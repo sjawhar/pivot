@@ -2,13 +2,17 @@
 
 A stage reaches a distribution when a module that its manifest names by name (a `byname:` entry)
 comes from a file that the distribution's RECORD lists, or is a package or a namespace package
-whose directory, as the import searched it, holds one (`owners`). For each reached distribution
-installed from version control, from a local directory or from a local archive, and for each such
-distribution that a reached one depends on, the manifest gets the key `dist:<name>`, `<name>`
-normalised as PEP 503 says. Its value hashes the distribution's own installed files, read from
-disk, so a change to them makes the stage stale, and a reinstall of the same files from another
-commit, path, installer or environment changes nothing. Package-index, remote-archive and
-editable distributions and pivot's own get no key.
+whose directory, as the import searched it, holds one (`owners`). `fingerprint` gives only the
+library code of those modules: no module whose file is user code, which the walk hashes or the
+user names by name (`@pivot.fingerprint_by_name`), and of a namespace package only its
+directories in a directory of `SITE_PACKAGE_PATHS` or in pivot's own packages, so no
+distribution's RECORD decides user code. For each reached distribution installed from version
+control, from a local directory or from a local archive, and for each such distribution that a
+reached one depends on, the manifest gets the key `dist:<name>`, `<name>` normalised as PEP 503
+says. Its value hashes the distribution's own installed files, read from disk, so a change to them
+makes the stage stale, and a reinstall of the same files from another commit, path, installer or
+environment changes nothing. Package-index, remote-archive and editable distributions and
+pivot's own get no key.
 
 It also tells `fingerprint.is_library_file` whether the RECORD of an editable distribution lists a
 file linked into a site directory (`listed_by_editable`): such a file keeps the decision of its
@@ -41,8 +45,10 @@ that requires one of them, directly or through others); every RECORD of a site d
 a stage reaches a file that lies in it (the deepest entry of the path that holds a place of the
 file: where Pivot judged it or where the walk listed it, and every later file of its chain of
 links; or that holds the file's resolved path) while a candidate there, or in another such
-entry of the file, has no RECORD; the RECORD of each editable distribution of a site directory,
-and no other, when `listed_by_editable` is first asked about a file whose site directory it is;
+entry of the file, has no RECORD and is no project's own metadata (`_projects_own`: one with no
+`direct_url.json` in an entry outside every `site-packages` and `dist-packages` directory, as a
+project's build leaves it); the RECORD of each editable distribution of a site directory, and no
+other, when `listed_by_editable` is first asked about a file whose site directory it is;
 the files under the directory of a reached package or namespace package only when such a site
 directory is the deepest entry of the path above that directory or lies at or under it, and only
 until each such site directory has a file there that no RECORD lists, once for each reached
@@ -83,6 +89,13 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 
     from pivot import import_origin
+
+# The names of the directories that installers put distributions in: a path with one of them as a
+# name lies in such a directory (`fingerprint.is_library_path`). A path entry with none of them
+# (the project root, a `src/` directory, a `PYTHONPATH` entry, a checkout) holds a project's own
+# code, and the metadata that a build or a develop install of the project writes there
+# (`_projects_own`).
+SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
 # The prefix of every key this module makes.
 _KEY_PREFIX = "dist:"
@@ -672,7 +685,9 @@ class _Index:
     pivot_own: frozenset[str]  # the candidates with a RECORD file in one of pivot's directories
     file_owners: Mapping[str, frozenset[str]]
     directory_owners: Mapping[str, frozenset[str]]
-    # Each site directory's candidates with no RECORD, which own no file.
+    # Each site directory's candidates with no RECORD, which own no file, but a project's own
+    # metadata (`_projects_own`): the refusal of a file that no RECORD lists (`_Snapshot._unlisted`)
+    # looks at these.
     recordless: Mapping[str, tuple[str, ...]]
 
 
@@ -915,7 +930,13 @@ def _build_index(
     once). Each RECORD path is resolved by `_resolved`, with `real_dirs` as `_real_path`'s memo. A
     candidate owns each file its RECORD lists, resolved, and each directory above such a file or
     above a path its RECORD lists inside its site directory, named as the RECORD names it
-    (`_listed_directories`)."""
+    (`_listed_directories`). A candidate with no RECORD owns no file, and goes in `recordless`
+    under its site directory, unless it is a project's own metadata (`_projects_own`): a
+    setuptools `<name>.egg-info` that a build or a develop install wrote in the project root or a
+    `src/` directory refuses nothing there. A candidate with no RECORD that has a
+    `direct_url.json` goes in `recordless` wherever it lies (a git or local install made with
+    `--target` that has lost its RECORD), and so does each one in a directory of
+    `SITE_PACKAGE_PATHS`."""
     seeds_by_form = [
         entry.dist_info for entry in installed if entry.classification.form in _SEED_FORMS
     ]
@@ -941,7 +962,8 @@ def _build_index(
         entry = by_dist_info[dist_info]
         paths = records[dist_info].paths
         if paths is None:
-            recordless.setdefault(entry.site_dir, []).append(dist_info)
+            if not _projects_own(entry):
+                recordless.setdefault(entry.site_dir, []).append(dist_info)
             continue
         directories = set[str]()
         for file in _resolved(entry, paths, real_dirs):
@@ -964,6 +986,20 @@ def _build_index(
             directory: frozenset(found) for directory, found in directory_owners.items()
         },
         recordless={site_dir: tuple(found) for site_dir, found in recordless.items()},
+    )
+
+
+def _projects_own(installed: Installed) -> bool:
+    """Whether `installed`, a candidate with no RECORD, is a project's own metadata, which a build
+    or a develop install of the project writes beside the project's code (a setuptools
+    `<name>.egg-info`, which has no RECORD): installed with no `direct_url.json`
+    (`InstallForm.INDEX`), in a path entry none of whose names is in `SITE_PACKAGE_PATHS` (the
+    project root, a `src/` directory, a `PYTHONPATH` entry, a checkout). The files it describes
+    are the project's own, which no RECORD lists, so it makes Pivot refuse no file that lies there
+    (`_Snapshot._unlisted`): neither a project file nor a library file whose resolved path lies
+    in uv's cache under the project root."""
+    return installed.classification.form is InstallForm.INDEX and not any(
+        name in SITE_PACKAGE_PATHS for name in installed.site_dir.split(os.sep)
     )
 
 

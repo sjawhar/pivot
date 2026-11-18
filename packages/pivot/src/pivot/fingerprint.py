@@ -126,8 +126,6 @@ _CACHE_SCHEMA_VERSION = 44
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
-_SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
-
 # Type alias for AST hash cache entry tuple.
 # Format: (rel_path, source_digest, qualname, py_version, schema_version, hash_hex)
 type AstHashEntry = tuple[str, str, str, str, int, str]
@@ -394,7 +392,7 @@ _identity_active: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextV
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
 # type-hint classes (`_hint_parts`), user-class members (`_user_methods`), mark decisions
 # (`_mark_decision`), class identities (`_class_identity`), the parts of classes with no source
-# (`_sourceless_parts`) and a loaded module's origin and file (`_held_module`), and by file
+# (`_sourceless_parts`) and the library part of a loaded module (`_held_module`), and by file
 # name for source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
@@ -2474,7 +2472,16 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     directories and the package's directory where the chain of links reaches a library path,
     where another distribution may put a file. No origin is found when the manifest has no
     `byname:` entry, or when no distribution on the worker's path can give a key or a refusal
-    (`installed_distributions.needs_origins`)."""
+    (`installed_distributions.needs_origins`).
+
+    Only library code is given (`_library_part`): a module whose file is user code, which the
+    walk hashes or the user names by name (`@pivot.fingerprint_by_name`), is left out, and a
+    namespace package keeps only its directories that are a library's (`_is_library_directory`,
+    the rule of `is_user_code`), and is left out when none is. So no distribution's RECORD, nor
+    its lack of one, decides a file or a directory of user code: a project's
+    `@pivot.fingerprint_by_name` helper, and the user's part of a namespace package shared with a
+    library (in the project, or in pip's checkout in `<venv>/src`), give no key and no refusal,
+    as in pivot 0.10.4, wherever they lie and whatever metadata lies beside them."""
     names = _by_name_names(manifest)
     if not names:
         return
@@ -2486,9 +2493,11 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     for name in names:
         module = sys.modules.get(name)
         if isinstance(module, types.ModuleType):
-            modules[name] = _held_module(module)
+            reached = _held_module(module)
         else:
-            modules[name] = reached_module_of(*loaded_source.worker_spec(name))
+            reached = _library_part(*loaded_source.worker_spec(name))
+        if reached is not None:
+            modules[name] = reached
     found = installed_distributions.distribution_keys(modules, path, pivot_dirs)
     prefix = _stage_prefix()
     for message in found.refusals:
@@ -2496,18 +2505,44 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     manifest.update(found.keys)
 
 
-def _held_module(module: types.ModuleType) -> installed_distributions.ReachedModule:
-    """What `installed_distributions` takes of a module this process holds (`reached_module_of`),
-    from its origin (`import_origin.of_module`) and its file as its import located it
-    (`import_origin.file_of_module`), found once per module object within one
+def _held_module(module: types.ModuleType) -> installed_distributions.ReachedModule | None:
+    """What `installed_distributions` takes of the library code of a module this process holds
+    (`_library_part`), from its origin (`import_origin.of_module`) and its file as its import
+    located it (`import_origin.file_of_module`), found once per module object within one
     `fingerprint_pass()`."""
     return _memoized(
         "reached-module",
         module,
-        lambda: reached_module_of(
+        lambda: _library_part(
             import_origin.of_module(module), import_origin.file_of_module(module)
         ),
     )
+
+
+def _library_part(
+    origin: import_origin.Origin | None, file: str | None
+) -> installed_distributions.ReachedModule | None:
+    """What `installed_distributions` takes of the library code of a module a stage reaches by
+    name, whose origin is `origin` and whose file, as its import located it or would locate it, is
+    `file` (`reached_module_of`). None for a module whose file is user code (`is_library_file`):
+    the walk hashes it, or the user names it by name, so no installed distribution's RECORD
+    decides it. A namespace package keeps only its directories that are a library's
+    (`_is_library_directory`, of each directory as `import_origin` resolves it, the rule by which
+    `is_user_code` decides a namespace package), and gives None when none is, so the user's part
+    of a namespace package it shares with a library is neither owned nor walked. Every other
+    origin (a library file, built-in, frozen, no file, unknown, None) is given whole."""
+    match origin:
+        case ("namespace", *directories):
+            library = tuple(
+                directory
+                for directory in directories
+                if _is_library_directory(pathlib.Path(directory))
+            )
+            return reached_module_of(("namespace", *library), file) if library else None
+        case ("file", _) if file is not None and not is_library_file(file):
+            return None
+        case _:
+            return reached_module_of(origin, file)
 
 
 def reached_module_of(
@@ -2520,8 +2555,8 @@ def reached_module_of(
     name the site directories and the package directory where the chain of links reaches a
     library path. For a file whose path with its directory resolved is a library path already
     (every file of a venv, copied or linked into uv's cache), the first place is
-    `with_real_directory(file)`. The one builder of both a module this process holds
-    (`_held_module`) and one a worker would import (`loaded_source.worker_spec`)."""
+    `with_real_directory(file)`. The one builder of both a module this process holds and one a
+    worker would import (`loaded_source.worker_spec`), through `_library_part`."""
     return installed_distributions.ReachedModule(origin, () if file is None else _places(file))
 
 
@@ -7049,33 +7084,42 @@ def _is_user_code_impl(obj: Any) -> bool:
         return False
 
     # A namespace package (PEP 420) has a __path__ but no __file__. It is a library's when one of
-    # its directories is in site-packages or dist-packages or in pivot's own packages. A directory
-    # under the interpreter's prefix alone, as pip's checkout of a `pip install -e git+...`
-    # package in `<venv>/src`, leaves a namespace the user shares with it user code. A directory
-    # is judged resolved, not by `is_library_file`'s rule for a linked file: uv's symlink link
-    # mode links each installed file and keeps the directories real.
+    # its directories is a library's (`_is_library_directory`); a directory under the
+    # interpreter's prefix alone, as pip's checkout of a `pip install -e git+...` package in
+    # `<venv>/src`, leaves a namespace the user shares with it user code. A directory is judged
+    # resolved, not by `is_library_file`'s rule for a linked file: uv's symlink link mode links
+    # each installed file and keeps the directories real.
     if not hasattr(module, "__file__") or module.__file__ is None:
         if not hasattr(module, "__path__"):
             return True  # No __file__ and no __path__: user code (exec/notebook/interactive)
-        for entry in module.__path__:
-            resolved = pathlib.Path(entry).resolve()
-            if any(part in _SITE_PACKAGE_PATHS for part in resolved.parts) or any(
-                resolved.is_relative_to(prefix) for prefix in _PIVOT_PACKAGE_DIRS
-            ):
-                return False
-        return True
+        return not any(
+            _is_library_directory(pathlib.Path(entry).resolve()) for entry in module.__path__
+        )
 
     return not is_library_file(module.__file__)
+
+
+def _is_library_directory(resolved: pathlib.Path) -> bool:
+    """Whether the resolved path ``resolved`` lies in a library's directory: one of its names is
+    ``site-packages`` or ``dist-packages`` (``installed_distributions.SITE_PACKAGE_PATHS``), or it
+    lies in one of pivot's own packages (``_PIVOT_PACKAGE_DIRS``). The one rule for a namespace
+    package's directory, in ``is_user_code`` and in the `dist:` keys (``_library_part``): a
+    directory under the interpreter's prefix alone, as pip's checkout of a ``pip install -e
+    git+...`` package in ``<venv>/src``, is the user's part of a namespace package it shares with
+    a library. ``is_library_path`` adds the interpreter's prefix for every other path."""
+    return any(
+        part in installed_distributions.SITE_PACKAGE_PATHS for part in resolved.parts
+    ) or any(resolved.is_relative_to(directory) for directory in _PIVOT_PACKAGE_DIRS)
 
 
 def is_library_path(path: pathlib.Path) -> bool:
     """Whether resolved file or directory ``path`` belongs to a library, not to user code: it
     lies under the interpreter's prefix (the stdlib, or a virtualenv), in a site-packages or
     dist-packages directory, or in one of pivot's own packages (``_PIVOT_PACKAGE_DIRS``), which
-    an editable install puts outside site-packages."""
-    if any(part in _SITE_PACKAGE_PATHS for part in path.parts):
-        return True
-    return any(path.is_relative_to(prefix) for prefix in (*_STDLIB_PATHS, *_PIVOT_PACKAGE_DIRS))
+    an editable install puts outside site-packages (``_is_library_directory``)."""
+    return _is_library_directory(path) or any(
+        path.is_relative_to(prefix) for prefix in _STDLIB_PATHS
+    )
 
 
 @functools.lru_cache(maxsize=4096)

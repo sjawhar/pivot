@@ -187,6 +187,16 @@ _RECORDLESS_GITMOD_REFUSAL = _RECORDLESS_REFUSAL.format(
     module="gitmod", form=installed_distributions.InstallForm.VCS.value
 )
 
+# The refusal of the reached module `mod`, whose file `{site}/mod.py` no RECORD lists, beside
+# `myproj.egg-info` in `{site}` (`_helper_project_egg_info`), as `_helper_written_site` writes it.
+_MYPROJ_MOD_REFUSAL = (
+    "Module 'mod' ({site}/mod.py) lies in {site}, where distribution 'myproj' "
+    "({site}/myproj.egg-info), installed with no direct_url.json, as from a package index, has "
+    "no RECORD file, and no RECORD file there lists that file. Pivot cannot tell whether the "
+    "stage runs that distribution's code, so the stage could skip a run after it changes. Fix: "
+    "reinstall 'myproj'."
+)
+
 
 def _helper_install_by_hand(
     root: pathlib.Path,
@@ -235,6 +245,23 @@ def _helper_project_egg_info(project: pathlib.Path, requirement: str) -> None:
     (egg_info / "requires.txt").write_text(f"{requirement}\n")
     requires = importlib.metadata.Distribution.at(egg_info).requires
     assert requires == [requirement], f"{egg_info} must require {requirement}: {requires}"
+
+
+def _helper_recordless_root_install(root: pathlib.Path, layout: str) -> None:
+    """Install `projlib` (`projlib.py`) by hand into `root/project`, the project root, in the
+    `layout` (`_helper_install_by_hand`), from a local directory (its `direct_url.json` is
+    `installed_dists.UV_DIRECTORY_URL`), and delete its RECORD: a distribution with no RECORD in
+    the project root that Pivot looks at, which `myproj.egg-info`, the project's own metadata,
+    is not."""
+    entry = _helper_install_by_hand(
+        root,
+        layout,
+        "projlib",
+        {"projlib.py": "PROJ = 1\n"},
+        installed_dists.UV_DIRECTORY_URL,
+        entry="project",
+    )
+    installed_dists.damage(entry / "projlib-0.1.dist-info" / "RECORD", None)
 
 
 def _helper_written_site(
@@ -963,16 +990,17 @@ def test_a_venv_inside_the_project_root_beside_the_projects_egg_info_gets_its_ke
         pytest.param(True, id="requirement-in-requires-txt-alone"),
     ],
 )
-def test_a_reached_module_of_an_index_egg_info_with_no_record_that_requires_a_local_install_is_refused(
+def test_a_reached_module_of_a_source_tree_beside_its_egg_info_with_no_record_is_not_refused(
     tmp_path: pathlib.Path, without_requires_dist: bool
 ) -> None:
     """The source tree of `mid`, on the path after the venv's site-packages, holds the package
     `mid` and the `mid.egg-info` its setuptools build left, with no RECORD and no
     `direct_url.json` (the package-index form), which requires `fixdep`, installed from its path,
     in a `Requires-Dist` header of its PKG-INFO, or in its `requires.txt` alone. The stage reaches
-    `mid`, whose file no RECORD lists: `mid` owns no file, so Pivot cannot tell that the stage
-    runs it and depends on `fixdep`, and refuses the stage, naming the module, its file and
-    `mid`."""
+    `mid`, whose file no RECORD lists. The source tree is no `site-packages` or `dist-packages`
+    directory, so `mid.egg-info` is the project's own metadata, which refuses nothing there, and
+    `mid` owns no file, so it gives no key. (`fingerprint.add_distribution_keys` gives no module
+    whose file is user code, as `mid/__init__.py` in a source tree is: the walk hashes it.)"""
     venv = installed_dists.make_venv(tmp_path / "venv")
     src = tmp_path / "src"
     installed_dists.install_directory(
@@ -987,15 +1015,7 @@ def test_a_reached_module_of_an_index_egg_info_with_no_record_that_requires_a_lo
         modules, [str(venv.site_packages), str(mid)], _PIVOT_DIRS
     )
 
-    tree = mid.resolve()
-    refusal = (
-        f"Module 'mid' ({tree}/mid/__init__.py) lies in {tree}, where distribution 'mid' "
-        f"({tree}/mid.egg-info), installed with no direct_url.json, as from a package index, has "
-        "no RECORD file, and no RECORD file there lists that file. Pivot cannot tell whether the "
-        "stage runs that distribution's code, so the stage could skip a run after it changes. "
-        "Fix: reinstall 'mid'."
-    )
-    assert found == installed_distributions.DistributionKeys({}, [refusal]), found
+    assert found == installed_distributions.DistributionKeys({}, []), found
 
 
 def test_an_egg_info_whose_metadata_names_no_requirement_is_followed_through_its_requires_txt(
@@ -1424,9 +1444,10 @@ def test_a_project_file_linked_to_a_recordless_git_install_is_refused_as_in_a_co
     file in both (`fingerprint.judged_file`: its link reaches `site-packages/gitmod.py`, a library
     path); in the linked layout its resolved path lies in the cache, outside every entry of the
     path. No refusal names `myproj`, since the project root is neither where Pivot judges the file
-    nor where it resolves, nor where its chain of links reaches a library file. Judged as the
-    import found it, in the project root, the linked layout would refuse nothing `alone`, and
-    each layout would refuse it for `myproj` beside the `.egg-info`."""
+    nor where it resolves, nor where its chain of links reaches a library file, and since
+    `myproj.egg-info` there is the project's own metadata, which refuses nothing in a path entry
+    outside every `site-packages` and `dist-packages` directory. Judged as the import found it, in
+    the project root, the linked layout would refuse nothing."""
     found = dict[str, installed_distributions.DistributionKeys]()
     for layout in _LAYOUTS:
         root = tmp_path / layout
@@ -1576,21 +1597,23 @@ def test_a_package_file_linked_to_a_file_another_entrys_record_lists_is_not_refu
     assert found == {"copied": keyed, "linked-into-a-cache": keyed}, found
 
 
-def test_a_project_file_linked_to_an_index_file_beside_a_recordless_egg_info_refuses_nothing(
+def test_a_project_file_linked_to_an_index_file_refuses_nothing_beside_recordless_root_installs(
     tmp_path: pathlib.Path,
 ) -> None:
     """In each layout (the installed files copied, or linked into a cache), `site-packages` holds
     `idxmod`, installed by hand as from a package index, whose RECORD lists `mod.py`, and
     `gitlib`, installed by hand as from git, with its RECORD. The project root, first on the path,
     holds `myproj.egg-info`, laid out as a setuptools build leaves it, with no RECORD, which
-    requires `gitlib` (a `Requires-Dist` header and `requires.txt`), and `project/mod.py`, a link
-    made by hand to `site-packages/mod.py`. The stage reaches `mod` through the project file, as
-    `fingerprint.reached_module_of` gives it. Neither layout refuses it, and both give the same
-    keys, none: `idxmod`'s RECORD in `site-packages` lists the file Pivot judged the module by
-    (`fingerprint.judged_file`), which lies in `site-packages` in both. With the project file as
-    the import found it in its place, the linked layout, whose resolved path lies in the cache
-    outside every entry of the path, would find the file only in the project root, which no
-    RECORD there lists beside `myproj`, and would refuse the stage."""
+    requires `gitlib` (a `Requires-Dist` header and `requires.txt`), `projlib`, installed there by
+    hand from a local directory, which has lost its RECORD (`_helper_recordless_root_install`),
+    and `project/mod.py`, a link made by hand to `site-packages/mod.py`. The stage reaches `mod`
+    through the project file, as `fingerprint.reached_module_of` gives it. Neither layout refuses
+    it, and both give the same keys, none: `idxmod`'s RECORD in `site-packages` lists the file
+    Pivot judged the module by (`fingerprint.judged_file`), which lies in `site-packages` in
+    both, and the project root is neither where Pivot judged it nor where it resolves. With the
+    project file as the import found it in its place, the linked layout, whose resolved path lies
+    in the cache outside every entry of the path, would find the file only in the project root,
+    which no RECORD there lists, beside `projlib`, and would refuse the stage."""
     found = dict[str, installed_distributions.DistributionKeys]()
     for layout in _LAYOUTS:
         root = tmp_path / layout
@@ -1601,6 +1624,7 @@ def test_a_project_file_linked_to_an_index_file_beside_a_recordless_egg_info_ref
         project = root / "project"
         _helper_link_by_hand(project, site, "mod.py", layout)
         _helper_project_egg_info(project, "gitlib")
+        _helper_recordless_root_install(root, layout)
         found[layout] = installed_distributions.distribution_keys(
             {"mod": installed_dists.module_loaded_from(project / "mod.py")},
             [str(project), str(site)],
@@ -1611,19 +1635,22 @@ def test_a_project_file_linked_to_an_index_file_beside_a_recordless_egg_info_ref
     assert found == {"copied": nothing, "linked-into-a-cache": nothing}, found
 
 
-def test_a_project_file_linked_to_an_unlisted_file_beside_a_recordless_egg_info_refuses_nothing(
+def test_a_project_file_linked_to_an_unlisted_file_refuses_nothing_beside_recordless_root_installs(
     tmp_path: pathlib.Path,
 ) -> None:
     """In each layout (the installed files copied, or linked into a cache), `site-packages` holds
     `gitlib`, installed by hand as from git, with its RECORD, and `orphan.py`, which no RECORD
     lists (a copy, or a link into the cache). The project root, first on the path, holds
-    `myproj.egg-info`, with no RECORD, which requires `gitlib`, and `project/orphan.py`, a link
-    made by hand to `site-packages/orphan.py`. The stage reaches `orphan` through the project
-    file. Neither layout refuses it, and both give the same keys, none: Pivot judges the project
-    file at `site-packages/orphan.py` in both (`fingerprint.judged_file`), where no distribution
-    lacks a RECORD, and its resolved path lies in `site-packages` or in the cache, neither of
-    which is the project root. Judged at the project file where it is a copy, the copied layout
-    alone would find the file in the project root, beside `myproj`, and refuse the stage."""
+    `myproj.egg-info`, with no RECORD, which requires `gitlib`, `projlib`, installed there by hand
+    from a local directory, which has lost its RECORD (`_helper_recordless_root_install`), and
+    `project/orphan.py`, a link made by hand to `site-packages/orphan.py`. The stage reaches
+    `orphan` through the project file. Neither layout refuses it, and both give the same keys,
+    none: Pivot judges the project file at `site-packages/orphan.py` in both
+    (`fingerprint.judged_file`), where no distribution lacks a RECORD, and its resolved path lies
+    in `site-packages` or in the cache, neither of which is the project root. Judged at the
+    project file, each layout would find the file in the project root, which no RECORD lists,
+    beside `projlib`, and would refuse the stage: the copied layout where the file is a copy,
+    whose resolved path lies in `site-packages`, too."""
     found = dict[str, installed_distributions.DistributionKeys]()
     for layout in _LAYOUTS:
         root = tmp_path / layout
@@ -1639,6 +1666,7 @@ def test_a_project_file_linked_to_an_unlisted_file_beside_a_recordless_egg_info_
         project = root / "project"
         _helper_link_by_hand(project, site, "orphan.py", layout)
         _helper_project_egg_info(project, "gitlib")
+        _helper_recordless_root_install(root, layout)
         found[layout] = installed_distributions.distribution_keys(
             {"orphan": installed_dists.module_loaded_from(project / "orphan.py")},
             [str(project), str(site)],
@@ -1647,6 +1675,63 @@ def test_a_project_file_linked_to_an_unlisted_file_beside_a_recordless_egg_info_
 
     nothing = installed_distributions.DistributionKeys({}, [])
     assert found == {"copied": nothing, "linked-into-a-cache": nothing}, found
+
+
+@pytest.mark.parametrize(
+    ("egg_info_in", "refusals"),
+    [
+        pytest.param("project", [], id="egg-info-in-the-project-root"),
+        pytest.param("venv/site-packages", [_MYPROJ_MOD_REFUSAL], id="egg-info-in-site-packages"),
+    ],
+)
+def test_a_projects_egg_info_refuses_no_library_file_uv_links_into_a_cache_under_the_root(
+    tmp_path: pathlib.Path, egg_info_in: str, refusals: list[str]
+) -> None:
+    """In each layout (the installed files copied, or linked into a cache that lies under the
+    project root, as `UV_CACHE_DIR` there puts uv's cache), `site-packages` holds `idxmod`,
+    installed by hand as from a package index, which has lost its RECORD, and `gitlib`,
+    installed by hand as from git, with its RECORD. `myproj.egg-info`, laid out as a setuptools
+    build leaves it, with no RECORD and no `direct_url.json`, which requires `gitlib`, lies in
+    the project root or in `site-packages` (`egg_info_in`, under the layout's directory), and
+    the path is the project root, then `site-packages`. The stage reaches `mod`, whose file no
+    RECORD lists, and `gitlib`. Both layouts give the key of `gitlib` and the same refusals:
+    none beside the project's own `.egg-info` in the project root, which is no `site-packages`
+    or `dist-packages` directory, though in the linked layout `mod.py` resolves into the cache
+    there; and in `site-packages`, where such an `.egg-info` is a distribution that can own a
+    file no RECORD lists, one refusal naming `mod.py` and `myproj`."""
+    found = dict[str, installed_distributions.DistributionKeys]()
+    for layout in _LAYOUTS:
+        root = tmp_path / layout
+        project = root / "project"
+        project.mkdir(parents=True)
+        site = root / "venv" / "site-packages"
+        cache = None if layout == "copied" else project / ".uv-cache"
+        installed_dists.index_install_by_hand(site, "idxmod", {"mod.py": "MOD = 1\n"}, cache=cache)
+        installed_dists.damage(site / "idxmod-0.1.dist-info" / "RECORD", None)
+        installed_dists.index_install_by_hand(
+            site, "gitlib", {"gitlib.py": "LIB = 1\n"}, cache=cache
+        )
+        (site / "gitlib-0.1.dist-info" / "direct_url.json").write_bytes(installed_dists.UV_GIT_URL)
+        _helper_project_egg_info(root / egg_info_in, "gitlib")
+        resolved = os.path.realpath(site / "mod.py")
+        assert pathlib.Path(resolved).is_relative_to(project.resolve()) == (cache is not None), (
+            f"mod.py must resolve under the project root in the linked layout alone: {resolved}"
+        )
+        keys = installed_distributions.distribution_keys(
+            {
+                name: installed_dists.module_loaded_from(site / f"{name}.py")
+                for name in ("gitlib", "mod")
+            },
+            [str(project), str(site)],
+            _PIVOT_DIRS,
+        )
+        found[layout] = _helper_written_site(keys, site)
+
+    copied_site = tmp_path / "copied" / "venv" / "site-packages"
+    expected = installed_distributions.DistributionKeys(
+        {"dist:gitlib": _helper_value(copied_site, {"gitlib.py": "gitlib.py"})}, refusals
+    )
+    assert found == {"copied": expected, "linked-into-a-cache": expected}, found
 
 
 def test_a_project_package_linked_file_by_file_gets_the_keys_of_each_install_in_its_directory(
