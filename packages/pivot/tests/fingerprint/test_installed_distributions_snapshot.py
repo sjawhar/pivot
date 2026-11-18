@@ -283,6 +283,24 @@ def _helper_recordless_root_install(root: pathlib.Path, layout: str) -> None:
     installed_dists.damage(entry / "projlib-0.1.dist-info" / "RECORD", None)
 
 
+def _helper_root_with_a_recordless_idxmod(
+    root: pathlib.Path, layout: str
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path | None]:
+    """Lay out under `root` the project root `root/project` and `root/venv/site-packages`, and
+    install `idxmod` (`mod.py`) by hand into `site-packages` as from a package index
+    (`installed_dists.index_install_by_hand`), its files copies in the `copied` layout and links
+    into a cache under the project root in the `linked-into-a-cache` one (`project/.uv-cache`, as
+    `UV_CACHE_DIR` there puts uv's cache), and delete its RECORD. Returns the project root,
+    `site-packages` and the cache, None in the `copied` layout."""
+    project = root / "project"
+    project.mkdir(parents=True)
+    site = root / "venv" / "site-packages"
+    cache = None if layout == "copied" else project / ".uv-cache"
+    installed_dists.index_install_by_hand(site, "idxmod", {"mod.py": "MOD = 1\n"}, cache=cache)
+    installed_dists.damage(site / "idxmod-0.1.dist-info" / "RECORD", None)
+    return project, site, cache
+
+
 def _helper_written_site(
     found: installed_distributions.DistributionKeys, site: pathlib.Path
 ) -> installed_distributions.DistributionKeys:
@@ -1763,12 +1781,7 @@ def test_a_projects_egg_info_refuses_no_library_file_uv_links_into_a_cache_under
     found = dict[str, installed_distributions.DistributionKeys]()
     for layout in _LAYOUTS:
         root = tmp_path / layout
-        project = root / "project"
-        project.mkdir(parents=True)
-        site = root / "venv" / "site-packages"
-        cache = None if layout == "copied" else project / ".uv-cache"
-        installed_dists.index_install_by_hand(site, "idxmod", {"mod.py": "MOD = 1\n"}, cache=cache)
-        installed_dists.damage(site / "idxmod-0.1.dist-info" / "RECORD", None)
+        project, site, cache = _helper_root_with_a_recordless_idxmod(root, layout)
         installed_dists.index_install_by_hand(
             site, "gitlib", {"gitlib.py": "LIB = 1\n"}, cache=cache
         )
@@ -1812,12 +1825,7 @@ def test_a_recordless_root_install_refuses_a_file_uv_links_into_a_cache_under_th
     found = dict[str, installed_distributions.DistributionKeys]()
     for layout in _LAYOUTS:
         root = tmp_path / layout
-        project = root / "project"
-        project.mkdir(parents=True)
-        site = root / "venv" / "site-packages"
-        cache = None if layout == "copied" else project / ".uv-cache"
-        installed_dists.index_install_by_hand(site, "idxmod", {"mod.py": "MOD = 1\n"}, cache=cache)
-        installed_dists.damage(site / "idxmod-0.1.dist-info" / "RECORD", None)
+        project, site, _ = _helper_root_with_a_recordless_idxmod(root, layout)
         _helper_recordless_root_install(root, layout)
         found[layout] = installed_distributions.distribution_keys(
             {"mod": installed_dists.module_loaded_from(site / "mod.py")},

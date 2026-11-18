@@ -22,7 +22,7 @@ is library code, as the same file copied would be.
 
 It holds the one definition of a library location, which `fingerprint.is_library_path` and the
 refusal of a file that no RECORD lists (`_projects_own`) share: a site-packages directory
-(`in_site_packages`, a name of `SITE_PACKAGE_PATHS`), or a path under the interpreter's prefix
+(`in_site_packages`, a name of `_SITE_PACKAGE_PATHS`), or a path under the interpreter's prefix
 (`in_library_location`, `INTERPRETER_PREFIXES`, read once at import).
 
 A leaf: it imports nothing of pivot's at run time, so `fingerprint` imports it and no import cycle
@@ -50,8 +50,7 @@ that requires one of them, directly or through others); every RECORD of a site d
 a stage reaches a file that lies in it (the deepest entry of the path that holds a place of the
 file: where Pivot judged it or where the walk listed it, and every later file of its chain of
 links; or that holds the file's resolved path) while a candidate there, or in another such
-entry of the file, has no RECORD and is no project's own metadata (`_projects_own`: one with no
-`direct_url.json` in an entry that is no library location, as a project's build leaves it); the
+entry of the file, has no RECORD and is no project's own metadata (`_projects_own`); the
 RECORD of each editable distribution of a site directory, and no other, when `listed_by_editable`
 is first asked about a file whose site directory it is; the files under the directory of a
 reached package or namespace package only when such a site directory is the deepest entry of the
@@ -98,7 +97,7 @@ if TYPE_CHECKING:
 
 # The names of the directories that installers put distributions in: a path with one of them as a
 # name lies in a site-packages directory (`in_site_packages`).
-SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
+_SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
 # The interpreter's prefixes, `sys.prefix` and `sys.base_prefix`, each resolved (one of them when
 # they are the same, outside a venv), read once at import, so that a resolved path compares with
@@ -114,16 +113,13 @@ INTERPRETER_PREFIXES = tuple(
 
 def in_site_packages(path: pathlib.PurePath) -> bool:
     """Whether the resolved path `path` lies in a site-packages directory: one of its names is in
-    `SITE_PACKAGE_PATHS`."""
-    return any(name in SITE_PACKAGE_PATHS for name in path.parts)
+    `_SITE_PACKAGE_PATHS`."""
+    return any(name in _SITE_PACKAGE_PATHS for name in path.parts)
 
 
 def in_library_location(path: pathlib.PurePath) -> bool:
     """Whether the resolved path `path` lies in a library location: in a site-packages directory
-    (`in_site_packages`), or under one of `INTERPRETER_PREFIXES`. A path entry that is none (the
-    project root, a `src/` directory, a `PYTHONPATH` entry, a checkout outside the prefixes) is
-    where a project keeps its code, and the metadata that a build or a develop install of the
-    project writes there (`_projects_own`)."""
+    (`in_site_packages`), or under one of `INTERPRETER_PREFIXES`."""
     return in_site_packages(path) or any(
         path.is_relative_to(prefix) for prefix in INTERPRETER_PREFIXES
     )
@@ -717,9 +713,9 @@ class _Index:
     pivot_own: frozenset[str]  # the candidates with a RECORD file in one of pivot's directories
     file_owners: Mapping[str, frozenset[str]]
     directory_owners: Mapping[str, frozenset[str]]
-    # Each site directory's candidates with no RECORD, which own no file, but a project's own
-    # metadata outside every library location (`_projects_own`): the refusal of a file that no
-    # RECORD lists (`_Snapshot._unlisted`) looks at these.
+    # Each site directory's candidates with no RECORD, which own no file, that are no project's
+    # own metadata (`_projects_own`): the refusal of a file that no RECORD lists
+    # (`_Snapshot._unlisted`) looks at these.
     recordless: Mapping[str, tuple[str, ...]]
 
 
@@ -963,13 +959,7 @@ def _build_index(
     candidate owns each file its RECORD lists, resolved, and each directory above such a file or
     above a path its RECORD lists inside its site directory, named as the RECORD names it
     (`_listed_directories`). A candidate with no RECORD owns no file, and goes in `recordless`
-    under its site directory, unless it is a project's own metadata (`_projects_own`): a
-    setuptools `<name>.egg-info` that a build or a develop install wrote in the project root or a
-    `src/` directory refuses nothing there. A candidate with no RECORD that has a
-    `direct_url.json` goes in `recordless` wherever it lies (a git or local install made with
-    `--target` that has lost its RECORD), and so does each one in a library location
-    (`in_library_location`: a site-packages directory, or under the interpreter's prefix, as a
-    library checkout's develop build in `<venv>/src`)."""
+    under its site directory when it is no project's own metadata (`_projects_own`)."""
     seeds_by_form = [
         entry.dist_info for entry in installed if entry.classification.form in _SEED_FORMS
     ]
@@ -1030,11 +1020,12 @@ def _projects_own(installed: Installed) -> bool:
     the project root, a `src/` directory, a `PYTHONPATH` entry, a checkout outside the
     interpreter's prefix). The files it describes are the project's own, which no RECORD lists,
     so it makes Pivot refuse no file that lies there (`_Snapshot._unlisted`): neither a project
-    file nor a library file whose resolved path lies in uv's cache under the project root. A
-    develop build's `<name>.egg-info` in a library location is not: a checkout under the
-    interpreter's prefix (pip's `install -e git+...` puts one in `<venv>/src`) holds library
-    code, which the walk records by name and does not hash, so a reached file there that no
-    RECORD lists is refused beside it."""
+    file nor a library file whose resolved path lies in uv's cache under the project root. One
+    with a `direct_url.json` is not, wherever it lies (a git or local install made with
+    `--target` that has lost its RECORD), nor is a develop build's `<name>.egg-info` in a library
+    location: a checkout under the interpreter's prefix (pip's `install -e git+...` puts one in
+    `<venv>/src`) holds library code, which the walk records by name and does not hash, so a
+    reached file there that no RECORD lists is refused beside it."""
     return installed.classification.form is InstallForm.INDEX and not in_library_location(
         pathlib.PurePath(installed.site_dir)
     )
