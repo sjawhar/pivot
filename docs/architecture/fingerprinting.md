@@ -642,17 +642,18 @@ directories are the deepest entry of the worker's `sys.path` that holds it where
 (a module's own file as `fingerprint.judged_file` gives it: as the import located it, its
 directory resolved, or, for a link outside every library path, the first file of its chain of
 links that is a library path; a file under a package where it lies in the package's directory),
-and the deepest entry that holds its resolved path, where a link points; a RECORD in either lists
-the file when one of its paths
-resolves to the file's resolved path. So a module file linked from one entry into another that
-holds such a distribution is refused as the file it points to would be, while a file linked from
-an entry that holds one into an entry whose RECORD lists the file is not; where an installer
-links each file into its cache, where that cache lies outside every entry of the path, no entry
-holds the resolved path, and the file is judged where it lies (for a cache inside an entry, see
-the Limits below). And a setuptools project's own `<name>.egg-info`, in the project root first on
-`sys.path`, refuses nothing for a module in the site-packages of a `.venv` inside that root,
-which is a deeper entry, where uv's cache, if it links files, lies outside that root (see the
-Limits below). The files checked are the module's own and, for a package's `__init__`
+the deepest entry that holds each further file of a module file's chain of links that is a
+library path, and the deepest entry that holds its resolved path, where a link points; a RECORD
+in any of them lists the file when one of its paths resolves to the file's resolved path. So a
+module file linked from one entry into another that holds such a distribution is refused as the
+file it points to would be, also where that file is itself a link into uv's cache, while a file
+linked from an entry that holds one into an entry whose RECORD lists the file is not; where an
+installer links each file into its cache, where that cache lies outside every entry of the path,
+no entry holds the resolved path, and the file is judged where it lies (for a cache inside an
+entry, see the Limits below). And a setuptools project's own `<name>.egg-info`, in the project
+root first on `sys.path`, refuses nothing for a module in the site-packages of a `.venv` inside
+that root, which is a deeper entry, where uv's cache, if it links files, lies outside that root
+(see the Limits below). The files checked are the module's own and, for a package's `__init__`
 file or a namespace package, the files under its directories but those under a `__pycache__`
 directory, which the key leaves out too (a `.pyc` file outside one is checked). Pivot walks such
 a directory only when the deepest entry of `sys.path` above it, or an entry at or under it,
@@ -704,14 +705,18 @@ one that rule 1 decides (`fingerprint.judged_file`): `fingerprint.reached_module
 `installed_distributions` beside the module's origin, so the site directory and the package
 directory they name are those where the chain reaches a library path, in a copied environment
 as in a linked one. A file whose own path, its directory resolved, is a library path already, as
-every file of a virtual environment is, is its own judged file: Pivot follows no link for it.
-Such a virtual environment so
-fingerprints as one whose files uv copied, and gives the same `dist:` keys and the same
-refusals. A distribution owns each directory above each path its RECORD lists inside its site
-directory, named as the RECORD names it, besides each directory above the file that path
-resolves to, so a namespace package, whose directories stay in `site-packages`, keeps its owner
-there, and so does a regular package, whose directory Pivot takes from its judged `__init__`
-file, not from that file's resolved path in the cache. A second distribution that puts a file
+every file of a virtual environment is, is its own judged file. Beside it go the further files of
+the chain that are library paths, followed to the chain's end within 40 links: the check of a
+file that no RECORD lists sees the site directory of each, so `A/site-packages/m.py`, a link made
+by hand to `B/site-packages/m.py`, lies in both, whether `B`'s file is a copy or a link into uv's
+cache (`test_installed_distributions_snapshot.py`, `test_installed_distributions_unlisted.py`). A
+virtual environment that uv builds with `UV_LINK_MODE=symlink` so fingerprints as one whose files
+uv copied, and gives the same `dist:` keys and the same refusals. A distribution owns each
+directory above each path its RECORD lists inside its site directory, named as the RECORD names
+it, besides each directory above the file that path resolves to, so a namespace package, whose
+directories stay in `site-packages`, keeps its owner there, and so does a regular package, whose
+directory Pivot takes from its judged `__init__` file, not from that file's resolved path in the
+cache. A second distribution that puts a file
 inside another's package (`pkg/contrib/extra.py`, where an index library holds
 `pkg/__init__.py`) is so reached through `pkg` as in a copied environment, and refuses the stage
 as there once it has lost its RECORD. A linked file that no RECORD lists, a link of an editable

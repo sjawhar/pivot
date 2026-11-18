@@ -14,9 +14,10 @@ symlink`) and the editable layouts uv and flit's `install --symlink` make:
 editable installs and builds no index of the candidates; `fingerprint.is_library_file`, which
 asks it only about a file linked under a library path; the keys of a namespace package and of a
 package that holds another install's file, which are those of a venv whose files are copies; and
-the keys and refusals of a module file linked by hand from the project root into
-`site-packages`, laid out by hand with that file copied or linked into a cache, each module given
-as `fingerprint.reached_module_of` gives it. No fixture is imported into this process.
+the keys and refusals of module and package files linked by hand into `site-packages`, from the
+project root or from another entry of the path, laid out by hand with those files copied or
+linked into a cache, each module given as `fingerprint.reached_module_of` gives it. No fixture
+is imported into this process.
 
 The CLI tests of the same decisions are in `test_installed_distributions.py` and
 `test_installed_distributions_link_mode.py`, and the pure functions on plain data in
@@ -201,18 +202,17 @@ def _helper_install_by_hand(
     return site
 
 
-def _helper_link_into_project(
-    root: pathlib.Path, site: pathlib.Path, name: str, layout: str
+def _helper_link_by_hand(
+    directory: pathlib.Path, site: pathlib.Path, name: str, layout: str
 ) -> pathlib.Path:
-    """`root/project/<name>`, a link made by hand to `site/<name>`, which is a copy in the
-    `copied` layout and a link into the cache in the other (the test fails otherwise); a
-    directory `<name>` lies in is a real directory of the project. Returns the project's root."""
-    project = root / "project"
-    (project / name).parent.mkdir(parents=True, exist_ok=True)
-    (project / name).symlink_to(site / name)
+    """`directory/<name>`, a link made by hand to `site/<name>`, which is a copy in the `copied`
+    layout and a link into the cache in the other (the test fails otherwise); a directory
+    `<name>` lies in is a real directory under `directory`. Returns `directory`."""
+    (directory / name).parent.mkdir(parents=True, exist_ok=True)
+    (directory / name).symlink_to(site / name)
     linked = (site / name).is_symlink()
     assert linked == (layout != "copied"), f"{site / name} in the {layout} layout: link {linked}"
-    return project
+    return directory
 
 
 def _helper_project_egg_info(project: pathlib.Path, requirement: str) -> None:
@@ -1403,19 +1403,23 @@ def test_a_file_one_install_puts_in_anothers_package_is_reached_in_a_venv_uv_lin
     assert recordless == refused, recordless
 
 
+@pytest.mark.parametrize("egg_info", ["alone", "beside-a-recordless-egg-info"])
 def test_a_project_file_linked_to_a_recordless_git_install_is_refused_as_in_a_copied_venv(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, egg_info: str
 ) -> None:
     """`gitmod`, installed by hand into `site-packages` as uv installs from git, in each layout
     (its `gitmod.py` copied, or linked into a cache), has lost its RECORD; `project/gitmod.py` is a
     link made by hand to `site-packages/gitmod.py`, and the path is the project root, then
-    `site-packages`. The stage reaches `gitmod` through the project file, as
-    `fingerprint.reached_module_of` gives it. Both layouts refuse it with one refusal, naming the
-    module's file in `site-packages`, where Pivot judges the project file in both
-    (`fingerprint.judged_file`: its link reaches `site-packages/gitmod.py`, a library path); in
-    the linked layout its resolved path lies in the cache, outside every entry of the path. With
-    the project file as the import found it in its place, the linked layout would refuse
-    nothing."""
+    `site-packages`; `beside-a-recordless-egg-info`: the project root also holds
+    `myproj.egg-info`, with no RECORD, which requires `gitmod`. The stage reaches `gitmod`
+    through the project file, as `fingerprint.reached_module_of` gives it. Both layouts refuse it
+    with one refusal, naming the module's file in `site-packages`, where Pivot judges the project
+    file in both (`fingerprint.judged_file`: its link reaches `site-packages/gitmod.py`, a library
+    path); in the linked layout its resolved path lies in the cache, outside every entry of the
+    path. No refusal names `myproj`, since the project root is neither where Pivot judges the file
+    nor where it resolves, nor where its chain of links reaches a library file. Judged as the
+    import found it, in the project root, the linked layout would refuse nothing `alone`, and
+    each layout would refuse it for `myproj` beside the `.egg-info`."""
     found = dict[str, installed_distributions.DistributionKeys]()
     for layout in _LAYOUTS:
         root = tmp_path / layout
@@ -1423,7 +1427,9 @@ def test_a_project_file_linked_to_a_recordless_git_install_is_refused_as_in_a_co
             root, layout, "gitmod", {"gitmod.py": "VALUE = 1\n"}, installed_dists.UV_GIT_URL
         )
         installed_dists.damage(site / "gitmod-0.1.dist-info" / "RECORD", None)
-        project = _helper_link_into_project(root, site, "gitmod.py", layout)
+        project = _helper_link_by_hand(root / "project", site, "gitmod.py", layout)
+        if egg_info != "alone":
+            _helper_project_egg_info(project, "gitmod")
         keys = installed_distributions.distribution_keys(
             {"gitmod": installed_dists.module_loaded_from(project / "gitmod.py")},
             [str(project), str(site)],
@@ -1433,6 +1439,46 @@ def test_a_project_file_linked_to_a_recordless_git_install_is_refused_as_in_a_co
 
     refused = installed_distributions.DistributionKeys({}, [_RECORDLESS_GITMOD_REFUSAL])
     assert found == {"copied": refused, "linked-into-a-cache": refused}, found
+
+
+@pytest.mark.parametrize("record", ["lost", "kept"])
+def test_a_library_file_linked_from_another_path_entry_is_checked_where_its_link_reaches(
+    tmp_path: pathlib.Path, record: str
+) -> None:
+    """`gitmod`, installed by hand into `B/venv/site-packages` as uv installs from git, in each
+    layout (its `gitmod.py` copied, or linked into a cache), with its RECORD `kept` or `lost`;
+    `A/site-packages/gitmod.py` is a link made by hand to that file, and the path is
+    `A/site-packages`, then `B/venv/site-packages`. The stage reaches `gitmod` through `A`'s file,
+    as `fingerprint.reached_module_of` gives it. Pivot judges the file in `A`, its first library
+    file, and its chain of links reaches a second one in `B`, where it lies too: in the copied
+    layout `B`'s file is its resolved path, and in the linked one that lies in the cache, outside
+    every entry of the path. So both layouts give the same: `kept`, the key of `gitmod` and no
+    refusal; `lost`, one refusal naming the file in `B`. With only the file Pivot judged checked,
+    the linked layout would find the file in `A` alone, where no distribution lacks a RECORD, and
+    refuse nothing."""
+    found = dict[str, installed_distributions.DistributionKeys]()
+    for layout in _LAYOUTS:
+        root = tmp_path / layout
+        site = _helper_install_by_hand(
+            root / "B", layout, "gitmod", {"gitmod.py": "VALUE = 1\n"}, installed_dists.UV_GIT_URL
+        )
+        if record == "lost":
+            installed_dists.damage(site / "gitmod-0.1.dist-info" / "RECORD", None)
+        entry = _helper_link_by_hand(root / "A" / "site-packages", site, "gitmod.py", layout)
+        keys = installed_distributions.distribution_keys(
+            {"gitmod": installed_dists.module_loaded_from(entry / "gitmod.py")},
+            [str(entry), str(site)],
+            _PIVOT_DIRS,
+        )
+        found[layout] = _helper_written_site(keys, site)
+
+    if record == "lost":
+        expected = installed_distributions.DistributionKeys({}, [_RECORDLESS_GITMOD_REFUSAL])
+    else:
+        copied_site = tmp_path / "copied" / "B" / "venv" / "site-packages"
+        value = _helper_value(copied_site, {"gitmod.py": "gitmod.py"})
+        expected = installed_distributions.DistributionKeys({"dist:gitmod": value}, [])
+    assert found == {"copied": expected, "linked-into-a-cache": expected}, found
 
 
 def test_a_project_file_linked_to_an_index_file_beside_a_recordless_egg_info_refuses_nothing(
@@ -1457,7 +1503,7 @@ def test_a_project_file_linked_to_an_index_file_beside_a_recordless_egg_info_ref
         _helper_install_by_hand(
             root, layout, "gitlib", {"gitlib.py": "LIB = 1\n"}, installed_dists.UV_GIT_URL
         )
-        project = _helper_link_into_project(root, site, "mod.py", layout)
+        project = _helper_link_by_hand(root / "project", site, "mod.py", layout)
         _helper_project_egg_info(project, "gitlib")
         found[layout] = installed_distributions.distribution_keys(
             {"mod": installed_dists.module_loaded_from(project / "mod.py")},
@@ -1494,7 +1540,7 @@ def test_a_project_file_linked_to_an_unlisted_file_beside_a_recordless_egg_info_
             cached = root / "cache" / "orphan.py"
             cached.write_text("ORPHAN = 1\n")
             (site / "orphan.py").symlink_to(cached)
-        project = _helper_link_into_project(root, site, "orphan.py", layout)
+        project = _helper_link_by_hand(root / "project", site, "orphan.py", layout)
         _helper_project_egg_info(project, "gitlib")
         found[layout] = installed_distributions.distribution_keys(
             {"orphan": installed_dists.module_loaded_from(project / "orphan.py")},
@@ -1504,38 +1550,6 @@ def test_a_project_file_linked_to_an_unlisted_file_beside_a_recordless_egg_info_
 
     nothing = installed_distributions.DistributionKeys({}, [])
     assert found == {"copied": nothing, "linked-into-a-cache": nothing}, found
-
-
-def test_a_recordless_git_install_and_a_recordless_egg_info_give_one_refusal_in_each_layout(
-    tmp_path: pathlib.Path,
-) -> None:
-    """In each layout (the installed files copied, or linked into a cache), `gitmod`, installed
-    by hand into `site-packages` as uv installs from git, has lost its RECORD, and the project
-    root, first on the path, holds `myproj.egg-info`, with no RECORD, which requires `gitmod`, and
-    `project/gitmod.py`, a link made by hand to `site-packages/gitmod.py`. The stage reaches
-    `gitmod` through the project file. Both layouts refuse it with one refusal, naming the
-    module's file in `site-packages`, where Pivot judges the project file in both
-    (`fingerprint.judged_file`); no refusal names `myproj`, since the project root is neither
-    where Pivot judges the file nor where it resolves. Judged at the project file where it is a
-    copy, the copied layout alone would refuse it a second time, for `myproj`."""
-    found = dict[str, installed_distributions.DistributionKeys]()
-    for layout in _LAYOUTS:
-        root = tmp_path / layout
-        site = _helper_install_by_hand(
-            root, layout, "gitmod", {"gitmod.py": "VALUE = 1\n"}, installed_dists.UV_GIT_URL
-        )
-        installed_dists.damage(site / "gitmod-0.1.dist-info" / "RECORD", None)
-        project = _helper_link_into_project(root, site, "gitmod.py", layout)
-        _helper_project_egg_info(project, "gitmod")
-        keys = installed_distributions.distribution_keys(
-            {"gitmod": installed_dists.module_loaded_from(project / "gitmod.py")},
-            [str(project), str(site)],
-            _PIVOT_DIRS,
-        )
-        found[layout] = _helper_written_site(keys, site)
-
-    refused = installed_distributions.DistributionKeys({}, [_RECORDLESS_GITMOD_REFUSAL])
-    assert found == {"copied": refused, "linked-into-a-cache": refused}, found
 
 
 def test_a_project_package_linked_file_by_file_gets_the_keys_of_each_install_in_its_directory(
@@ -1560,8 +1574,8 @@ def test_a_project_package_linked_file_by_file_gets_the_keys_of_each_install_in_
         _helper_install_by_hand(
             root, layout, "pkgplugin", {"pkg/plugin.py": "PLUGIN = 1\n"}, installed_dists.UV_GIT_URL
         )
-        project = _helper_link_into_project(root, site, "pkg/__init__.py", layout)
-        _helper_link_into_project(root, site, "pkg/plugin.py", layout)
+        project = _helper_link_by_hand(root / "project", site, "pkg/__init__.py", layout)
+        _helper_link_by_hand(project, site, "pkg/plugin.py", layout)
         found[layout] = installed_distributions.distribution_keys(
             {"pkg": installed_dists.module_loaded_from(project / "pkg" / "__init__.py")},
             [str(project), str(site)],

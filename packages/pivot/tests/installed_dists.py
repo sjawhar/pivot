@@ -468,9 +468,10 @@ def index_install_by_hand(
 def module_loaded_from(found: pathlib.Path) -> installed_distributions.ReachedModule:
     """What `fingerprint.add_distribution_keys` gives of a module this process loaded from the
     file the import found at `found` (`fingerprint.reached_module_of`): the origin
-    `import_origin.of_module` gives it, the file resolved, and the file Pivot judges that file by
-    (`fingerprint.judged_file`). Pivot 0.10.4 has no `fingerprint.reached_module_of`, which is
-    looked up only when this is called, so the tests that use this module still collect there."""
+    `import_origin.of_module` gives it, the file resolved, the file Pivot judges that file by
+    (`fingerprint.judged_file`) and the further library files of its chain of links. Pivot 0.10.4
+    has no `fingerprint.reached_module_of`, which is looked up only when this is called, so the
+    tests that use this module still collect there."""
     return fingerprint.reached_module_of(("file", os.path.realpath(found)), str(found))
 
 

@@ -128,9 +128,10 @@ _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
-# The most symbolic links `judged_file` follows from a file to a library path: Linux's limit on
-# the links one path lookup follows (MAXSYMLINKS, 40). A file whose chain needs more is judged
-# where the import found it.
+# The most symbolic links `_library_chain` follows from a file: Linux's limit on the links one path
+# lookup follows (MAXSYMLINKS, 40). A file whose chain reaches a library path only after more is
+# judged where the import found it, and no library file the chain reaches only after more is a
+# place the file lies in (`reached_module_of`).
 _MAX_LINK_HOPS = 40
 
 # Type alias for AST hash cache entry tuple.
@@ -2474,10 +2475,11 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     a worker would import it from, predicted without importing it (`loaded_source.worker_spec`,
     which gives the origin and the file at once). Beside it goes the file Pivot judges the
     module's file by (`judged_file` of the module's file as its import located it, else of the
-    predicted spec's): in a venv uv links into its cache the origin lies in the cache, and only
-    that file names the site directory and the package's directory where `is_library_file`
-    decided, where another distribution may put a file. No origin is found when the manifest has
-    no `byname:` entry, or when no distribution on the worker's path can give a key or a refusal
+    predicted spec's), and the further library files of its chain of links: in a venv uv links
+    into its cache the origin lies in the cache, and only those files name the site directories
+    and the package's directory where the chain of links reaches a library path, where another
+    distribution may put a file. No origin is found when the manifest has no `byname:` entry, or
+    when no distribution on the worker's path can give a key or a refusal
     (`installed_distributions.needs_origins`)."""
     names = _by_name_names(manifest)
     if not names:
@@ -2519,14 +2521,17 @@ def reached_module_of(
 ) -> installed_distributions.ReachedModule:
     """What `installed_distributions` takes of a module a stage reaches by name, whose origin is
     `origin` and whose file, as its import located it or would locate it, is `file`: that origin,
-    and the file Pivot judges `file` by (`judged_file`), None when it has none, so the keys and
-    the refusals name the site directory and the package directory where `is_library_file`
-    decided. For a file whose path with its directory resolved is a library path already (every
-    file of a venv, copied or linked into uv's cache), that is `with_real_directory(file)`. The
-    one builder of both a module this process holds (`_held_module`) and one a worker would
-    import (`loaded_source.worker_spec`)."""
+    the file Pivot judges `file` by (`judged_file`, `real`), and the further files of its chain
+    of links that are library paths (`_library_chain`, `hops`); no file and no hops when it has
+    none. So the keys and the refusals name the site directories and the package directory where
+    the chain of links reaches a library path. For a file whose path with its directory resolved
+    is a library path already (every file of a venv, copied or linked into uv's cache), `real` is
+    `with_real_directory(file)`. The one builder of both a module this process holds
+    (`_held_module`) and one a worker would import (`loaded_source.worker_spec`)."""
+    if file is None:
+        return installed_distributions.ReachedModule(origin, None)
     return installed_distributions.ReachedModule(
-        origin, None if file is None else judged_file(file)
+        origin, judged_file(file), _library_chain(file)[1:]
     )
 
 
@@ -7127,25 +7132,40 @@ def is_library_file(filename: str) -> bool:
 def judged_file(filename: str) -> str:
     """The file Pivot judges the file ``filename`` by (``is_library_file``), which
     ``reached_module_of`` gives ``installed_distributions`` to name the site directory and the
-    package directory of a module. Pivot starts from the file as the import found it
-    (``with_real_directory``), follows its chain of symbolic links one link at a time to the file
-    each link names (``_link_hop``), and gives the first file of the chain that is a library
-    path, whatever the resolved path is, so a project file linked by hand to a file of
-    ``site-packages`` is judged there both where that file is a copy and where it is a link into
-    uv's cache. It gives the file as the import found it when the chain meets a file that is no
-    library path and no link Pivot can read, or reaches no library path within
-    ``_MAX_LINK_HOPS`` links (a loop of links among them). For a file whose own path with its
-    directory resolved is a library path already (every file of a venv, copied or linked into
-    uv's cache), that is the file as the import found it: Pivot follows no link. Decided once per
-    file name per process."""
-    found = with_real_directory(filename)
-    hop, links = found, 0
-    while not is_library_path(pathlib.Path(hop)):
+    package directory of a module: the first file of its chain of symbolic links that is a
+    library path (``_library_chain``), whatever the resolved path is, so a project file linked by
+    hand to a file of ``site-packages`` is judged there both where that file is a copy and where
+    it is a link into uv's cache. The file as the import found it (``with_real_directory``) when
+    no file of the chain is a library path: the chain meets a file that is no library path and
+    no link Pivot can read, or reaches no library path within ``_MAX_LINK_HOPS`` links (a loop of
+    links among them). For a file whose own path with its directory resolved is a library path
+    already (every file of a venv, copied or linked into uv's cache), that is the file as the
+    import found it. Decided once per file name per process."""
+    chain = _library_chain(filename)
+    return chain[0] if chain else with_real_directory(filename)
+
+
+@functools.lru_cache(maxsize=4096)
+def _library_chain(filename: str) -> tuple[str, ...]:
+    """The files of the chain of symbolic links from the file ``filename`` that are library paths
+    (``is_library_path``), each once, in the order of the chain. Pivot starts from the file as the
+    import found it (``with_real_directory``) and follows the chain one link at a time to the file
+    each link names (``_link_hop``), to its end: a file that is no link Pivot can read, or
+    ``_MAX_LINK_HOPS`` links in all. The first is the file Pivot judges ``filename`` by
+    (``judged_file``); the others are the further places the file lies in, which
+    ``installed_distributions`` checks for a file that no RECORD lists (``reached_module_of``):
+    ``A/site-packages/m.py``, a link made by hand to ``B/site-packages/m.py``, lies in both,
+    whether ``B``'s file is a copy or a link into uv's cache. Each file of the chain costs one
+    ``os.readlink``. Decided once per file name per process."""
+    hop, links = with_real_directory(filename), 0
+    chain = dict[str, None]()
+    while True:
+        if is_library_path(pathlib.Path(hop)):
+            chain[hop] = None
         target = _link_hop(hop) if links < _MAX_LINK_HOPS else None
         if target is None:
-            return found
+            return tuple(chain)
         hop, links = target, links + 1
-    return hop
 
 
 def _link_hop(link: str) -> str | None:
@@ -7166,7 +7186,7 @@ def _link_hop(link: str) -> str | None:
 def with_real_directory(filename: str) -> str:
     """The file ``filename`` made absolute, its directory resolved and its last name kept: the
     file as the import found it, whatever links its directory was reached through, and, where
-    the file is itself a link, not where that link points. ``judged_file`` starts the chain of
+    the file is itself a link, not where that link points. ``_library_chain`` starts the chain of
     links it follows from it."""
     absolute = os.path.abspath(filename)
     return os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
