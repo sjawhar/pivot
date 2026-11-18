@@ -15,8 +15,10 @@ when `packages/pivot/src` is pivot 0.10.4's.
 
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
-(`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, the refusals of a
-broken install, word for word, with the start pivot gives each for `STAGE` (`STAGE_PREFIX`), the
+(`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, the two refusals of an
+install Pivot cannot read, word for word, as templates (`DISTRIBUTION_REFUSAL`,
+`UNLISTED_FILE_REFUSAL`) and as those of a broken install of the fixtures, with the start pivot
+gives each for `STAGE`, in an error (`STAGE_FAILED`) and in a warning (`STAGE_PREFIX`), the
 layout flit's `install --symlink` gives an editable install (`flit_symlink_install`), built by
 hand since CI has no flit, the layout uv gives an install from a package index, its files copied
 or linked into a cache (`index_install_by_hand`), built by hand for the tests that start no
@@ -112,30 +114,56 @@ def main():
     print(value())
 """
 
-# The refusals of a broken install, word for word, `{site}` the venv's resolved site-packages.
-UNCLASSIFIED_REFUSAL = (
-    "Distribution 'fix-lib' ({site}/fix_lib-0.1.dist-info), which this stage reaches, is "
-    "installed in a form Pivot cannot classify: its direct_url.json is not a JSON object. Pivot "
-    "cannot fingerprint the installed code the stage runs, so the stage could skip a run after "
-    "that code changes. Fix: reinstall 'fix-lib'."
+# The two refusals pivot gives of an install it cannot read, word for word, each a template for
+# `str.format`, so that a change to the words of either is made here alone: a distribution's
+# (`installed_distributions.decide`), `{how}` being `REACHED` or `DEPENDED_ON`, and that of a
+# reached module whose file no RECORD lists beside a distribution with no RECORD
+# (`installed_distributions.distribution_keys`), `{form}` saying how that distribution is
+# installed (an `InstallForm`'s value) and `{problem}` what is wrong with its RECORD.
+DISTRIBUTION_REFUSAL = (
+    "Distribution '{name}' ({dist_info}), which {how}, {reason}. Pivot cannot fingerprint the "
+    "installed code the stage runs, so the stage could skip a run after that code changes. Fix: "
+    "reinstall '{name}'."
 )
-RECORDLESS_DEPENDENCY_REFUSAL = (
-    "Distribution 'fixdep' ({site}/fixdep-0.1.dist-info), which a distribution this stage "
-    "reaches depends on, is installed from a local directory (dir_info) and has no RECORD file, "
-    "so Pivot cannot read its files. Pivot cannot fingerprint the installed code the stage runs, "
-    "so the stage could skip a run after that code changes. Fix: reinstall 'fixdep'."
+REACHED = "this stage reaches"
+DEPENDED_ON = "a distribution this stage reaches depends on"
+UNLISTED_FILE_REFUSAL = (
+    "Module '{module}' ({file}) lies in {site}, where distribution '{name}' ({dist_info}), "
+    "installed {form}, {problem}, and no RECORD file there lists that file. Pivot cannot tell "
+    "whether the stage runs that distribution's code, so the stage could skip a run after it "
+    "changes. Fix: reinstall '{name}'."
 )
-# A reached module `{module}`, whose file `{file}` no RECORD lists, beside `Fix_Lib` with no RECORD.
-UNLISTED_REFUSAL = (
-    "Module '{module}' ({site}/{file}) lies in {site}, where distribution 'fix-lib' "
-    "({site}/fix_lib-0.1.dist-info), installed from a local directory (dir_info), has no RECORD "
-    "file, and no RECORD file there lists that file. Pivot cannot tell whether the stage runs "
-    "that distribution's code, so the stage could skip a run after it changes. Fix: reinstall "
-    "'fix-lib'."
+# The refusals of a broken install of `Fix_Lib` and `fixdep`, `{site}` left in each for the venv's
+# resolved site-packages.
+UNCLASSIFIED_REFUSAL = DISTRIBUTION_REFUSAL.format(
+    name="fix-lib",
+    dist_info="{site}/fix_lib-0.1.dist-info",
+    how=REACHED,
+    reason="is installed in a form Pivot cannot classify: its direct_url.json is not a JSON object",
 )
-# How pivot starts each of those refusals of `STAGE`, and the warning unsafe fingerprinting gives
-# in its place, as it starts every refusal it can downgrade: with the stage's name.
+RECORDLESS_DEPENDENCY_REFUSAL = DISTRIBUTION_REFUSAL.format(
+    name="fixdep",
+    dist_info="{site}/fixdep-0.1.dist-info",
+    how=DEPENDED_ON,
+    reason="is installed from a local directory (dir_info) and has no RECORD file, so Pivot "
+    + "cannot read its files",
+)
+# A reached module `{module}`, whose file `{file}` no RECORD lists, beside `Fix_Lib` with no RECORD:
+# `{module}` and `{file}`, relative to `{site}`, left in it too.
+UNLISTED_REFUSAL = UNLISTED_FILE_REFUSAL.format(
+    module="{module}",
+    file="{site}/{file}",
+    site="{site}",
+    name="fix-lib",
+    dist_info="{site}/fix_lib-0.1.dist-info",
+    form="from a local directory (dir_info)",
+    problem="has no RECORD file",
+)
+# How pivot starts the warning unsafe fingerprinting gives of `STAGE` in place of each of those
+# refusals, as it starts every refusal it can downgrade: with the stage's name.
 STAGE_PREFIX = f"Stage '{STAGE}': "
+# How the error of a refused `STAGE` starts: the stage's name once, before its first refusal.
+STAGE_FAILED = f"{STAGE_PREFIX}fingerprinting failed: "
 
 # The `.dist-info` directory of the `flitlib` that `flit_symlink_install` installs, and the
 # METADATA flit 4.2.0 wrote in it.

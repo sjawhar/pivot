@@ -25,15 +25,20 @@ from pivot import installed_distributions
 
 _FORM = installed_distributions.InstallForm
 
-# The refusal of reached module `{module}`, whose file `{file}` lies in site directory `{site}`,
-# where `{name}` 0.1, installed `{form}`, has no RECORD (`_helper_recordless_install`), and no
-# RECORD lists that file.
-_UNLISTED_REFUSAL = (
-    "Module '{module}' ({file}) lies in {site}, where distribution '{name}' "
-    "({site}/{name}-0.1.dist-info), installed {form}, has no RECORD file, and no RECORD file "
-    "there lists that file. Pivot cannot tell whether the stage runs that distribution's code, "
-    "so the stage could skip a run after it changes. Fix: reinstall '{name}'."
-)
+
+def _helper_unlisted_refusal(module: str, file: str, site: str, name: str, form: str) -> str:
+    """The refusal of reached module `module`, whose file `file` lies in site directory `site`,
+    where `name` 0.1, installed `form`, has no RECORD (`_helper_recordless_install`), and no
+    RECORD lists that file."""
+    return installed_dists.UNLISTED_FILE_REFUSAL.format(
+        module=module,
+        file=file,
+        site=site,
+        name=name,
+        dist_info=f"{site}/{name}-0.1.dist-info",
+        form=form,
+        problem="has no RECORD file",
+    )
 
 
 def _helper_recordless_install(site: pathlib.Path, name: str, direct_url: bytes) -> None:
@@ -71,7 +76,7 @@ def test_a_module_file_linked_into_another_path_entry_is_refused_beside_its_reco
     )
 
     site = os.path.realpath(first)
-    refusal = _UNLISTED_REFUSAL.format(
+    refusal = _helper_unlisted_refusal(
         module="x", file=f"{site}/x.py", site=site, name="xlib", form=_FORM.LOCAL_DIRECTORY.value
     )
     expected = installed_distributions.DistributionKeys({}, [refusal])
@@ -97,7 +102,7 @@ def test_a_module_file_linked_to_another_file_of_its_path_entry_is_refused_as_fo
     )
 
     real_site = os.path.realpath(site)
-    refusal = _UNLISTED_REFUSAL.format(
+    refusal = _helper_unlisted_refusal(
         module="x",
         file=f"{real_site}/x.py",
         site=real_site,
@@ -130,7 +135,7 @@ def test_a_project_file_linked_into_a_package_of_a_recordless_install_is_refused
     )
 
     real_site = os.path.realpath(site)
-    refusal = _UNLISTED_REFUSAL.format(
+    refusal = _helper_unlisted_refusal(
         module="helper",
         file=f"{real_site}/x/helper.py",
         site=real_site,

@@ -68,12 +68,12 @@ with Pipeline("p") as pipeline:
 """
 
 # The refusal of `fixdep`, which `Fix_Lib` requires, when its `direct_url.json` is no JSON object,
-# word for word, `{site}` the venv's resolved site-packages.
-_UNCLASSIFIED_DEPENDENCY_REFUSAL = (
-    "Distribution 'fixdep' ({site}/fixdep-0.1.dist-info), which a distribution this stage "
-    "reaches depends on, is installed in a form Pivot cannot classify: its direct_url.json is "
-    "not a JSON object. Pivot cannot fingerprint the installed code the stage runs, so the stage "
-    "could skip a run after that code changes. Fix: reinstall 'fixdep'."
+# `{site}` left for the venv's resolved site-packages.
+_UNCLASSIFIED_DEPENDENCY_REFUSAL = installed_dists.DISTRIBUTION_REFUSAL.format(
+    name="fixdep",
+    dist_info="{site}/fixdep-0.1.dist-info",
+    how=installed_dists.DEPENDED_ON,
+    reason="is installed in a form Pivot cannot classify: its direct_url.json is not a JSON object",
 )
 
 
@@ -306,7 +306,7 @@ def test_a_broken_install_refuses_the_stage_with_one_error_in_a_copied_and_a_lin
     relative to site-packages, overwritten with `text` or deleted): the reached `Fix_Lib`'s
     `direct_url.json` made `[]`, which is no JSON object; `fixdep`'s RECORD deleted; `fixdep`'s
     `direct_url.json` made `[]`. The copied venv refuses the stage with `refusal`, after the
-    stage's name (`STAGE_PREFIX`), and the linked venv refuses it with the same `Error:` line.
+    stage's name, once (`STAGE_FAILED`), and the linked venv refuses it with the same `Error:` line.
     Only `reached-unclassified` depends on `fingerprint.is_library_file` taking as library code a
     linked module that only the RECORD of a distribution Pivot cannot classify lists.
     The two `dependency-` cases guard the parity of the two venvs on a path that the
@@ -323,8 +323,8 @@ def test_a_broken_install_refuses_the_stage_with_one_error_in_a_copied_and_a_lin
         installed_dists.damage(project.venv.site_packages / damaged, text)
         refusals[link_mode] = _helper_refusal(project, project.venv.site_packages)
 
-    expected = installed_dists.STAGE_PREFIX + refusal
-    assert refusals["copy"].endswith(expected), (
+    expected = f"Error: {installed_dists.STAGE_FAILED}{refusal}"
+    assert refusals["copy"] == expected, (
         f"the copied venv must refuse with:\n{expected}\n{refusals['copy']}"
     )
     assert refusals["symlink"] == refusals["copy"], (

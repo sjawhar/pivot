@@ -600,14 +600,16 @@ Limits:
 | A version file that setuptools-scm or hatch-vcs writes into the installed package | It holds the commit (or a version made from it), so every new commit of the library changes the key, and every stage that reaches the library reruns, whatever else changed |
 | One library installed from git on one machine and from a package index on another | The first machine's lock has a `dist:` key for it and the second's has none, so each machine reads the other's lock as stale (before this key, both had only `byname:` entries, which a lock leaves out) |
 
-Refusals: when Pivot cannot tell which installed code a stage runs, it refuses the stage with a
-message that starts with the stage's name (`Stage '<name>': `, as every refusal that unsafe
-fingerprinting can downgrade starts) and names the distribution, its `.dist-info` directory, the
-reason and the fix (reinstall it). It looks only when at least one distribution on the worker's
-`sys.path` is installed from git, a local path or a local archive, or has a `direct_url.json`
-Pivot cannot classify, and only at the distributions a stage needs: each one it reaches and each
-one those require, directly or through others. Pivot's own distribution refuses nothing. Each
-other is refused for the first of these that holds:
+Refusals: when Pivot cannot tell which installed code a stage runs, it refuses the stage with an
+error that names the stage once, first (`Stage '<name>': fingerprinting failed: `, then each
+refusal, a blank line between two), and names the distribution, its `.dist-info` directory, the
+reason and the fix (reinstall it); the warning that unsafe fingerprinting gives in its place
+starts with the stage's name (`Stage '<name>': `), as every refusal it can downgrade starts. It
+looks only when at least one distribution on the worker's `sys.path` is installed from git, a
+local path or a local archive, or has a `direct_url.json` Pivot cannot classify, and only at the
+distributions a stage needs: each one it reaches and each one those require, directly or through
+others. Pivot's own distribution refuses nothing. Each other is refused for the first of these
+that holds:
 
 1. Its `direct_url.json` cannot be read, is not JSON, is nested deeper than Python's JSON parser
    recurses, is not a JSON object, names none or more than one of `vcs_info`, `dir_info` and

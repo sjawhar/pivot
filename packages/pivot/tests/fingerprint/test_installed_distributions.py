@@ -466,27 +466,32 @@ def test_a_broken_install_the_stage_needs_is_refused_and_unsafe_fingerprinting_w
     file damaged (`damaged`, relative to site-packages, overwritten with `text` or deleted): a
     `direct_url.json` of the reached `Fix_Lib` that is not a JSON object; the RECORD of `fixdep`,
     which the closure meets by name; the RECORD of the reached `Fix_Lib`. `pivot repro` refuses
-    the stage with `refusal`, which names the distribution, after the stage's name
-    (`STAGE_PREFIX`). Under `core.unsafe_fingerprinting` it warns with the same message and runs
-    the stage, whose result is kept out of the run cache: with its lock deleted, the next `pivot
-    repro` runs it again, where a filed result would be restored."""
+    the stage with `refusal`, which names the distribution, after the stage's name, once
+    (`STAGE_FAILED`). Under `core.unsafe_fingerprinting` it warns with `refusal` after the
+    stage's name (`STAGE_PREFIX`) and runs the stage, whose result is kept out of the run cache:
+    with its lock deleted, the next `pivot repro` runs it again, where a filed result would be
+    restored."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src")
     installed_dists.install_directory(venv, fixdep)
     installed_dists.install_directory(venv, fixlib)
     project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("fixlib"))
     installed_dists.damage(venv.site_packages / damaged, text)
-    expected = installed_dists.STAGE_PREFIX + refusal.format(site=venv.site_packages.resolve())
+    message = refusal.format(site=venv.site_packages.resolve())
 
-    _helper_assert_refused(installed_dists.run_pivot(project, "repro", "--json"), expected)
+    _helper_assert_refused(
+        installed_dists.run_pivot(project, "repro", "--json"),
+        installed_dists.STAGE_FAILED + message,
+    )
     assert not (project.root / installed_dists.OUTPUT).exists(), (
         f"the refused {installed_dists.STAGE} must not run"
     )
 
     (project.root / ".pivot" / "config.yaml").write_text(_UNSAFE_CONFIG)
-    _helper_assert_runs_with_warning(project, expected, "unsafe `pivot repro`")
+    warning = installed_dists.STAGE_PREFIX + message
+    _helper_assert_runs_with_warning(project, warning, "unsafe `pivot repro`")
     installed_dists.lock_path(project, installed_dists.STAGE).unlink()
-    _helper_assert_runs_with_warning(project, expected, "with the lock deleted, `pivot repro`")
+    _helper_assert_runs_with_warning(project, warning, "with the lock deleted, `pivot repro`")
 
 
 @pytest.mark.parametrize(

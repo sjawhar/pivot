@@ -7,9 +7,10 @@ plain data: which files each key hashes, read from disk once per process; what t
 path reads; the refusals of an install Pivot cannot read, and which reached package directories
 the check of an install with no RECORD walks, and how far, once per process. Then
 `fingerprint.add_distribution_keys`, which looks up no module's origin when no install on the
-path can give a key, and one fingerprint, through the registry, of a stage that imports its
-installed library only in its body. Last, over files uv links into its cache (`--link-mode
-symlink`) and the editable layouts uv and flit's `install --symlink` make:
+path can give a key, and the fingerprint, through the registry, of a stage that imports its
+installed library only in its body, whose error names the stage once before its refusals. Last,
+over files uv links into its cache (`--link-mode symlink`) and the editable layouts uv and flit's
+`install --symlink` make:
 `installed_distributions.listed_by_editable`, which reads only the RECORDs of one directory's
 editable installs and builds no index of the candidates; `fingerprint.is_library_file`, which
 asks it only about a file linked under a library path; the keys of a namespace package and of a
@@ -56,6 +57,30 @@ def make() -> str:
 with Pipeline("p") as pipeline:
     make()
 """
+
+# A stage that imports, in its body, the installed `fixlib` and the project's module `unloaded`,
+# which discovery does not load, and the refusal of that import, which does not start with the
+# stage's name.
+_UNLOADED_BODY_IMPORT_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def make() -> str:
+    import fixlib
+    import unloaded
+
+    return fixlib.value() + unloaded.VALUE
+
+
+with Pipeline("p") as pipeline:
+    make()
+"""
+_UNLOADED_BODY_IMPORT_REFUSAL = (
+    "'make' imports user module 'unloaded' in its body, but pipeline discovery did not load it, "
+    "so Pivot cannot fingerprint it without running it. Fix: import it at module level (or in "
+    "pipeline.py) so discovery loads it, or move the value into the stage's StageParams."
+)
 
 # A module name of 197 letters: its file, with `.py`, has a name of 200 bytes.
 _LONG_MODULE = "m" * 197
@@ -172,29 +197,39 @@ def _helper_egg_info_project(
 # copies, as `--link-mode copy` leaves them, and links into a cache, as `--link-mode symlink` does.
 _LAYOUTS = ("copied", "linked-into-a-cache")
 
-# The refusal of a reached module `{module}` whose file `{site}/{module}.py` no RECORD lists beside
-# distribution `{module}`, installed by hand `{form}`, which has lost its RECORD
-# (`_helper_install_by_hand`); `{site}` stays in the message, as `_helper_written_site` writes it.
-_RECORDLESS_REFUSAL = (
-    "Module '{module}' ({{site}}/{module}.py) lies in {{site}}, where distribution '{module}' "
-    "({{site}}/{module}-0.1.dist-info), installed {form}, has no RECORD file, and no RECORD file "
-    "there lists that file. Pivot cannot tell whether the stage runs that distribution's code, so "
-    "the stage could skip a run after it changes. Fix: reinstall '{module}'."
-)
+
+def _helper_recordless_refusal(module: str, form: installed_distributions.InstallForm) -> str:
+    """The refusal of a reached module `module` whose file `{site}/<module>.py` no RECORD lists
+    beside distribution `module`, installed by hand `form`, which has lost its RECORD
+    (`_helper_install_by_hand`); `{site}` stays in the message, as `_helper_written_site` writes
+    it."""
+    site = "{site}"
+    return installed_dists.UNLISTED_FILE_REFUSAL.format(
+        module=module,
+        file=f"{site}/{module}.py",
+        site=site,
+        name=module,
+        dist_info=f"{site}/{module}-0.1.dist-info",
+        form=form.value,
+        problem="has no RECORD file",
+    )
+
 
 # The refusal of `gitmod`, installed by hand as from git, which has lost its RECORD.
-_RECORDLESS_GITMOD_REFUSAL = _RECORDLESS_REFUSAL.format(
-    module="gitmod", form=installed_distributions.InstallForm.VCS.value
+_RECORDLESS_GITMOD_REFUSAL = _helper_recordless_refusal(
+    "gitmod", installed_distributions.InstallForm.VCS
 )
 
 # The refusal of the reached module `mod`, whose file `{site}/mod.py` no RECORD lists, beside
 # `myproj.egg-info` in `{site}` (`_helper_project_egg_info`), as `_helper_written_site` writes it.
-_MYPROJ_MOD_REFUSAL = (
-    "Module 'mod' ({site}/mod.py) lies in {site}, where distribution 'myproj' "
-    "({site}/myproj.egg-info), installed with no direct_url.json, as from a package index, has "
-    "no RECORD file, and no RECORD file there lists that file. Pivot cannot tell whether the "
-    "stage runs that distribution's code, so the stage could skip a run after it changes. Fix: "
-    "reinstall 'myproj'."
+_MYPROJ_MOD_REFUSAL = installed_dists.UNLISTED_FILE_REFUSAL.format(
+    module="mod",
+    file="{site}/mod.py",
+    site="{site}",
+    name="myproj",
+    dist_info="{site}/myproj.egg-info",
+    form=installed_distributions.InstallForm.INDEX.value,
+    problem="has no RECORD file",
 )
 
 
@@ -692,12 +727,14 @@ def test_a_reached_package_is_walked_once_and_only_until_each_recordless_entry_h
     again = installed_distributions.distribution_keys(modules, path, _PIVOT_DIRS)
 
     inner = vendored.resolve()
-    unlisted_lock = (
-        f"Module 'company' ({inner}/.lock) lies in {inner}, where distribution 'fixother' "
-        f"({inner}/fixother-0.1.dist-info), installed from a local directory (dir_info), has no "
-        "RECORD file, and no RECORD file there lists that file. Pivot cannot tell whether the "
-        "stage runs that distribution's code, so the stage could skip a run after it changes. "
-        "Fix: reinstall 'fixother'."
+    unlisted_lock = installed_dists.UNLISTED_FILE_REFUSAL.format(
+        module="company",
+        file=f"{inner}/.lock",
+        site=inner,
+        name="fixother",
+        dist_info=f"{inner}/fixother-0.1.dist-info",
+        form=installed_distributions.InstallForm.LOCAL_DIRECTORY.value,
+        problem="has no RECORD file",
     )
     unlisted_stray = installed_dists.UNLISTED_REFUSAL.format(
         module="nsco", file="nsco/stray.py", site=site.resolve()
@@ -740,12 +777,13 @@ def test_reached_and_required_installs_pivot_cannot_read_are_refused(
     found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
     resolved = site.resolve()
-    unclassified = (
-        f"Distribution 'fixurl' ({resolved}/fixurl-0.1.dist-info), which this stage reaches, is "
-        f"installed in a form Pivot cannot classify: its direct_url.json cannot be read ([Errno "
-        f"21] Is a directory: '{resolved}/fixurl-0.1.dist-info/direct_url.json'). Pivot cannot "
-        "fingerprint the installed code the stage runs, so the stage could skip a run after that "
-        "code changes. Fix: reinstall 'fixurl'."
+    dist_info = f"{resolved}/fixurl-0.1.dist-info"
+    unclassified = installed_dists.DISTRIBUTION_REFUSAL.format(
+        name="fixurl",
+        dist_info=dist_info,
+        how=installed_dists.REACHED,
+        reason="is installed in a form Pivot cannot classify: its direct_url.json cannot be read "
+        + f"([Errno 21] Is a directory: '{dist_info}/direct_url.json')",
     )
     assert found == installed_distributions.DistributionKeys(
         {"dist:fix-lib": _helper_value(site, {"fixlib/__init__.py": "fixlib/__init__.py"})},
@@ -914,31 +952,66 @@ def test_a_listed_file_of_path_max_bytes_or_more_is_owned_and_not_refused(
     ), found
 
 
+@pytest.mark.parametrize(
+    ("pipeline_text", "damaged", "refusals"),
+    [
+        pytest.param(
+            _BODY_IMPORT_PIPELINE,
+            {"fix_lib-0.1.dist-info/direct_url.json": "[]"},
+            [installed_dists.UNCLASSIFIED_REFUSAL],
+            id="one-refusal",
+        ),
+        pytest.param(
+            _BODY_IMPORT_PIPELINE,
+            {"fix_lib-0.1.dist-info/direct_url.json": "[]", "fixdep-0.1.dist-info/RECORD": None},
+            [installed_dists.UNCLASSIFIED_REFUSAL, installed_dists.RECORDLESS_DEPENDENCY_REFUSAL],
+            id="two-refusals",
+        ),
+        pytest.param(
+            _UNLOADED_BODY_IMPORT_PIPELINE,
+            {"fix_lib-0.1.dist-info/direct_url.json": "[]"},
+            [_UNLOADED_BODY_IMPORT_REFUSAL, installed_dists.UNCLASSIFIED_REFUSAL],
+            id="a-refusal-that-does-not-name-the-stage-first",
+        ),
+    ],
+)
 def test_a_refusal_of_a_reached_install_fails_the_fingerprint_through_the_registry(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_text: str,
+    damaged: dict[str, str | None],
+    refusals: list[str],
 ) -> None:
-    """`Fix_Lib`, whose `direct_url.json` is not a JSON object, is installed in a site directory
-    on this process's path, and the stage imports its `fixlib` in its body, which no fingerprint
-    runs. The registry's fingerprint of the stage fails with the refusal, which names the
-    distribution after the stage's name, wrapped as every refusal is (`fingerprinting failed`, so
-    the stage is named twice, as for a non-scalar capture), and `fixlib` was not imported."""
+    """`Fix_Lib` and its requirement `fixdep` are installed in a site directory on this process's
+    path, and the stage imports `fixlib` in its body, which no fingerprint runs, and in
+    `_UNLOADED_BODY_IMPORT_PIPELINE` the project's module `unloaded`, which discovery did not
+    load. Then `damaged` (each file, relative to site-packages, overwritten with its text or
+    deleted): `Fix_Lib`'s `direct_url.json` made `[]`, which is no JSON object, and in
+    `two-refusals` `fixdep`'s RECORD deleted too. The registry's fingerprint of the stage fails
+    with an error that names the stage once, first (`STAGE_FAILED`), then each of `refusals` in
+    order, a blank line between two. A refusal of a distribution starts with the stage's name, as
+    the warning unsafe fingerprinting gives in its place does, and is given here without it; the
+    refusal of the body import, which does not start with it, keeps all of its text. `fixlib` was
+    not imported."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    source = installed_dists.write_library(
-        tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
-    )
-    installed_dists.install_directory(venv, source)
-    installed_dists.damage(venv.site_packages / "fix_lib-0.1.dist-info" / "direct_url.json", "[]")
+    fixlib, fixdep = installed_dists.write_fixlib_and_fixdep(tmp_path / "src")
+    installed_dists.install_directory(venv, fixdep)
+    installed_dists.install_directory(venv, fixlib)
+    for path, text in damaged.items():
+        installed_dists.damage(venv.site_packages / path, text)
     monkeypatch.syspath_prepend(str(venv.site_packages))
-    pipeline = helpers.discover_project(tmp_path, monkeypatch, {}, _BODY_IMPORT_PIPELINE)
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {"unloaded.py": 'VALUE = ":unloaded"\n'}, pipeline_text
+    )
 
     with pytest.raises(exceptions.PivotError) as raised:
         pipeline.ensure_fingerprint(installed_dists.STAGE)
 
-    refusal = installed_dists.UNCLASSIFIED_REFUSAL.format(site=venv.site_packages.resolve())
-    assert str(raised.value) == (
-        f"Stage '{installed_dists.STAGE}': fingerprinting failed: "
-        + f"{installed_dists.STAGE_PREFIX}{refusal}"
-    ), raised.value
+    site = venv.site_packages.resolve()
+    expected = installed_dists.STAGE_FAILED + "\n\n".join(
+        refusal.format(site=site) for refusal in refusals
+    )
+    assert str(raised.value) == expected, raised.value
     assert "fixlib" not in sys.modules, "fingerprinting must not import the stage's library"
 
 
@@ -1546,8 +1619,8 @@ def test_a_library_file_linked_to_a_recordless_install_outside_every_library_pat
         )
         found[layout] = _helper_written_site(keys, libs)
 
-    refusal = _RECORDLESS_REFUSAL.format(
-        module="wlib", form=installed_distributions.InstallForm.LOCAL_DIRECTORY.value
+    refusal = _helper_recordless_refusal(
+        "wlib", installed_distributions.InstallForm.LOCAL_DIRECTORY
     )
     refused = installed_distributions.DistributionKeys({}, [refusal])
     assert found == {"copied": refused, "linked-into-a-cache": refused}, found

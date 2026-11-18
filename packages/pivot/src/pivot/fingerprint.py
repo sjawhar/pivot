@@ -1590,7 +1590,22 @@ def _collected_capture_errors() -> Iterator[None]:
     finally:
         _capture_errors.reset(token)
     if errors:
-        raise exceptions.StageDefinitionError("\n\n".join(_merged_refusals(errors)))
+        raise exceptions.StageDefinitionError(_REFUSAL_SEPARATOR.join(_merged_refusals(errors)))
+
+
+# What `_collected_capture_errors` joins a stage's refusals with, raised together: a blank line.
+_REFUSAL_SEPARATOR = "\n\n"
+
+
+def without_stage_prefix(message: str, stage_name: str) -> str:
+    """`message`, the error of a fingerprint of stage `stage_name`, for a caller that names the
+    stage before it: each refusal in it (one, or several joined by `_REFUSAL_SEPARATOR`) that
+    starts with the stage's name (`_prefix_of`) is given without that start, and all other text
+    as it is."""
+    prefix = _prefix_of(stage_name)
+    return _REFUSAL_SEPARATOR.join(
+        refusal.removeprefix(prefix) for refusal in message.split(_REFUSAL_SEPARATOR)
+    )
 
 
 def refuse(message: str) -> None:
@@ -1989,28 +2004,19 @@ def _expand_class(cls: type) -> None:
         if tree is not None:
             _check_dynamic_access(cls, tree)
     _process_class_body_dependencies(cls)
-    entries = _entries()
     bases = _class_bases(cls)
     for index, base in enumerate(bases):
         if base is object:
             continue
         step = f"b:{index}"
         _record_read(cls, step)
-        if not is_user_code(base):
-            _mark_by_name(_reached_library_module(base), entries)
-            continue
-        with _walking(step):
-            _add_callable(base, in_value=True)
+        _class_edge(base, step, in_value=True)
     for index, base in enumerate(_statement_bases(cls)):
         if any(base is known for known in bases):
             continue
         step = f"ob:{index}"
         _record_read(cls, step)
-        if not is_user_code(base):
-            _mark_by_name(_reached_library_module(base), entries)
-            continue
-        with _walking(step):
-            _add_callable(base, in_value=True)
+        _class_edge(base, step, in_value=True)
     _process_user_methods(cls)
     _process_instance_class_attributes(cls)
     _process_dataclass_defaults(cls)
@@ -2029,6 +2035,18 @@ def _statement_bases(cls: type) -> tuple[type, ...]:
     if type(written) is not tuple:
         return ()
     return tuple(base for base in cast("tuple[Any, ...]", written) if issubclass(type(base), type))
+
+
+def _class_edge(target: type, step: str, *, in_value: bool = False) -> None:
+    """The edge `step` of the class node being expanded to class `target` (a base, or a class its
+    statement's annotations name): a library class is not walked, and the library module whose
+    code it runs is recorded by name (`_reached_library_module`); a user class is walked under
+    `step` (`_add_callable`, keyed inside a value when `in_value`)."""
+    if not is_user_code(target):
+        _mark_by_name(_reached_library_module(target), _entries())
+        return
+    with _walking(step):
+        _add_callable(target, in_value=in_value)
 
 
 def _process_user_methods(cls: type) -> None:
@@ -2419,6 +2437,17 @@ def _reached_library_module(value: object) -> str | None:
     return module_name
 
 
+def _library_callable_module(value: object, declared: object) -> str | None:
+    """The name of the module a worker imports to run library callable `value`, whose
+    `__module__` reads `declared` (each caller reads it its own way, since a reader decides what a
+    `__getattr__` that raises does): `declared` when it is a `str`, else the library module that
+    `_reached_library_module` gives, the one that binds `value` under its own name (scipy.special's
+    ufuncs name no `__module__`), or None."""
+    if type(declared) is str:
+        return declared
+    return _reached_library_module(value)
+
+
 @functools.lru_cache(maxsize=4096)
 def _in_pivot_packages(file: str) -> bool:
     """Whether a module's `file`, resolved, lies in one of pivot's own packages
@@ -2698,7 +2727,6 @@ def _process_class_body_dependencies(cls: type) -> None:
         if isinstance(stmt, ast.AnnAssign):
             _collect_annotation_names(stmt.annotation, names, dotted_refs)
 
-    entries = _entries()
     for name in sorted(names):
         _record_read(cls, f"n:{name}")
         if name not in ns:
@@ -2706,11 +2734,7 @@ def _process_class_body_dependencies(cls: type) -> None:
         value = ns[name]
         if not issubclass(type(value), type):
             continue
-        if not is_user_code(value):
-            _mark_by_name(_reached_library_module(value), entries)
-            continue
-        with _walking(f"n:{name}"):
-            _add_callable(value)
+        _class_edge(value, f"n:{name}")
 
     for parts in dotted_refs:
         step = f"np:{'.'.join(parts)}"
@@ -2718,11 +2742,7 @@ def _process_class_body_dependencies(cls: type) -> None:
         resolved = _resolve_dotted_path(parts, ns)
         if not issubclass(type(resolved), type):
             continue
-        if not is_user_code(resolved):
-            _mark_by_name(_reached_library_module(resolved), entries)
-            continue
-        with _walking(step):
-            _add_callable(resolved)
+        _class_edge(resolved, step)
 
 
 def _collect_annotation_names(
@@ -3385,7 +3405,7 @@ def _check_non_scalar_capture(
     if parameter is not None:
         subject += f" as the default of parameter '{parameter}'"
     message = (
-        f"Stage '{stage_name}': {subject} (type: {type(value).__name__}).\n"
+        f"{_prefix_of(stage_name)}{subject} (type: {type(value).__name__}).\n"
         + "Pivot tracks module-level bool, int, float, str, bytes, and None values, tuples and "
         + "frozensets of them, and compiled regexes. Other values may change without a reliable "
         + "fingerprint, which can cause silent wrong outputs.\n"
@@ -3403,7 +3423,12 @@ def _stage_prefix() -> str:
     """`Stage '<name>': `, which starts the message of a refusal unsafe fingerprinting can
     downgrade, so the warning it becomes names the stage it lets run: the stage that
     `stage_fingerprint_scope` names (`_current_stage_name`), or `<unknown>` outside one."""
-    return f"Stage '{_current_stage_name.get() or '<unknown>'}': "
+    return _prefix_of(_current_stage_name.get() or "<unknown>")
+
+
+def _prefix_of(stage_name: str) -> str:
+    """`Stage '<stage_name>': `, the start of a refusal of stage `stage_name` that names it."""
+    return f"Stage '{stage_name}': "
 
 
 def _field_opaque_message(binding: str) -> Callable[[tuple[str, ...], Any], str]:
@@ -3732,13 +3757,8 @@ def _process_captured_value(
             # A library function or class is named by where it is defined; its code is not
             # hashed, but rebinding the name to another one must change the manifest.
             entries[f"ext:{binding_ref}"] = _library_name(value)
-            module_name = getattr(value, "__module__", None)
-            if isinstance(module_name, str):
-                _mark_by_name(module_name, entries)
-            else:
-                # No `__module__` names where it is defined (scipy.special's ufuncs): the library
-                # module that binds it under its own name is the one a worker imports.
-                _mark_by_name(_reached_library_module(value), entries)
+            declared = getattr(value, "__module__", None)
+            _mark_by_name(_library_callable_module(value, declared), entries)
         case _ValueKind.LOGGER:
             return
         case _ValueKind.HOOKED:
@@ -4530,15 +4550,14 @@ class _FormBuilder:
         return ["external", _library_name(value)]
 
     def callable_module(self, value: Any) -> None:
-        """Report the module of library callable `value`, for the worker imports it by name: its
-        `__module__` when that names a loaded module, else, when it is not a string, the library
-        module that binds it (`reached_module`)."""
-        module = _attribute_or_none(value, "__module__")
-        if type(module) is str:
-            if isinstance(sys.modules.get(module), types.ModuleType):
-                self.report(_ReportKind.EXTERNAL, module)
-        else:
-            self.reached_module(value)
+        """Report the module of library callable `value`, for the worker imports it by name
+        (`_library_callable_module`), unless its `__module__` is a string that names no loaded
+        module."""
+        declared = _attribute_or_none(value, "__module__")
+        if type(declared) is str and not isinstance(sys.modules.get(declared), types.ModuleType):
+            return
+        if (module := _library_callable_module(value, declared)) is not None:
+            self.report(_ReportKind.EXTERNAL, module)
 
     def reached_module(self, value: Any, *steps: str) -> None:
         """Report, at `steps`, the library module whose code `value` runs, when the walk records
@@ -4904,18 +4923,15 @@ class _FormBuilder:
 
     def cache_wrapper(self, value: Any) -> Any:
         """A user cache's identity and statically readable settings, or a library name, its module
-        reported: its `__module__`, else, when that is not a string, the library module that binds
-        it (`reached_module`).
+        reported (`_library_callable_module`).
 
         Only the shared follower traverses user wrapper metadata. Replaced `cache_parameters`
         keeps unreadable settings in C and makes a user cache opaque.
         """
         if not is_user_code(value):
-            module = getattr(value, "__module__", None)
-            if type(module) is str:
+            declared = getattr(value, "__module__", None)
+            if (module := _library_callable_module(value, declared)) is not None:
                 self.report(_ReportKind.EXTERNAL, module)
-            else:
-                self.reached_module(value)
             return ["external", _library_name(value)]
         self.report(_ReportKind.FUNCTION, value)
         attributes = _instance_dict(_type_of(value), value) or {}
@@ -6942,7 +6958,7 @@ def _class_above_mark_message(value: Any) -> str:
     decorator = _definition_ref(type(instance))
     helper = _library_name(marked) if marked is not None else _definition_ref(instance)
     stage = _current_stage_name.get()
-    prefix = f"Stage '{stage}': " if stage else ""
+    prefix = _prefix_of(stage) if stage else ""
     return (
         f"{prefix}the class-based decorator '{decorator}' is above '{helper}', which is marked "
         + "@fingerprint_by_name.\n"

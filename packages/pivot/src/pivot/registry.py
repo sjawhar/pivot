@@ -536,7 +536,9 @@ def _check_output_path_free(
 
 
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict[str, str], bool]:
-    """Compute a stage fingerprint and whether a refusal in it was downgraded; wrap errors."""
+    """Compute a stage fingerprint and whether a refusal in it was downgraded; wrap errors in one
+    that names the stage once, first: a refusal that starts with the stage's name is given without
+    it (`fingerprint.without_stage_prefix`)."""
     try:
         with fingerprint.stage_fingerprint_scope(stage_name) as scope:
             no_fp = info["no_fingerprint"]
@@ -561,7 +563,10 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict
             fingerprint.add_distribution_keys(result)
         return fingerprint.without_by_name(result), scope["unsafe"]
     except Exception as exc:
-        raise exceptions.PivotError(f"Stage '{stage_name}': fingerprinting failed: {exc}") from exc
+        message = fingerprint.without_stage_prefix(str(exc), stage_name)
+        raise exceptions.PivotError(
+            f"Stage '{stage_name}': fingerprinting failed: {message}"
+        ) from exc
 
 
 def _wiring_manifest(info: RegistryStageInfo) -> dict[str, str]:

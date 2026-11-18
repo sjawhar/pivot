@@ -88,14 +88,11 @@ _PIP_RECORD = (
     b"fixlib/__pycache__/__init__.cpython-313.pyc,,\r\n"
 )
 
-# The refusal `decide` gives the distribution `_helper_installed` describes.
-_DECIDE_REFUSAL = (
-    f"Distribution 'fix-lib' ({_SITE}/fix_lib-0.1.dist-info), which {{how}}, {{reason}}. Pivot "
-    "cannot fingerprint the installed code the stage runs, so the stage could skip a run after "
-    "that code changes. Fix: reinstall 'fix-lib'."
+# The refusal `decide` gives the distribution `_helper_installed` describes, `{how}` and
+# `{reason}` left.
+_DECIDE_REFUSAL = installed_dists.DISTRIBUTION_REFUSAL.format(
+    name="fix-lib", dist_info=f"{_SITE}/fix_lib-0.1.dist-info", how="{how}", reason="{reason}"
 )
-_REACHES = "this stage reaches"
-_DEPENDED_ON = "a distribution this stage reaches depends on"
 _FIXLIB_RECORD = installed_distributions.Record(("fixlib/__init__.py",), "")
 _NO_RECORD = installed_distributions.Record(None, "has no RECORD file")
 _NO_METADATA = installed_distributions.Requirements(frozenset(), "has no METADATA file")
@@ -724,7 +721,7 @@ def test_owners_maps_an_origin_to_the_candidates_by_file(
             installed_distributions.Decision(
                 keyed=False,
                 refusal=_DECIDE_REFUSAL.format(
-                    how=_REACHES,
+                    how=installed_dists.REACHED,
                     reason="is installed in a form Pivot cannot classify: its direct_url.json "
                     + "is not a JSON object",
                 ),
@@ -740,7 +737,7 @@ def test_owners_maps_an_origin_to_the_candidates_by_file(
             installed_distributions.Decision(
                 keyed=False,
                 refusal=_DECIDE_REFUSAL.format(
-                    how=_DEPENDED_ON,
+                    how=installed_dists.DEPENDED_ON,
                     reason="is installed from version control (vcs_info) and has no RECORD file, "
                     + "so Pivot cannot read its files",
                 ),
@@ -756,7 +753,7 @@ def test_owners_maps_an_origin_to_the_candidates_by_file(
             installed_distributions.Decision(
                 keyed=True,
                 refusal=_DECIDE_REFUSAL.format(
-                    how=_REACHES,
+                    how=installed_dists.REACHED,
                     reason="has no METADATA file, so Pivot cannot tell what it depends on",
                 ),
             ),
@@ -771,7 +768,7 @@ def test_owners_maps_an_origin_to_the_candidates_by_file(
             installed_distributions.Decision(
                 keyed=False,
                 refusal=_DECIDE_REFUSAL.format(
-                    how=_DEPENDED_ON,
+                    how=installed_dists.DEPENDED_ON,
                     reason="has no METADATA file, so Pivot cannot tell what it depends on",
                 ),
             ),
