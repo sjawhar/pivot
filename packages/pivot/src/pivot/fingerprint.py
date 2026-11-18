@@ -7140,7 +7140,7 @@ def _places(filename: str) -> tuple[str, ...]:
     file as the import found it (``installed_distributions.link_chain`` of
     ``with_real_directory``), from its first file that is a library path (``judged_file``) to its
     end, every later file included, library path or not, so the check of a file that no RECORD
-    lists sees each path entry the links pass: ``A/site-packages/m.py``, a link made by hand to
+    lists sees the path entry of each of them: ``A/site-packages/m.py``, a link made by hand to
     ``B/site-packages/m.py`` or to ``P/libs/m.py`` (a ``--target`` directory), lies in both,
     whether that file is a copy or a link into uv's cache. The file as the import found it alone
     when no file of the chain is a library path. Decided once per file name per process."""

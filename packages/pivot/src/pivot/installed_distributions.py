@@ -55,8 +55,11 @@ directory, to the path `os.path.realpath` gives: a RECORD path of PATH_MAX bytes
 site directory by `realpath` alone, and every other path a name at a time from the nearest
 directory above it already resolved (a site directory, or one resolved for an earlier path): one
 `os.path.islink` for each new name, and `realpath` only for a name that is a symbolic link,
-empty, `.` or `..` (`_real_path`). `listed_by_editable` resolves no RECORD path: it compares each
-as written, normalised, with the file's path in its site directory.
+empty, `.` or `..` (`_real_path`). A walked file that is a symbolic link, and a reached module's
+file, also have their chain of links read (`link_chain`): one `os.readlink` and one
+`os.path.realpath` of its directory for each link, outside `_real_path`'s memo.
+`listed_by_editable` resolves no RECORD path: it compares each as written, normalised, with the
+file's path in its site directory.
 """
 
 from __future__ import annotations

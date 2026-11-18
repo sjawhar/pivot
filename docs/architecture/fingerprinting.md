@@ -646,14 +646,16 @@ resolved, or, for a link outside every library path, the first file of its chain
 is a library path) and in every later file of that chain, library path or not; a file under a
 package lies where the walk lists it in the package's directory and, for a symbolic link, in
 every later file of its chain (`installed_distributions.link_chain`, which follows at most 40
-links). So a module or package file linked from one entry into another that holds such a
-distribution is refused as the file it points to would be, also where that file is itself a link
-into uv's cache or the entry is no library path (a `--target` directory), while a file linked
-from an entry that holds one into an entry whose RECORD lists the file is not; where an
-installer links each file into its cache, where that cache lies outside every entry of the path,
-no entry holds the resolved path, and the file is judged where it lies (for a cache inside an
-entry, see the Limits below). And a setuptools project's own `<name>.egg-info`, in the project
-root first on `sys.path`, refuses nothing for a module in the site-packages of a `.venv` inside
+links). So a module's own file linked from one entry into another that holds such a distribution
+is refused, naming the file in that entry, also where that file is itself a link into uv's cache
+or the entry is no library path (a `--target` directory), and a module or package file linked
+into an entry whose RECORD lists the file is not refused; a walked package file is checked only in
+the entries the walk covers (below), so a link from it into another entry that holds such a
+distribution is not refused there. Where an installer links each file into its cache, where that
+cache lies outside every entry of the path, no entry holds the resolved path, and the file is
+judged where it lies (for a cache inside an entry, see the Limits below). And a setuptools
+project's own `<name>.egg-info`, in the project root first on `sys.path`, refuses nothing for a
+module in the site-packages of a `.venv` inside
 that root, which is a deeper entry, where uv's cache, if it links files, lies outside that root
 (see the Limits below). The files checked are the module's own and, for a package's `__init__`
 file or a namespace package, the files under its directories but those under a `__pycache__`
