@@ -58,15 +58,6 @@ with Pipeline("p") as pipeline:
 _LONG_MODULE = "m" * 197
 
 
-def _helper_module(path: pathlib.Path) -> installed_distributions.ReachedModule:
-    """What `fingerprint.add_distribution_keys` gives of a module loaded from the file at `path`:
-    the origin `import_origin.of_module` gives it, and `path`, its file as the import located
-    it, with its directory resolved (`_helper_real`)."""
-    return installed_distributions.ReachedModule(
-        ("file", os.path.realpath(path)), _helper_real(path)
-    )
-
-
 def _helper_namespace(directory: pathlib.Path) -> installed_distributions.ReachedModule:
     """What `fingerprint.add_distribution_keys` gives of a namespace package whose one directory
     is `directory`: the origin `import_origin.of_module` gives it, and no file."""
@@ -199,7 +190,7 @@ def test_distribution_keys_hash_each_reached_git_path_and_local_archive_install_
     installed_dists.install(venv, str(wheel))
     site = venv.site_packages
     modules = {
-        module: _helper_module(site / module / "__init__.py")
+        module: installed_dists.module_loaded_from(site / module / "__init__.py")
         for module in ("fixlib", "fixgit", "fixwheel")
     }
 
@@ -255,7 +246,7 @@ def test_a_pyc_file_outside_pycache_is_hashed_and_the_bytecode_pip_compiles_is_n
     assert listed == sorted(["fixlib/__init__.py", compiled, "fixlib/core.pyc"]), (
         f"pip's RECORD must list fixlib's two modules and the bytecode pip compiled: {listed}"
     )
-    modules = {"fixlib": _helper_module(site / "fixlib" / "__init__.py")}
+    modules = {"fixlib": installed_dists.module_loaded_from(site / "fixlib" / "__init__.py")}
     hashed = {name: name for name in ("fixlib/__init__.py", "fixlib/core.pyc")}
     values = [_helper_value(site, hashed)]
 
@@ -290,7 +281,7 @@ def test_distribution_keys_read_the_files_once_per_path_and_pivot_dirs_until_res
     installed_dists.install_directory(venv, source)
     site = venv.site_packages
     module = site / "fixlib" / "__init__.py"
-    modules = {"fixlib": _helper_module(module)}
+    modules = {"fixlib": installed_dists.module_loaded_from(module)}
     path = [str(site)]
     longer_path = [*path, str(tmp_path / "missing")]
     other_dirs = [*_PIVOT_DIRS, str(tmp_path / "other")]
@@ -349,8 +340,8 @@ def test_an_index_install_whose_metadata_cannot_be_read_refuses_nothing_with_no_
         b"Metadata-Version: 2.4\nName: idx\xe9\n"
     )
     modules = {
-        "fixedit": _helper_module(fixedit / "fixedit" / "__init__.py"),
-        "idxlib": _helper_module(site / "idxlib" / "__init__.py"),
+        "fixedit": installed_dists.module_loaded_from(fixedit / "fixedit" / "__init__.py"),
+        "idxlib": installed_dists.module_loaded_from(site / "idxlib" / "__init__.py"),
     }
 
     found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
@@ -389,7 +380,9 @@ def test_the_scan_skips_what_is_no_metadata_directory_and_reads_an_egg_info_dire
     path = [str(tmp_path / "missing"), f"{tmp_path}/nul\0entry", str(site), str(site), str(egg)]
 
     found = installed_distributions.distribution_keys(
-        {"fixlib": _helper_module(site / "fixlib" / "__init__.py")}, path, _PIVOT_DIRS
+        {"fixlib": installed_dists.module_loaded_from(site / "fixlib" / "__init__.py")},
+        path,
+        _PIVOT_DIRS,
     )
 
     assert found == installed_distributions.DistributionKeys(
@@ -449,10 +442,10 @@ def test_a_reached_file_no_record_lists_beside_a_recordless_install_is_refused_p
     core = site / "company" / "__init__.py"
     py_compile.compile(str(core), cfile=str(site / "company" / "legacy.pyc"), doraise=True)
     modules = {
-        "company": _helper_module(core),
-        "fixlib": _helper_module(site / "fixlib" / "__init__.py"),
-        "fixlib.helpers": _helper_module(site / "fixlib" / "helpers.py"),
-        "fixother": _helper_module(second / "fixother" / "__init__.py"),
+        "company": installed_dists.module_loaded_from(core),
+        "fixlib": installed_dists.module_loaded_from(site / "fixlib" / "__init__.py"),
+        "fixlib.helpers": installed_dists.module_loaded_from(site / "fixlib" / "helpers.py"),
+        "fixother": installed_dists.module_loaded_from(second / "fixother" / "__init__.py"),
         "missing": installed_distributions.ReachedModule(None, None),
         "nsco": _helper_namespace(site / "nsco"),
         "sys": installed_distributions.ReachedModule(("built-in",), None),
@@ -517,7 +510,7 @@ def test_a_reached_package_is_not_walked_for_a_recordless_install_in_another_pat
     site = venv.site_packages
     files_under = mocker.spy(installed_distributions, "_files_under")
     modules = {
-        "fixlib": _helper_module(site / "fixlib" / "__init__.py"),
+        "fixlib": installed_dists.module_loaded_from(site / "fixlib" / "__init__.py"),
         "nsco": _helper_namespace(site / "nsco"),
     }
 
@@ -578,7 +571,7 @@ def test_a_reached_package_is_walked_once_and_only_until_each_recordless_entry_h
     real_path = mocker.spy(installed_distributions, "_real_path")
     nsco = os.path.realpath(site / "nsco")
     modules = {
-        "company": _helper_module(site / "company" / "__init__.py"),
+        "company": installed_dists.module_loaded_from(site / "company" / "__init__.py"),
         "nsco": _helper_namespace(site / "nsco"),
     }
     path = [str(site), str(vendored)]
@@ -629,7 +622,8 @@ def test_reached_and_required_installs_pivot_cannot_read_are_refused(
     url = site / "fixurl-0.1.dist-info" / "direct_url.json"
     _helper_replace_with_directory(url)
     modules = {
-        module: _helper_module(site / module / "__init__.py") for module in ("fixlib", "fixurl")
+        module: installed_dists.module_loaded_from(site / module / "__init__.py")
+        for module in ("fixlib", "fixurl")
     }
 
     found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
@@ -665,7 +659,7 @@ def test_pivots_own_distribution_gets_no_key_and_its_requirements_are_not_follow
     )
     installed_dists.install_directory(venv, own)
     site = venv.site_packages
-    modules = {"pivot": _helper_module(site / "pivot" / "__init__.py")}
+    modules = {"pivot": installed_dists.module_loaded_from(site / "pivot" / "__init__.py")}
 
     as_pivot = installed_distributions.distribution_keys(
         modules, [str(site)], [os.path.realpath(site / "pivot")]
@@ -715,7 +709,7 @@ def test_a_listed_file_that_cannot_be_read_hashes_as_null_and_refuses_nothing(
     )
     installed_dists.install_directory(venv, source)
     site = venv.site_packages
-    modules = {"fixlib": _helper_module(site / "fixlib" / "__init__.py")}
+    modules = {"fixlib": installed_dists.module_loaded_from(site / "fixlib" / "__init__.py")}
     files: dict[str, str | None] = {
         "fixlib/__init__.py": "fixlib/__init__.py",
         "fixlib/extra.py": "fixlib/extra.py",
@@ -751,7 +745,7 @@ def test_a_record_path_holding_a_nul_character_hashes_as_null_and_refuses_nothin
     record = site / "fix_lib-0.1.dist-info" / "RECORD"
     record.write_bytes(record.read_bytes() + b"fixlib/\x00.py,,\n")
     installed_dists.damage(site / "fixdep-0.1.dist-info" / "RECORD", None)
-    modules = {"fixlib": _helper_module(site / "fixlib" / "__init__.py")}
+    modules = {"fixlib": installed_dists.module_loaded_from(site / "fixlib" / "__init__.py")}
 
     found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
@@ -799,7 +793,7 @@ def test_a_listed_file_of_path_max_bytes_or_more_is_owned_and_not_refused(
     site = moved / inside
     lengths = [len(os.fsencode(f"{site}/{path}")) for path in (listed, "fixlib")]
     assert lengths[0] == path_max > lengths[1], f"only {listed} may be PATH_MAX long: {lengths}"
-    modules = {module: _helper_module(site / file)}
+    modules = {module: installed_dists.module_loaded_from(site / file)}
 
     found = installed_distributions.distribution_keys(modules, [str(site)], _PIVOT_DIRS)
 
@@ -863,8 +857,8 @@ def test_a_venv_inside_the_project_root_beside_the_projects_egg_info_gets_its_ke
     assert requires == ["fixdep"], f"the project's egg-info must require fixdep: {requires}"
     site = venv.site_packages
     modules = {
-        "elsewhere": _helper_module(tmp_path / "elsewhere.py"),
-        "fixlib": _helper_module(site / "fixlib" / "__init__.py"),
+        "elsewhere": installed_dists.module_loaded_from(tmp_path / "elsewhere.py"),
+        "fixlib": installed_dists.module_loaded_from(site / "fixlib" / "__init__.py"),
     }
 
     found = installed_distributions.distribution_keys(modules, [str(root), str(site)], _PIVOT_DIRS)
@@ -903,7 +897,7 @@ def test_a_reached_module_of_an_index_egg_info_with_no_record_that_requires_a_lo
     mid = _helper_egg_info_project(
         venv, src, "mid", "fixdep", without_requires_dist=without_requires_dist
     )
-    modules = {"mid": _helper_module(mid / "mid" / "__init__.py")}
+    modules = {"mid": installed_dists.module_loaded_from(mid / "mid" / "__init__.py")}
 
     found = installed_distributions.distribution_keys(
         modules, [str(venv.site_packages), str(mid)], _PIVOT_DIRS
@@ -939,7 +933,7 @@ def test_an_egg_info_whose_metadata_names_no_requirement_is_followed_through_its
     site = venv.site_packages
 
     found = installed_distributions.distribution_keys(
-        {"fixlib": _helper_module(site / "fixlib" / "__init__.py")},
+        {"fixlib": installed_dists.module_loaded_from(site / "fixlib" / "__init__.py")},
         [str(site), str(mid)],
         _PIVOT_DIRS,
     )
@@ -1255,7 +1249,11 @@ def test_a_file_one_install_puts_in_anothers_package_is_reached_in_a_venv_uv_lin
 
     intact = [
         installed_distributions.distribution_keys(
-            {"company": _helper_module(venv.site_packages / "company" / "__init__.py")},
+            {
+                "company": installed_dists.module_loaded_from(
+                    venv.site_packages / "company" / "__init__.py"
+                )
+            },
             [str(venv.site_packages)],
             _PIVOT_DIRS,
         )
@@ -1266,7 +1264,11 @@ def test_a_file_one_install_puts_in_anothers_package_is_reached_in_a_venv_uv_lin
     installed_distributions.reset()
     recordless = [
         installed_distributions.distribution_keys(
-            {"company": _helper_module(venv.site_packages / "company" / "__init__.py")},
+            {
+                "company": installed_dists.module_loaded_from(
+                    venv.site_packages / "company" / "__init__.py"
+                )
+            },
             [str(venv.site_packages)],
             _PIVOT_DIRS,
         )

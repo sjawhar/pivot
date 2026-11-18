@@ -753,15 +753,16 @@ class _Snapshot:
         of the path that the scan listed and that holds the file where the import found it or
         the walk listed it, and the deepest that holds its resolved path (`_site_dir`), and a
         RECORD of either lists the file when one of its paths resolves to the file's resolved
-        path (`_find_unlisted`): in a venv whose installer links each file into its cache, no
-        entry holds the resolved path, which lies in the cache, as a resolved RECORD path does,
-        and a file linked into another entry of the path lies in both. A directory is walked only
-        for the site directories with such a candidate that can hold a file under it other than
-        through a symbolic link (the deepest entry of the path above the directory, and each
-        entry at or under it), and only until each of them has its file. The walk enters no
-        directory that is a symbolic link, so a file under such a link is not checked, and a file
-        under the directory that is a symbolic link into any other entry with such a candidate is
-        not checked there."""
+        path (`_find_unlisted`): in a venv whose installer links each file into its cache, where
+        that cache lies outside every entry of the path, no entry holds the resolved path, which
+        lies in the cache, as a resolved RECORD path does, and where the cache lies inside an entry
+        (under a project root on the path), that entry holds the resolved path too. A file linked
+        into another entry of the path lies in both. A directory is walked only for the site
+        directories with such a candidate that can hold a file under it other than through a
+        symbolic link (the deepest entry of the path above the directory, and each entry at or
+        under it), and only until each of them has its file. The walk enters no directory that is
+        a symbolic link, so a file under such a link is not checked, and a file under the directory
+        that is a symbolic link into any other entry with such a candidate is not checked there."""
         key = (name, module)
         if key not in self._unlisted_refusals:
             files, directories = _reached_paths(module.origin, module.real)
@@ -800,6 +801,8 @@ class _Snapshot:
         directory out of `pending`; once `pending` is empty, read no more of `files`."""
         for where, resolved in files:
             lies_in = dict[str, str]()  # site directory -> the file's path that lies in it
+            # The resolved path first, then where found, which wins in a site directory both lie
+            # in: the refusal names the file where the import found it or the walk listed it.
             for path in (resolved, where):
                 site_dir = self._site_dir(path)
                 if site_dir is not None:

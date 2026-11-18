@@ -394,7 +394,7 @@ _identity_active: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextV
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
 # type-hint classes (`_hint_parts`), user-class members (`_user_methods`), mark decisions
 # (`_mark_decision`), class identities (`_class_identity`), the parts of classes with no source
-# (`_sourceless_parts`) and a loaded module's origin and file (`_reached_module`), and by file
+# (`_sourceless_parts`) and a loaded module's origin and file (`_held_module`), and by file
 # name for source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
@@ -2485,12 +2485,9 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     for name in names:
         module = sys.modules.get(name)
         if isinstance(module, types.ModuleType):
-            modules[name] = _reached_module(module)
+            modules[name] = _held_module(module)
         else:
-            spec = loaded_source.worker_spec(name)
-            modules[name] = installed_distributions.ReachedModule(
-                spec.origin, None if spec.file is None else with_real_directory(spec.file)
-            )
+            modules[name] = reached_module(*loaded_source.worker_spec(name))
     found = installed_distributions.distribution_keys(modules, path, pivot_dirs)
     prefix = _stage_prefix()
     for message in found.refusals:
@@ -2498,19 +2495,31 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     manifest.update(found.keys)
 
 
-def _reached_module(module: types.ModuleType) -> installed_distributions.ReachedModule:
-    """What `installed_distributions` takes of a module this process holds: its origin
-    (`import_origin.of_module`) and its file as its import located it, with its directory
-    resolved (`import_origin.file_of_module`, `with_real_directory`), found once per module
-    object within one `fingerprint_pass()`."""
+def _held_module(module: types.ModuleType) -> installed_distributions.ReachedModule:
+    """What `installed_distributions` takes of a module this process holds (`reached_module`),
+    from its origin (`import_origin.of_module`) and its file as its import located it
+    (`import_origin.file_of_module`), found once per module object within one
+    `fingerprint_pass()`."""
+    return _memoized(
+        "reached-module",
+        module,
+        lambda: reached_module(
+            import_origin.of_module(module), import_origin.file_of_module(module)
+        ),
+    )
 
-    def read() -> installed_distributions.ReachedModule:
-        file = import_origin.file_of_module(module)
-        return installed_distributions.ReachedModule(
-            import_origin.of_module(module), None if file is None else with_real_directory(file)
-        )
 
-    return _memoized("reached-module", module, read)
+def reached_module(
+    origin: import_origin.Origin | None, file: str | None
+) -> installed_distributions.ReachedModule:
+    """What `installed_distributions` takes of a module a stage reaches by name, whose origin is
+    `origin` and whose file, as its import located it or would locate it, is `file`: that origin,
+    and that file with its directory resolved and its last name kept (`with_real_directory`),
+    None when it has none. The one builder of both a module this process holds (`_held_module`)
+    and one a worker would import (`loaded_source.worker_spec`)."""
+    return installed_distributions.ReachedModule(
+        origin, None if file is None else with_real_directory(file)
+    )
 
 
 def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:

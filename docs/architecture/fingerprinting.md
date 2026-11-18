@@ -642,8 +642,9 @@ resolved path, where a link points; a RECORD in either lists the file when one o
 resolves to the file's resolved path. So a module file linked from one entry into another that
 holds such a distribution is refused as the file it points to would be, while a file linked from
 an entry that holds one into an entry whose RECORD lists the file is not; where an installer
-links each file into its cache, no entry holds the resolved path, and the file is judged where
-it lies. And a setuptools project's own `<name>.egg-info`, in the project root first on
+links each file into its cache, where that cache lies outside every entry of the path, no entry
+holds the resolved path, and the file is judged where it lies (for a cache inside an entry, see
+the Limits below). And a setuptools project's own `<name>.egg-info`, in the project root first on
 `sys.path`, refuses nothing for a module in the site-packages of a `.venv` inside that root,
 which is a deeper entry. The files checked are the module's own and, for a package's `__init__`
 file or a namespace package, the files under its directories but those under a `__pycache__`
@@ -725,6 +726,7 @@ Limits:
 |-------|--------------|
 | A distribution with no `direct_url.json` is read as a package-index install, which is not editable. So a linked file that such a distribution's RECORD lists is an index library's: a module file that flit before 3.0 linked with `install --symlink` (flit wrote no `direct_url.json`, PEP 610, before 3.0), or a file of an index library that was replaced by hand with a link to a file elsewhere | The linked file is library code, recorded by name, so an edit to the file it points to reruns nothing. Pivot 0.10.4 resolved the link and walked its target as user code, so that edit reran the stage. Pivot reads no second sign of an editable install. A package directory that flit links is not affected: its files resolve into the checkout (rule 1). Fix: reinstall with a tool that writes `direct_url.json` (flit 3.0 or later, `pip install -e`, `uv pip install -e`) |
 | One entry of uv's cache linked from two entries of `sys.path`: the same wheel installed with `--link-mode symlink` into a virtual environment and into the environment it sees through `--system-site-packages`, or into a `--target` directory | The RECORDs of both installs resolve to the same files, so both own a module the stage reaches in either (a file is owned by its resolved path, a package's directory by where the import searched). For a git or local library the key's value then covers both installs, where copied files give the value of the one the stage imports, and a second install Pivot cannot read (a `direct_url.json` it cannot classify, requirements it cannot read) refuses the stage. That adds reruns and refusals only: no change is hidden |
+| uv's cache inside an entry of `sys.path`: `UV_CACHE_DIR` under the project root, which is on `sys.path`, for a virtual environment that uv builds with `--link-mode symlink` | A linked file's resolved path, in the cache, then lies in that entry too, so the check above judges the file there as well as where the import found it. Where that entry holds a distribution with no RECORD that Pivot looks at (a project's own `.egg-info` that requires a git library), a file the check covers that no RECORD lists (one of a distribution that has lost its RECORD) refuses the stage, named as it lies in the cache; with the cache outside every entry, that distribution refuses nothing for it. That fails closed: it adds a refusal only, for an install that is already broken, and hides no change |
 
 ### Module-Level Instances
 

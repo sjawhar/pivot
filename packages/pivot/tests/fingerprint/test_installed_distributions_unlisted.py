@@ -1,10 +1,11 @@
 """The refusal of a reached module's file that no RECORD lists beside an install with no RECORD
 (`installed_distributions.distribution_keys`), called in this process on site directories this
 test lays out by hand: a module file linked from one entry of the path into another that holds
-such an install, a project file linked into such an install's package, and a project file,
-beside such an install, linked to a file an index install's RECORD lists. A file lies in the
-entry where the import finds it and in the one it resolves into, and a RECORD of either lists
-it. No test starts a process.
+such an install, a module file linked to another file of the entry that holds one, a project
+file linked into such an install's package, and a project file, beside such an install, linked
+to a file an index install's RECORD lists. A file lies in the entry where the import finds it
+and in the one it resolves into, and a RECORD of either lists it; where both are one entry, the
+refusal names the file where the import found it. No test starts a process.
 
 The pure functions of `pivot.installed_distributions` are in
 `test_installed_distributions_rules.py`, and the same check over real installs in
@@ -16,7 +17,7 @@ import pathlib
 
 from tests import installed_dists
 
-from pivot import fingerprint, installed_distributions
+from pivot import installed_distributions
 
 _FORM = installed_distributions.InstallForm
 
@@ -41,15 +42,6 @@ def _helper_recordless_install(site: pathlib.Path, name: str, direct_url: bytes)
     (dist_info / "direct_url.json").write_bytes(direct_url)
 
 
-def _helper_reached(found: pathlib.Path) -> installed_distributions.ReachedModule:
-    """What `fingerprint.add_distribution_keys` gives of a module this process loaded from the
-    file the import found at `found`: the origin `import_origin.of_module` gives it, the file
-    resolved, and that file with its directory resolved (`fingerprint.with_real_directory`)."""
-    return installed_distributions.ReachedModule(
-        ("file", os.path.realpath(found)), fingerprint.with_real_directory(str(found))
-    )
-
-
 def test_a_module_file_linked_into_another_path_entry_is_refused_beside_its_recordless_install(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -68,10 +60,10 @@ def test_a_module_file_linked_into_another_path_entry_is_refused_beside_its_reco
     path = [str(second), str(first)]
 
     linked = installed_distributions.distribution_keys(
-        {"x": _helper_reached(second / "x.py")}, path, ()
+        {"x": installed_dists.module_loaded_from(second / "x.py")}, path, ()
     )
     found_there = installed_distributions.distribution_keys(
-        {"x": _helper_reached(first / "x.py")}, path, ()
+        {"x": installed_dists.module_loaded_from(first / "x.py")}, path, ()
     )
 
     site = os.path.realpath(first)
@@ -80,6 +72,35 @@ def test_a_module_file_linked_into_another_path_entry_is_refused_beside_its_reco
     )
     expected = installed_distributions.DistributionKeys({}, [refusal])
     assert [linked, found_there] == [expected, expected], [linked, found_there]
+
+
+def test_a_module_file_linked_to_another_file_of_its_path_entry_is_refused_as_found(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`xlib`, installed from a local directory into `site-packages`, has lost its RECORD, and
+    `x.py` beside it is a link to `sub/y.py`. The file lies in `site-packages` both where the
+    import of `x` finds it and where it resolves, and no RECORD there lists it: the stage that
+    reaches `x` is refused once, naming the file where the import found it, `x.py`, not
+    `sub/y.py`."""
+    site = tmp_path / "site-packages"
+    _helper_recordless_install(site, "xlib", installed_dists.UV_DIRECTORY_URL)
+    (site / "sub").mkdir()
+    (site / "sub" / "y.py").write_text("Y = 1\n")
+    (site / "x.py").symlink_to(site / "sub" / "y.py")
+
+    found = installed_distributions.distribution_keys(
+        {"x": installed_dists.module_loaded_from(site / "x.py")}, [str(site)], ()
+    )
+
+    real_site = os.path.realpath(site)
+    refusal = _UNLISTED_REFUSAL.format(
+        module="x",
+        file=f"{real_site}/x.py",
+        site=real_site,
+        name="xlib",
+        form=_FORM.LOCAL_DIRECTORY.value,
+    )
+    assert found == installed_distributions.DistributionKeys({}, [refusal]), found
 
 
 def test_a_project_file_linked_into_a_package_of_a_recordless_install_is_refused(
@@ -99,7 +120,9 @@ def test_a_project_file_linked_into_a_package_of_a_recordless_install_is_refused
     (root / "helper.py").symlink_to(site / "x" / "helper.py")
 
     found = installed_distributions.distribution_keys(
-        {"helper": _helper_reached(root / "helper.py")}, [str(root), str(site)], ()
+        {"helper": installed_dists.module_loaded_from(root / "helper.py")},
+        [str(root), str(site)],
+        (),
     )
 
     real_site = os.path.realpath(site)
@@ -129,10 +152,10 @@ def test_a_project_file_linked_to_a_file_an_index_record_lists_is_not_refused(
     path = [str(root), str(site)]
 
     linked = installed_distributions.distribution_keys(
-        {"y": _helper_reached(root / "y.py")}, path, ()
+        {"y": installed_dists.module_loaded_from(root / "y.py")}, path, ()
     )
     found_there = installed_distributions.distribution_keys(
-        {"y": _helper_reached(site / "y.py")}, path, ()
+        {"y": installed_dists.module_loaded_from(site / "y.py")}, path, ()
     )
 
     expected = installed_distributions.DistributionKeys({}, [])

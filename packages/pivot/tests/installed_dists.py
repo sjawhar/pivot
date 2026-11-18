@@ -9,17 +9,19 @@ by uv or by the venv's own pip, runs offline without build isolation. Pivot runs
 directory off `sys.path`, as the `pivot` console script does. `make_standalone_venv` makes instead
 a venv without that `.pth` file, into which uv installs a released pivot from the package index and
 fixtures it builds with build isolation. This module imports only the standard library, pytest,
-PyYAML, `tests.helpers` and the `pivot` package, so the tests that use it still collect when
-`packages/pivot/src` is pivot 0.10.4's.
+PyYAML, `tests.helpers`, the `pivot` package and its `fingerprint` module (the
+`installed_distributions` types only for type checking), so the tests that use it still collect
+when `packages/pivot/src` is pivot 0.10.4's.
 
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
 (`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, the refusals of a
 broken install, word for word, with the start pivot gives each for `STAGE` (`STAGE_PREFIX`), the
 layout flit's `install --symlink` gives an editable install (`flit_symlink_install`), built by
-hand since CI has no flit, and the layout uv gives an install from a package index, its files
-copied or linked into a cache (`index_install_by_hand`), built by hand for the tests that start
-no process.
+hand since CI has no flit, the layout uv gives an install from a package index, its files copied
+or linked into a cache (`index_install_by_hand`), built by hand for the tests that start no
+process, and what those tests give `installed_distributions.distribution_keys` of a module loaded
+from a file (`module_loaded_from`).
 """
 
 from __future__ import annotations
@@ -42,10 +44,13 @@ import pytest
 import yaml
 
 import pivot
+from pivot import fingerprint
 from tests import helpers
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+
+    from pivot import installed_distributions
 
 # The code `python -c` runs to start pivot's CLI, as the `pivot` console script does.
 _PIVOT_MAIN = "from pivot.cli import _console_main; _console_main()"
@@ -458,6 +463,15 @@ def index_install_by_hand(
         rows.append(f"{relative},sha256={digest},{len(data)}")
     rows.append(f"{dist_info}/RECORD,,")
     (site / dist_info / "RECORD").write_text("".join(f"{row}\n" for row in sorted(rows)))
+
+
+def module_loaded_from(found: pathlib.Path) -> installed_distributions.ReachedModule:
+    """What `fingerprint.add_distribution_keys` gives of a module this process loaded from the
+    file the import found at `found` (`fingerprint.reached_module`): the origin
+    `import_origin.of_module` gives it, the file resolved, and that file with its directory
+    resolved and its last name kept. Pivot 0.10.4 has no `fingerprint.reached_module`, which is
+    looked up only when this is called, so the tests that use this module still collect there."""
+    return fingerprint.reached_module(("file", os.path.realpath(found)), str(found))
 
 
 def git(cwd: pathlib.Path, home: pathlib.Path, *args: str) -> str:
