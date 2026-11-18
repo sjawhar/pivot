@@ -184,3 +184,48 @@ def test_a_linked_library_whose_record_is_lost_is_walked_as_user_code(
 
     installed_dists.assert_stale_on(project, installed_dists.STAGE, "func:fixlib.value")
     installed_dists.assert_runs_and_writes(project, "value-2", "the second `pivot repro`")
+
+
+def _helper_refusal(project: installed_dists.Project, site: pathlib.Path) -> str:
+    """The refusal `pivot repro --json` exits 1 with in `project`, from its `Error:` line, with
+    the venv's resolved site-packages `site` written `{site}`; the test fails unless it exits 1."""
+    ran = installed_dists.run_pivot(project, "repro", "--json")
+    shown = installed_dists.shown(ran)
+    assert ran.returncode == 1, f"pivot must refuse {installed_dists.STAGE}:\n{shown}"
+    errors = [line for line in ran.stderr.splitlines() if line.startswith("Error:")]
+    assert len(errors) == 1, f"pivot must print one Error: line:\n{shown}"
+    return errors[0].replace(str(site.resolve()), "{site}")
+
+
+def test_a_linked_library_whose_record_is_lost_is_refused_as_a_copied_one_is(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`Fix_Lib` installed from its path into one venv with `--link-mode copy` and into another
+    with `--link-mode symlink`, each with its own project and the same pipeline, and each with its
+    RECORD lost. A venv uv links into its cache fingerprints as one it copied into (BET-1194 spec
+    v9, "uv's symlink link mode"): the copied venv refuses the stage, since Pivot cannot tell
+    which files the reached distribution owns, so the linked venv refuses it with the same
+    refusal. Walking the linked library as user code instead hashes its Python source only: a
+    change to a package data file it reads, or to any other file it ships that is not Python
+    source, leaves the stage cached with the old output."""
+    source = installed_dists.write_library(
+        tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
+    )
+    refusals = dict[str, str]()
+    for link_mode in ("copy", "symlink"):
+        root = tmp_path / link_mode
+        root.mkdir()
+        venv = installed_dists.make_venv(root / "venv")
+        installed_dists.install_directory(venv, source, link_mode=link_mode)
+        linked = (venv.site_packages / "fixlib" / "__init__.py").is_symlink()
+        assert linked == (link_mode == "symlink"), (
+            f"fixlib/__init__.py must be a link only with --link-mode symlink: {link_mode} {linked}"
+        )
+        installed_dists.damage(venv.site_packages / "fix_lib-0.1.dist-info" / "RECORD", None)
+        project = installed_dists.make_project_in(root, venv, installed_dists.pipeline("fixlib"))
+        refusals[link_mode] = _helper_refusal(project, venv.site_packages)
+
+    assert refusals["symlink"] == refusals["copy"], (
+        f"the linked venv must refuse as the copied one does:\nlinked {refusals['symlink']}\n"
+        + f"copied {refusals['copy']}"
+    )
