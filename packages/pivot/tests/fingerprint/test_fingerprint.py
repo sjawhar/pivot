@@ -33,7 +33,15 @@ import xxhash
 from pydantic import BaseModel
 
 import pivot_tui.stats
-from pivot import ast_utils, exceptions, fingerprint, loaders, project, stage_def
+from pivot import (
+    ast_utils,
+    exceptions,
+    fingerprint,
+    installed_distributions,
+    loaders,
+    project,
+    stage_def,
+)
 from pivot.storage import state as state_mod
 
 # A memory address as a repr writes one (`0x7f3a1c2b9e50`): no form may hold one.
@@ -4229,7 +4237,11 @@ def test_is_user_code_namespace_package_split_with_a_directory_under_the_prefix(
     user = tmp_path / "user"
     for import_root in (vendor, user):
         (import_root / "split_ns").mkdir(parents=True)
-    monkeypatch.setattr(fingerprint, "_STDLIB_PATHS", (*fingerprint._STDLIB_PATHS, venv.resolve()))
+    monkeypatch.setattr(
+        installed_distributions,
+        "INTERPRETER_PREFIXES",
+        (*installed_distributions.INTERPRETER_PREFIXES, venv.resolve()),
+    )
     monkeypatch.syspath_prepend(str(user))
     monkeypatch.syspath_prepend(str(vendor))
     sys.modules.pop("split_ns", None)

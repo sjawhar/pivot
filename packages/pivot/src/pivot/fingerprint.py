@@ -140,26 +140,6 @@ class _PydanticModelProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def _init_stdlib_paths() -> tuple[pathlib.Path, ...]:
-    """Build resolved stdlib paths for symlink-safe comparison.
-
-    Resolves sys.prefix and sys.base_prefix to handle environments where Python
-    is installed via symlinks (e.g., Homebrew). Deduplicates when not in a venv.
-    """
-    paths = list[pathlib.Path]()
-    for prefix in (sys.prefix, sys.base_prefix):
-        try:
-            resolved = pathlib.Path(prefix).resolve()
-        except OSError:
-            resolved = pathlib.Path(prefix)
-        if resolved not in paths:
-            paths.append(resolved)
-    return tuple(paths)
-
-
-_STDLIB_PATHS = _init_stdlib_paths()
-
-
 def _pivot_tui_dirs() -> tuple[pathlib.Path, ...]:
     """Resolve pivot_tui's directories from what the installed pivot-tui distribution records:
     the site directory it is installed in, which counts on its own only for a directory not named
@@ -2437,14 +2417,15 @@ def _reached_library_module(value: object) -> str | None:
     return module_name
 
 
-def _library_callable_module(value: object, declared: object) -> str | None:
-    """The name of the module a worker imports to run library callable `value`, whose
-    `__module__` reads `declared` (each caller reads it its own way, since a reader decides what a
-    `__getattr__` that raises does): `declared` when it is a `str`, else the library module that
-    `_reached_library_module` gives, the one that binds `value` under its own name (scipy.special's
-    ufuncs name no `__module__`), or None."""
-    if type(declared) is str:
-        return declared
+def _library_callable_module(value: object, module_name: str | None) -> str | None:
+    """The name of the module a worker imports to run library callable `value`: `module_name`,
+    the `__module__` its caller read and took as a module's name, or, when it took none (None),
+    the library module that `_reached_library_module` gives, the one that binds `value` under its
+    own name (scipy.special's ufuncs name no `__module__`), or None. Each caller reads and checks
+    `__module__` its own way: a reader decides what a `__getattr__` that raises does, and a check
+    (`isinstance` or `type(...) is str`) what a `str` subclass does."""
+    if module_name is not None:
+        return module_name
     return _reached_library_module(value)
 
 
@@ -2454,8 +2435,7 @@ def _in_pivot_packages(file: str) -> bool:
     (`_PIVOT_PACKAGE_DIRS`): decided once per file name per process, as `_is_user_source_file`
     decides, since every stage with a pivot loader reaches that loader's module again, inside a
     `fingerprint_pass()` or not."""
-    path = pathlib.Path(file).resolve()
-    return any(path.is_relative_to(directory) for directory in _PIVOT_PACKAGE_DIRS)
+    return _under_pivot_package_dirs(pathlib.Path(file).resolve())
 
 
 def _by_name_entry(key: str) -> str | None:
@@ -2508,9 +2488,10 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     namespace package keeps only its directories that are a library's (`_is_library_directory`,
     the rule of `is_user_code`), and is left out when none is. So no distribution's RECORD, nor
     its lack of one, decides a file or a directory of user code: a project's
-    `@pivot.fingerprint_by_name` helper, and the user's part of a namespace package shared with a
-    library (in the project, or in pip's checkout in `<venv>/src`), give no key and no refusal,
-    as in pivot 0.10.4, wherever they lie and whatever metadata lies beside them."""
+    `@pivot.fingerprint_by_name` helper whose file is user code, and the user's part of a
+    namespace package shared with a library (in the project, or in pip's checkout in
+    `<venv>/src`), give no key and no refusal, as in pivot 0.10.4, whatever metadata lies beside
+    them."""
     names = _by_name_names(manifest)
     if not names:
         return
@@ -3757,8 +3738,9 @@ def _process_captured_value(
             # A library function or class is named by where it is defined; its code is not
             # hashed, but rebinding the name to another one must change the manifest.
             entries[f"ext:{binding_ref}"] = _library_name(value)
-            declared = getattr(value, "__module__", None)
-            _mark_by_name(_library_callable_module(value, declared), entries)
+            module_name = getattr(value, "__module__", None)
+            accepted = module_name if isinstance(module_name, str) else None
+            _mark_by_name(_library_callable_module(value, accepted), entries)
         case _ValueKind.LOGGER:
             return
         case _ValueKind.HOOKED:
@@ -4554,9 +4536,10 @@ class _FormBuilder:
         (`_library_callable_module`), unless its `__module__` is a string that names no loaded
         module."""
         declared = _attribute_or_none(value, "__module__")
-        if type(declared) is str and not isinstance(sys.modules.get(declared), types.ModuleType):
+        accepted = declared if type(declared) is str else None
+        if accepted is not None and not isinstance(sys.modules.get(accepted), types.ModuleType):
             return
-        if (module := _library_callable_module(value, declared)) is not None:
+        if (module := _library_callable_module(value, accepted)) is not None:
             self.report(_ReportKind.EXTERNAL, module)
 
     def reached_module(self, value: Any, *steps: str) -> None:
@@ -4930,7 +4913,8 @@ class _FormBuilder:
         """
         if not is_user_code(value):
             declared = getattr(value, "__module__", None)
-            if (module := _library_callable_module(value, declared)) is not None:
+            accepted = declared if type(declared) is str else None
+            if (module := _library_callable_module(value, accepted)) is not None:
                 self.report(_ReportKind.EXTERNAL, module)
             return ["external", _library_name(value)]
         self.report(_ReportKind.FUNCTION, value)
@@ -7116,26 +7100,29 @@ def _is_user_code_impl(obj: Any) -> bool:
 
 
 def _is_library_directory(resolved: pathlib.Path) -> bool:
-    """Whether the resolved path ``resolved`` lies in a library's directory: one of its names is
-    ``site-packages`` or ``dist-packages`` (``installed_distributions.SITE_PACKAGE_PATHS``), or it
-    lies in one of pivot's own packages (``_PIVOT_PACKAGE_DIRS``). The one rule for a namespace
-    package's directory, in ``is_user_code`` and in the `dist:` keys (``_library_part``): a
-    directory under the interpreter's prefix alone, as pip's checkout of a ``pip install -e
-    git+...`` package in ``<venv>/src``, is the user's part of a namespace package it shares with
-    a library. ``is_library_path`` adds the interpreter's prefix for every other path."""
-    return any(
-        part in installed_distributions.SITE_PACKAGE_PATHS for part in resolved.parts
-    ) or any(resolved.is_relative_to(directory) for directory in _PIVOT_PACKAGE_DIRS)
+    """Whether the resolved path ``resolved`` lies in a library's directory: in a site-packages
+    directory (``installed_distributions.in_site_packages``), or in one of pivot's own packages
+    (``_under_pivot_package_dirs``). The one rule for a namespace package's directory, in
+    ``is_user_code`` and in the `dist:` keys (``_library_part``): a directory under the
+    interpreter's prefix alone, as pip's checkout of a ``pip install -e git+...`` package in
+    ``<venv>/src``, is the user's part of a namespace package it shares with a library.
+    ``is_library_path`` adds the interpreter's prefix for every other path."""
+    return installed_distributions.in_site_packages(resolved) or _under_pivot_package_dirs(resolved)
 
 
 def is_library_path(path: pathlib.Path) -> bool:
-    """Whether resolved file or directory ``path`` belongs to a library, not to user code: it
-    lies under the interpreter's prefix (the stdlib, or a virtualenv), in a site-packages or
-    dist-packages directory, or in one of pivot's own packages (``_PIVOT_PACKAGE_DIRS``), which
-    an editable install puts outside site-packages (``_is_library_directory``)."""
-    return _is_library_directory(path) or any(
-        path.is_relative_to(prefix) for prefix in _STDLIB_PATHS
-    )
+    """Whether resolved file or directory ``path`` belongs to a library, not to user code: it lies
+    in a library location (``installed_distributions.in_library_location``: a site-packages or
+    dist-packages directory, or under the interpreter's prefix, the stdlib or a virtualenv), or
+    in one of pivot's own packages, which an editable install puts outside site-packages
+    (``_under_pivot_package_dirs``)."""
+    return installed_distributions.in_library_location(path) or _under_pivot_package_dirs(path)
+
+
+def _under_pivot_package_dirs(resolved: pathlib.Path) -> bool:
+    """Whether the resolved path ``resolved`` lies in one of pivot's own packages
+    (``_PIVOT_PACKAGE_DIRS``)."""
+    return any(resolved.is_relative_to(directory) for directory in _PIVOT_PACKAGE_DIRS)
 
 
 @functools.lru_cache(maxsize=4096)

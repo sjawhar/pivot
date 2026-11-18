@@ -594,7 +594,7 @@ Limits:
 | Markers and extras of a requirement (`Requires-Dist`, or a `requires.txt` line, whose `[extra]` and `[:marker]` section headers are not evaluated either) | Not evaluated: only each requirement's leading name is read, so a requirement behind a false marker or an extra that names an installed git or local distribution still adds its key. That can rerun a stage when a library it never imports changes; it never hides a change |
 | A package or namespace package that a stage reads by its name (`import company.vendor` binds `company`) | Every git or local distribution with a file under its directories gives its key, though the stage may use only one of them |
 | A reinstall while a Pivot process runs | Pivot reads the installed distributions, and each keyed distribution's files, once per process for one worker `sys.path` (again when that path changes), so the running process keeps the values it read: `pivot repro --watch`, with or without `--serve`, sees a reinstall when Pivot starts again. The next process reads the new files, and a stage that reaches a changed one reruns once |
-| An editable install | No key. Its source is user code when it lies outside the interpreter's prefix and outside every `site-packages` or `dist-packages` directory, and the walk hashes it as it hashes the project's code. pip's checkout of a `pip install -e git+…` package, in `<venv>/src`, lies under the interpreter's prefix, so it is library code with no key, recorded by name as a package-index library is: a change to its files is seen only where the walk hashes library code (a stage function it defines, a loader's `load`, `save` and `empty`) |
+| An editable install | No key. Its source is user code when it lies outside the interpreter's prefix and outside every `site-packages` or `dist-packages` directory, and the walk hashes it as it hashes the project's code. pip's checkout of a `pip install -e git+…` package, in `<venv>/src`, lies under the interpreter's prefix, so it is library code with no key, recorded by name as a package-index library is: a change to its files is seen only where the walk hashes library code (a stage function it defines, a loader's `load`, `save` and `empty`). Where a `.pth` line puts that checkout itself on `sys.path` and its build left `<name>.egg-info` there, with no RECORD, which requires a library installed from git, a local path or a local archive, a stage that reaches a module of the checkout is refused: no RECORD lists that module's file beside that metadata (the refusal of a file that no RECORD lists, below) |
 | A distribution in a zip archive on `sys.path`, or behind any entry Pivot cannot list as a directory | Not read: it owns no module and gets no key. pip and uv install into a directory |
 | A git or local library with compiled extensions | Its extension modules have platform-tagged names (`*.cpython-313-x86_64-linux-gnu.so`) and bytes that differ by platform, compiler and build, so its `dist:` value differs between machines, and can differ when the same commit is built again: a lock written on one machine reads stale on another |
 | A version file that setuptools-scm or hatch-vcs writes into the installed package | It holds the commit (or a version made from it), so every new commit of the library changes the key, and every stage that reaches the library reruns, whatever else changed |
@@ -638,25 +638,34 @@ file's directories of the worker's `sys.path` lists, while a distribution in one
 directories has no RECORD Pivot can read and is one Pivot looks at: one installed from git, a
 local path or a local archive, one it cannot classify, one whose requirements it cannot read, or
 one that requires such a distribution, directly or through others, of any install form (a
-package-index `.egg-info` directory in a `site-packages` or `dist-packages` directory, which
-never has a RECORD, included). Such a distribution owns no file, so Pivot cannot tell whether
-the module is that distribution's. A project's own metadata is not one: a distribution with no
-RECORD and no `direct_url.json` in an entry of `sys.path` outside every `site-packages` and
-`dist-packages` directory (the project root, a `src/` directory, a `PYTHONPATH` entry, a
-checkout), as the `<name>.egg-info` that setuptools writes beside the project's code when it
-builds the project (`uv build`, or `uv pip install -e` with build isolation), refuses nothing;
-one there with a `direct_url.json` (a git or local install made with `--target` that has lost
-its RECORD) still does. Nor does a file or a directory of user code meet this check: Pivot gives
-it only the library code of the modules the stage reaches by name
+package-index `.egg-info` directory in a `site-packages` or `dist-packages` directory or under the
+interpreter's prefix, which never has a RECORD, included). Such a distribution owns no file, so
+Pivot cannot tell whether the module is that distribution's. A project's own metadata is not
+one: a distribution with no RECORD and no `direct_url.json` in an entry of `sys.path` that is no
+library location (`installed_distributions.in_library_location`: outside every `site-packages`
+and `dist-packages` directory and the interpreter's prefix; the project root, a `src/`
+directory, a `PYTHONPATH` entry, a checkout), as the `<name>.egg-info` that setuptools writes
+beside the project's code when it builds the project (`uv build`, or `uv pip install -e` with
+build isolation), refuses nothing; one there with a `direct_url.json` (a git or local install
+made with `--target` that has lost its RECORD) still does, and so does the `<name>.egg-info` of
+a library's checkout under the interpreter's prefix (pip's `pip install -e git+...` puts one in
+`<venv>/src`, and its develop build writes that metadata there), whose files are library code,
+recorded by name and not walked. Nor does a file or a directory of user code meet this check:
+Pivot gives it only the library code of the modules the stage reaches by name
 (`fingerprint.add_distribution_keys`), so a module whose file is user code
 (`fingerprint.is_library_file`), which the walk hashes or the user names by name
 (`@pivot.fingerprint_by_name`), is not checked, and of a namespace package only its directories
 in a `site-packages` or `dist-packages` directory or in one of pivot's own packages are, the rule
 by which Pivot takes a namespace package as library code (a directory under the interpreter's
 prefix alone, as pip's checkout of a `pip install -e git+...` package in `<venv>/src`, is the
-user's part). So a project's `@pivot.fingerprint_by_name` helper, and the user's part of a
-namespace package shared with a library, give no `dist:` key and no refusal, as in pivot 0.10.4,
-whatever metadata lies beside them. A file's
+user's part). So a project's `@pivot.fingerprint_by_name` helper whose file is user code, and
+the user's part of a namespace package shared with a library, give no `dist:` key and no
+refusal, as in pivot 0.10.4, whatever metadata lies beside them. A namespace package's portion
+under the interpreter's prefix but outside `site-packages` is the user's by that rule also where
+a non-editable install put it there (a git install made with `--target` into `<prefix>/vendor`,
+its RECORD kept): a stage that reaches the namespace package only by its top name (`company`)
+gets no key of that install, and one that reaches its module by name (`company.v`) still does,
+since that module's file is library code. A file's
 directories are the deepest entries of the worker's `sys.path` that hold its places, and the
 deepest entry that holds its resolved path, where a link points; a RECORD in any of them lists
 the file when one of its paths resolves to the file's resolved path. A module's own file lies
@@ -674,8 +683,10 @@ distribution is not refused there. Where an installer links each file into its c
 cache lies outside every entry of the path, no entry holds the resolved path, and the file is
 judged where it lies; where the cache lies inside an entry (`UV_CACHE_DIR` under the project
 root), that entry holds the resolved path too, and a project's own metadata there refuses
-nothing for it. The files checked are the module's own and, for a package's `__init__`
-file or a namespace package, the files under its directories but those under a `__pycache__`
+nothing for it (another distribution there with no RECORD that Pivot looks at does; see the
+Limits of [Files Linked into site-packages](#files-linked-into-site-packages)). The files checked
+are the module's own and, for a package's `__init__` file or a namespace package, the files under
+its directories but those under a `__pycache__`
 directory, which the key leaves out too (a `.pyc` file outside one is checked). Pivot walks such
 a directory only when the deepest entry of `sys.path` above it, or an entry at or under it,
 holds such a distribution, and stops once it has found, in each of those entries, a file that no
@@ -790,6 +801,7 @@ Limits:
 |-------|--------------|
 | A file linked into `site-packages` that no editable distribution's RECORD lists: a link made by hand to a user's file (a new name, or in place of a library's file), a link of an editable install whose RECORD is lost or that Pivot cannot read, a link that only a distribution Pivot cannot classify, or one that is not editable, lists, and a module file that flit before 3.0 linked with `install --symlink` (flit wrote no `direct_url.json`, PEP 610, before 3.0, so its distribution reads as a package-index install, which is not editable); also when the stage reaches it through a link to it | The linked file is library code, recorded by name and refused as a copied file would be (rule 2), so an edit to the file it points to reruns nothing: an edit to the checkout of an editable install whose RECORD is lost reruns nothing either. Pivot 0.10.4 resolved the link and walked its target as user code, so that edit reran the stage. Pivot reads no second sign of an editable install. A package directory that flit links is not affected: its files resolve into the checkout (rule 3). Fix: reinstall with a tool that writes `direct_url.json` (flit 3.0 or later, `pip install -e`, `uv pip install -e`), reinstall an editable install whose RECORD is lost, or install a user's code editable in place of a link made by hand |
 | One entry of uv's cache linked from two entries of `sys.path`: the same wheel installed with `--link-mode symlink` into a virtual environment and into the environment it sees through `--system-site-packages`, or into a `--target` directory | The RECORDs of both installs resolve to the same files, so both own a module the stage reaches in either (a file is owned by its resolved path, a package's directory by where the import searched). For a git or local library the key's value then covers both installs, where copied files give the value of the one the stage imports, and a second install Pivot cannot read (a `direct_url.json` it cannot classify, requirements it cannot read) refuses the stage. That adds reruns and refusals only: no change is hidden |
+| uv's cache inside an entry of `sys.path`: `UV_CACHE_DIR` under the project root, which is on `sys.path`, for a virtual environment that uv builds with `--link-mode symlink` | A linked file's resolved path, in the cache, then lies in that entry too, so the check above judges the file there as well as where Pivot judged it. Where that entry holds a distribution with no RECORD that Pivot looks at and that is no project's own metadata (one installed into the project root from a local directory, `dir_info`, or from git, that has lost its RECORD), a file the check covers that no RECORD lists (one of a distribution that has lost its RECORD) refuses the stage, named as it lies in the cache; with the files copied, or the cache outside every entry, that distribution refuses nothing for it. A project's own `.egg-info` there refuses nothing in either layout. That fails closed: it adds a refusal only, for installs that are already broken, and hides no change |
 
 ### Module-Level Instances
 

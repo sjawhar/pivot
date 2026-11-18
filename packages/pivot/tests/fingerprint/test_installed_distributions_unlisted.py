@@ -26,21 +26,6 @@ from pivot import installed_distributions
 _FORM = installed_distributions.InstallForm
 
 
-def _helper_unlisted_refusal(module: str, file: str, site: str, name: str, form: str) -> str:
-    """The refusal of reached module `module`, whose file `file` lies in site directory `site`,
-    where `name` 0.1, installed `form`, has no RECORD (`_helper_recordless_install`), and no
-    RECORD lists that file."""
-    return installed_dists.UNLISTED_FILE_REFUSAL.format(
-        module=module,
-        file=file,
-        site=site,
-        name=name,
-        dist_info=f"{site}/{name}-0.1.dist-info",
-        form=form,
-        problem="has no RECORD file",
-    )
-
-
 def _helper_recordless_install(site: pathlib.Path, name: str, direct_url: bytes) -> None:
     """Install distribution `name` 0.1 into the site directory `site` by hand, with `direct_url`
     as its `direct_url.json`, and lose its RECORD: `<name>-0.1.dist-info` holds only METADATA,
@@ -76,8 +61,8 @@ def test_a_module_file_linked_into_another_path_entry_is_refused_beside_its_reco
     )
 
     site = os.path.realpath(first)
-    refusal = _helper_unlisted_refusal(
-        module="x", file=f"{site}/x.py", site=site, name="xlib", form=_FORM.LOCAL_DIRECTORY.value
+    refusal = installed_dists.unlisted_refusal(
+        module="x", file=f"{site}/x.py", site=site, name="xlib", form=_FORM.LOCAL_DIRECTORY
     )
     expected = installed_distributions.DistributionKeys({}, [refusal])
     assert [linked, found_there] == [expected, expected], [linked, found_there]
@@ -102,12 +87,12 @@ def test_a_module_file_linked_to_another_file_of_its_path_entry_is_refused_as_fo
     )
 
     real_site = os.path.realpath(site)
-    refusal = _helper_unlisted_refusal(
+    refusal = installed_dists.unlisted_refusal(
         module="x",
         file=f"{real_site}/x.py",
         site=real_site,
         name="xlib",
-        form=_FORM.LOCAL_DIRECTORY.value,
+        form=_FORM.LOCAL_DIRECTORY,
     )
     assert found == installed_distributions.DistributionKeys({}, [refusal]), found
 
@@ -135,12 +120,12 @@ def test_a_project_file_linked_into_a_package_of_a_recordless_install_is_refused
     )
 
     real_site = os.path.realpath(site)
-    refusal = _helper_unlisted_refusal(
+    refusal = installed_dists.unlisted_refusal(
         module="helper",
         file=f"{real_site}/x/helper.py",
         site=real_site,
         name="x",
-        form=_FORM.VCS.value,
+        form=_FORM.VCS,
     )
     assert found == installed_distributions.DistributionKeys({}, [refusal]), found
 

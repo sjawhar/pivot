@@ -198,38 +198,22 @@ def _helper_egg_info_project(
 _LAYOUTS = ("copied", "linked-into-a-cache")
 
 
-def _helper_recordless_refusal(module: str, form: installed_distributions.InstallForm) -> str:
-    """The refusal of a reached module `module` whose file `{site}/<module>.py` no RECORD lists
-    beside distribution `module`, installed by hand `form`, which has lost its RECORD
-    (`_helper_install_by_hand`); `{site}` stays in the message, as `_helper_written_site` writes
-    it."""
-    site = "{site}"
-    return installed_dists.UNLISTED_FILE_REFUSAL.format(
-        module=module,
-        file=f"{site}/{module}.py",
-        site=site,
-        name=module,
-        dist_info=f"{site}/{module}-0.1.dist-info",
-        form=form.value,
-        problem="has no RECORD file",
-    )
-
-
-# The refusal of `gitmod`, installed by hand as from git, which has lost its RECORD.
-_RECORDLESS_GITMOD_REFUSAL = _helper_recordless_refusal(
-    "gitmod", installed_distributions.InstallForm.VCS
+# The refusal of `gitmod`, whose file `{site}/gitmod.py` no RECORD lists, installed by hand as from
+# git, which has lost its RECORD (`_helper_install_by_hand`); `{site}` stays in the message, as
+# `_helper_written_site` writes it.
+_RECORDLESS_GITMOD_REFUSAL = installed_dists.unlisted_refusal(
+    "gitmod", "{site}/gitmod.py", "{site}", "gitmod", installed_distributions.InstallForm.VCS
 )
 
 # The refusal of the reached module `mod`, whose file `{site}/mod.py` no RECORD lists, beside
 # `myproj.egg-info` in `{site}` (`_helper_project_egg_info`), as `_helper_written_site` writes it.
-_MYPROJ_MOD_REFUSAL = installed_dists.UNLISTED_FILE_REFUSAL.format(
-    module="mod",
-    file="{site}/mod.py",
-    site="{site}",
-    name="myproj",
+_MYPROJ_MOD_REFUSAL = installed_dists.unlisted_refusal(
+    "mod",
+    "{site}/mod.py",
+    "{site}",
+    "myproj",
+    installed_distributions.InstallForm.INDEX,
     dist_info="{site}/myproj.egg-info",
-    form=installed_distributions.InstallForm.INDEX.value,
-    problem="has no RECORD file",
 )
 
 
@@ -727,14 +711,12 @@ def test_a_reached_package_is_walked_once_and_only_until_each_recordless_entry_h
     again = installed_distributions.distribution_keys(modules, path, _PIVOT_DIRS)
 
     inner = vendored.resolve()
-    unlisted_lock = installed_dists.UNLISTED_FILE_REFUSAL.format(
-        module="company",
-        file=f"{inner}/.lock",
-        site=inner,
-        name="fixother",
-        dist_info=f"{inner}/fixother-0.1.dist-info",
-        form=installed_distributions.InstallForm.LOCAL_DIRECTORY.value,
-        problem="has no RECORD file",
+    unlisted_lock = installed_dists.unlisted_refusal(
+        "company",
+        f"{inner}/.lock",
+        str(inner),
+        "fixother",
+        installed_distributions.InstallForm.LOCAL_DIRECTORY,
     )
     unlisted_stray = installed_dists.UNLISTED_REFUSAL.format(
         module="nsco", file="nsco/stray.py", site=site.resolve()
@@ -1070,10 +1052,11 @@ def test_a_reached_module_of_a_source_tree_beside_its_egg_info_with_no_record_is
     `mid` and the `mid.egg-info` its setuptools build left, with no RECORD and no
     `direct_url.json` (the package-index form), which requires `fixdep`, installed from its path,
     in a `Requires-Dist` header of its PKG-INFO, or in its `requires.txt` alone. The stage reaches
-    `mid`, whose file no RECORD lists. The source tree is no `site-packages` or `dist-packages`
-    directory, so `mid.egg-info` is the project's own metadata, which refuses nothing there, and
-    `mid` owns no file, so it gives no key. (`fingerprint.add_distribution_keys` gives no module
-    whose file is user code, as `mid/__init__.py` in a source tree is: the walk hashes it.)"""
+    `mid`, whose file no RECORD lists. The source tree is no library location (no `site-packages`
+    or `dist-packages` directory, nor under the interpreter's prefix), so `mid.egg-info` is the
+    project's own metadata, which refuses nothing there, and `mid` owns no file, so it gives no
+    key. (`fingerprint.add_distribution_keys` gives no module whose file is user code, as
+    `mid/__init__.py` in a source tree is: the walk hashes it.)"""
     venv = installed_dists.make_venv(tmp_path / "venv")
     src = tmp_path / "src"
     installed_dists.install_directory(
@@ -1519,8 +1502,8 @@ def test_a_project_file_linked_to_a_recordless_git_install_is_refused_as_in_a_co
     path. No refusal names `myproj`, since the project root is neither where Pivot judges the file
     nor where it resolves, nor where its chain of links reaches a library file, and since
     `myproj.egg-info` there is the project's own metadata, which refuses nothing in a path entry
-    outside every `site-packages` and `dist-packages` directory. Judged as the import found it, in
-    the project root, the linked layout would refuse nothing."""
+    outside every `site-packages` and `dist-packages` directory and the interpreter's prefix.
+    Judged as the import found it, in the project root, the linked layout would refuse nothing."""
     found = dict[str, installed_distributions.DistributionKeys]()
     for layout in _LAYOUTS:
         root = tmp_path / layout
@@ -1619,8 +1602,12 @@ def test_a_library_file_linked_to_a_recordless_install_outside_every_library_pat
         )
         found[layout] = _helper_written_site(keys, libs)
 
-    refusal = _helper_recordless_refusal(
-        "wlib", installed_distributions.InstallForm.LOCAL_DIRECTORY
+    refusal = installed_dists.unlisted_refusal(
+        "wlib",
+        "{site}/wlib.py",
+        "{site}",
+        "wlib",
+        installed_distributions.InstallForm.LOCAL_DIRECTORY,
     )
     refused = installed_distributions.DistributionKeys({}, [refusal])
     assert found == {"copied": refused, "linked-into-a-cache": refused}, found
@@ -1768,10 +1755,11 @@ def test_a_projects_egg_info_refuses_no_library_file_uv_links_into_a_cache_under
     the project root or in `site-packages` (`egg_info_in`, under the layout's directory), and
     the path is the project root, then `site-packages`. The stage reaches `mod`, whose file no
     RECORD lists, and `gitlib`. Both layouts give the key of `gitlib` and the same refusals:
-    none beside the project's own `.egg-info` in the project root, which is no `site-packages`
-    or `dist-packages` directory, though in the linked layout `mod.py` resolves into the cache
-    there; and in `site-packages`, where such an `.egg-info` is a distribution that can own a
-    file no RECORD lists, one refusal naming `mod.py` and `myproj`."""
+    none beside the project's own `.egg-info` in the project root, which is no library location
+    (no `site-packages` or `dist-packages` directory, nor under the interpreter's prefix), though
+    in the linked layout `mod.py` resolves into the cache there; and in `site-packages`, where
+    such an `.egg-info` is a distribution that can own a file no RECORD lists, one refusal naming
+    `mod.py` and `myproj`."""
     found = dict[str, installed_distributions.DistributionKeys]()
     for layout in _LAYOUTS:
         root = tmp_path / layout
@@ -1805,6 +1793,50 @@ def test_a_projects_egg_info_refuses_no_library_file_uv_links_into_a_cache_under
         {"dist:gitlib": _helper_value(copied_site, {"gitlib.py": "gitlib.py"})}, refusals
     )
     assert found == {"copied": expected, "linked-into-a-cache": expected}, found
+
+
+def test_a_recordless_root_install_refuses_a_file_uv_links_into_a_cache_under_the_root_alone(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stated limit (`docs/architecture/fingerprinting.md`, the Limits of "Files Linked into
+    site-packages"). In each layout (the installed files copied, or linked into a cache that lies
+    under the project root, as `UV_CACHE_DIR` there puts uv's cache), `site-packages` holds
+    `idxmod`, installed by hand as from a package index, which has lost its RECORD, and the
+    project root, first on the path, holds `projlib`, installed there by hand from a local
+    directory, which has lost its RECORD too (`_helper_recordless_root_install`), and is no
+    project's own metadata. The stage reaches `mod`, whose file no RECORD lists. The copied layout
+    refuses nothing: no distribution in `site-packages` lacks a RECORD Pivot looks at. In the
+    linked layout `mod.py` resolves into the cache, which the project root holds, beside
+    `projlib`, so it refuses the stage, naming the file in the cache: one more refusal, for
+    installs that are already broken, and no change hidden."""
+    found = dict[str, installed_distributions.DistributionKeys]()
+    for layout in _LAYOUTS:
+        root = tmp_path / layout
+        project = root / "project"
+        project.mkdir(parents=True)
+        site = root / "venv" / "site-packages"
+        cache = None if layout == "copied" else project / ".uv-cache"
+        installed_dists.index_install_by_hand(site, "idxmod", {"mod.py": "MOD = 1\n"}, cache=cache)
+        installed_dists.damage(site / "idxmod-0.1.dist-info" / "RECORD", None)
+        _helper_recordless_root_install(root, layout)
+        found[layout] = installed_distributions.distribution_keys(
+            {"mod": installed_dists.module_loaded_from(site / "mod.py")},
+            [str(project), str(site)],
+            _PIVOT_DIRS,
+        )
+
+    real_project = os.path.realpath(tmp_path / "linked-into-a-cache" / "project")
+    refusal = installed_dists.unlisted_refusal(
+        "mod",
+        f"{real_project}/.uv-cache/idxmod/mod.py",
+        real_project,
+        "projlib",
+        installed_distributions.InstallForm.LOCAL_DIRECTORY,
+    )
+    assert found == {
+        "copied": installed_distributions.DistributionKeys({}, []),
+        "linked-into-a-cache": installed_distributions.DistributionKeys({}, [refusal]),
+    }, found
 
 
 def test_a_project_package_linked_file_by_file_gets_the_keys_of_each_install_in_its_directory(

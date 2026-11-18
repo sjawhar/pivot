@@ -5,7 +5,7 @@ comes from a file that the distribution's RECORD lists, or is a package or a nam
 whose directory, as the import searched it, holds one (`owners`). `fingerprint` gives only the
 library code of those modules: no module whose file is user code, which the walk hashes or the
 user names by name (`@pivot.fingerprint_by_name`), and of a namespace package only its
-directories in a directory of `SITE_PACKAGE_PATHS` or in pivot's own packages, so no
+directories in a site-packages directory (`in_site_packages`) or in pivot's own packages, so no
 distribution's RECORD decides user code. For each reached distribution installed from version
 control, from a local directory or from a local archive, and for each such distribution that a
 reached one depends on, the manifest gets the key `dist:<name>`, `<name>` normalised as PEP 503
@@ -19,6 +19,11 @@ file linked into a site directory (`listed_by_editable`): such a file keeps the 
 resolved path, as flit's `install --symlink` links a checkout's module file there, and every
 other file linked there, as uv's `--link-mode symlink` links each installed file into its cache,
 is library code, as the same file copied would be.
+
+It holds the one definition of a library location, which `fingerprint.is_library_path` and the
+refusal of a file that no RECORD lists (`_projects_own`) share: a site-packages directory
+(`in_site_packages`, a name of `SITE_PACKAGE_PATHS`), or a path under the interpreter's prefix
+(`in_library_location`, `INTERPRETER_PREFIXES`, read once at import).
 
 A leaf: it imports nothing of pivot's at run time, so `fingerprint` imports it and no import cycle
 forms. It takes plain data (each reached module's origin and the places its file lies in,
@@ -46,26 +51,25 @@ a stage reaches a file that lies in it (the deepest entry of the path that holds
 file: where Pivot judged it or where the walk listed it, and every later file of its chain of
 links; or that holds the file's resolved path) while a candidate there, or in another such
 entry of the file, has no RECORD and is no project's own metadata (`_projects_own`: one with no
-`direct_url.json` in an entry outside every `site-packages` and `dist-packages` directory, as a
-project's build leaves it); the RECORD of each editable distribution of a site directory, and no
-other, when `listed_by_editable` is first asked about a file whose site directory it is;
-the files under the directory of a reached package or namespace package only when such a site
-directory is the deepest entry of the path above that directory or lies at or under it, and only
-until each such site directory has a file there that no RECORD lists, once for each reached
-module; and the files of a keyed distribution only when a stage reaches it. Each RECORD is read
-once, whichever of these needs it first. A process that asks only `listed_by_editable`, as a
-worker's import recorder does, reads no requirement and builds no index of the candidates. Each
-path a RECORD lists that can name a file is resolved for the index of the candidates and for the
-refusal of a reached file that no RECORD lists (`_resolved`), and so is each file under such a
-directory, to the path `os.path.realpath` gives: a RECORD path of PATH_MAX bytes or more in its
-site directory by `realpath` alone, and every other path a name at a time from the nearest
-directory above it already resolved (a site directory, or one resolved for an earlier path): one
-`os.path.islink` for each new name, and `realpath` only for a name that is a symbolic link,
-empty, `.` or `..` (`_real_path`). A walked file that is a symbolic link, and a reached module's
-file, also have their chain of links read (`link_chain`): one `os.readlink` and one
-`os.path.realpath` of its directory for each link, outside `_real_path`'s memo.
-`listed_by_editable` resolves no RECORD path: it compares each as written, normalised, with the
-file's path in its site directory.
+`direct_url.json` in an entry that is no library location, as a project's build leaves it); the
+RECORD of each editable distribution of a site directory, and no other, when `listed_by_editable`
+is first asked about a file whose site directory it is; the files under the directory of a
+reached package or namespace package only when such a site directory is the deepest entry of the
+path above that directory or lies at or under it, and only until each such site directory has a
+file there that no RECORD lists, once for each reached module; and the files of a keyed
+distribution only when a stage reaches it. Each RECORD is read once, whichever of these needs it
+first. A process that asks only `listed_by_editable`, as a worker's import recorder does, reads
+no requirement and builds no index of the candidates. Each path a RECORD lists that can name a
+file is resolved for the index of the candidates and for the refusal of a reached file that no
+RECORD lists (`_resolved`), and so is each file under such a directory, to the path
+`os.path.realpath` gives: a RECORD path of PATH_MAX bytes or more in its site directory by
+`realpath` alone, and every other path a name at a time from the nearest directory above it
+already resolved (a site directory, or one resolved for an earlier path): one `os.path.islink` for
+each new name, and `realpath` only for a name that is a symbolic link, empty, `.` or `..`
+(`_real_path`). A walked file that is a symbolic link, and a reached module's file, also have
+their chain of links read (`link_chain`): one `os.readlink` and one `os.path.realpath` of its
+directory for each link, outside `_real_path`'s memo. `listed_by_editable` resolves no RECORD
+path: it compares each as written, normalised, with the file's path in its site directory.
 """
 
 from __future__ import annotations
@@ -76,9 +80,11 @@ import enum
 import functools
 import json
 import os
+import pathlib
 import posixpath
 import re
 import stat
+import sys
 import threading
 import urllib.parse
 from typing import TYPE_CHECKING, NamedTuple, cast
@@ -91,11 +97,37 @@ if TYPE_CHECKING:
     from pivot import import_origin
 
 # The names of the directories that installers put distributions in: a path with one of them as a
-# name lies in such a directory (`fingerprint.is_library_path`). A path entry with none of them
-# (the project root, a `src/` directory, a `PYTHONPATH` entry, a checkout) holds a project's own
-# code, and the metadata that a build or a develop install of the project writes there
-# (`_projects_own`).
+# name lies in a site-packages directory (`in_site_packages`).
 SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
+
+# The interpreter's prefixes, `sys.prefix` and `sys.base_prefix`, each resolved (one of them when
+# they are the same, outside a venv), read once at import, so that a resolved path compares with
+# them where the interpreter is installed through symbolic links (Homebrew's): the standard
+# library lies under them, and in a venv every installed file, also one outside site-packages, as
+# pip's checkout of a `pip install -e git+...` package in `<venv>/src`. `Path.resolve` raises no
+# `OSError` for these absolute paths: not strict, `os.path.realpath` passes over a name it cannot
+# read.
+INTERPRETER_PREFIXES = tuple(
+    dict.fromkeys(pathlib.Path(prefix).resolve() for prefix in (sys.prefix, sys.base_prefix))
+)
+
+
+def in_site_packages(path: pathlib.PurePath) -> bool:
+    """Whether the resolved path `path` lies in a site-packages directory: one of its names is in
+    `SITE_PACKAGE_PATHS`."""
+    return any(name in SITE_PACKAGE_PATHS for name in path.parts)
+
+
+def in_library_location(path: pathlib.PurePath) -> bool:
+    """Whether the resolved path `path` lies in a library location: in a site-packages directory
+    (`in_site_packages`), or under one of `INTERPRETER_PREFIXES`. A path entry that is none (the
+    project root, a `src/` directory, a `PYTHONPATH` entry, a checkout outside the prefixes) is
+    where a project keeps its code, and the metadata that a build or a develop install of the
+    project writes there (`_projects_own`)."""
+    return in_site_packages(path) or any(
+        path.is_relative_to(prefix) for prefix in INTERPRETER_PREFIXES
+    )
+
 
 # The prefix of every key this module makes.
 _KEY_PREFIX = "dist:"
@@ -686,8 +718,8 @@ class _Index:
     file_owners: Mapping[str, frozenset[str]]
     directory_owners: Mapping[str, frozenset[str]]
     # Each site directory's candidates with no RECORD, which own no file, but a project's own
-    # metadata (`_projects_own`): the refusal of a file that no RECORD lists (`_Snapshot._unlisted`)
-    # looks at these.
+    # metadata outside every library location (`_projects_own`): the refusal of a file that no
+    # RECORD lists (`_Snapshot._unlisted`) looks at these.
     recordless: Mapping[str, tuple[str, ...]]
 
 
@@ -935,8 +967,9 @@ def _build_index(
     setuptools `<name>.egg-info` that a build or a develop install wrote in the project root or a
     `src/` directory refuses nothing there. A candidate with no RECORD that has a
     `direct_url.json` goes in `recordless` wherever it lies (a git or local install made with
-    `--target` that has lost its RECORD), and so does each one in a directory of
-    `SITE_PACKAGE_PATHS`."""
+    `--target` that has lost its RECORD), and so does each one in a library location
+    (`in_library_location`: a site-packages directory, or under the interpreter's prefix, as a
+    library checkout's develop build in `<venv>/src`)."""
     seeds_by_form = [
         entry.dist_info for entry in installed if entry.classification.form in _SEED_FORMS
     ]
@@ -993,13 +1026,17 @@ def _projects_own(installed: Installed) -> bool:
     """Whether `installed`, a candidate with no RECORD, is a project's own metadata, which a build
     or a develop install of the project writes beside the project's code (a setuptools
     `<name>.egg-info`, which has no RECORD): installed with no `direct_url.json`
-    (`InstallForm.INDEX`), in a path entry none of whose names is in `SITE_PACKAGE_PATHS` (the
-    project root, a `src/` directory, a `PYTHONPATH` entry, a checkout). The files it describes
-    are the project's own, which no RECORD lists, so it makes Pivot refuse no file that lies there
-    (`_Snapshot._unlisted`): neither a project file nor a library file whose resolved path lies
-    in uv's cache under the project root."""
-    return installed.classification.form is InstallForm.INDEX and not any(
-        name in SITE_PACKAGE_PATHS for name in installed.site_dir.split(os.sep)
+    (`InstallForm.INDEX`), in a path entry that is no library location (`in_library_location`:
+    the project root, a `src/` directory, a `PYTHONPATH` entry, a checkout outside the
+    interpreter's prefix). The files it describes are the project's own, which no RECORD lists,
+    so it makes Pivot refuse no file that lies there (`_Snapshot._unlisted`): neither a project
+    file nor a library file whose resolved path lies in uv's cache under the project root. A
+    develop build's `<name>.egg-info` in a library location is not: a checkout under the
+    interpreter's prefix (pip's `install -e git+...` puts one in `<venv>/src`) holds library
+    code, which the walk records by name and does not hash, so a reached file there that no
+    RECORD lists is refused beside it."""
+    return installed.classification.form is InstallForm.INDEX and not in_library_location(
+        pathlib.PurePath(installed.site_dir)
     )
 
 

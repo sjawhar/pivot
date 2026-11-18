@@ -16,14 +16,16 @@ when `packages/pivot/src` is pivot 0.10.4's.
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
 (`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, the two refusals of an
-install Pivot cannot read, word for word, as templates (`DISTRIBUTION_REFUSAL`,
-`UNLISTED_FILE_REFUSAL`) and as those of a broken install of the fixtures, with the start pivot
-gives each for `STAGE`, in an error (`STAGE_FAILED`) and in a warning (`STAGE_PREFIX`), the
-layout flit's `install --symlink` gives an editable install (`flit_symlink_install`), built by
-hand since CI has no flit, the layout uv gives an install from a package index, its files copied
-or linked into a cache (`index_install_by_hand`), built by hand for the tests that start no
-process, and what those tests give `installed_distributions.distribution_keys` of a module loaded
-from a file (`module_loaded_from`).
+install Pivot cannot read, word for word, as templates (`DISTRIBUTION_REFUSAL`, and
+`UNLISTED_FILE_REFUSAL`, which `unlisted_refusal` fills; each ends with the fix `REFUSAL_FIX`
+starts) and as those of a broken install of the fixtures, with the start pivot gives each for
+`STAGE`, in an error (`STAGE_FAILED`) and in a warning (`STAGE_PREFIX`), a run that refuses and
+warns of nothing (`assert_runs_with_no_refusal`), the layout flit's `install --symlink` gives an
+editable install (`flit_symlink_install`), built by hand since CI has no flit, the layout uv
+gives an install from a package index, its files copied or linked into a cache
+(`index_install_by_hand`), built by hand for the tests that start no process, and what those
+tests give `installed_distributions.distribution_keys` of a module loaded from a file
+(`module_loaded_from`).
 """
 
 from __future__ import annotations
@@ -118,12 +120,15 @@ def main():
 # `str.format`, so that a change to the words of either is made here alone: a distribution's
 # (`installed_distributions.decide`), `{how}` being `REACHED` or `DEPENDED_ON`, and that of a
 # reached module whose file no RECORD lists beside a distribution with no RECORD
-# (`installed_distributions.distribution_keys`), `{form}` saying how that distribution is
-# installed (an `InstallForm`'s value) and `{problem}` what is wrong with its RECORD.
+# (`installed_distributions.distribution_keys`, which `unlisted_refusal` fills), `{form}` saying
+# how that distribution is installed (an `InstallForm`'s value) and `{problem}` what is wrong
+# with its RECORD. Each ends with the fix `REFUSAL_FIX` starts, and so does the warning that
+# unsafe fingerprinting gives in its place.
+REFUSAL_FIX = "Fix: reinstall"
 DISTRIBUTION_REFUSAL = (
     "Distribution '{name}' ({dist_info}), which {how}, {reason}. Pivot cannot fingerprint the "
-    "installed code the stage runs, so the stage could skip a run after that code changes. Fix: "
-    "reinstall '{name}'."
+    "installed code the stage runs, so the stage could skip a run after that code changes. "
+    f"{REFUSAL_FIX} '{{name}}'."
 )
 REACHED = "this stage reaches"
 DEPENDED_ON = "a distribution this stage reaches depends on"
@@ -131,8 +136,47 @@ UNLISTED_FILE_REFUSAL = (
     "Module '{module}' ({file}) lies in {site}, where distribution '{name}' ({dist_info}), "
     "installed {form}, {problem}, and no RECORD file there lists that file. Pivot cannot tell "
     "whether the stage runs that distribution's code, so the stage could skip a run after it "
-    "changes. Fix: reinstall '{name}'."
+    f"changes. {REFUSAL_FIX} '{{name}}'."
 )
+
+# How `InstallForm.LOCAL_DIRECTORY` and `InstallForm.INDEX` complete "installed ..." in a refusal
+# (each one's value), written out for the refusals this module builds when it is imported, since
+# it imports nothing of `installed_distributions` at run time (above).
+_LOCAL_DIRECTORY_FORM = "from a local directory (dir_info)"  # InstallForm.LOCAL_DIRECTORY.value
+_INDEX_FORM = "with no direct_url.json, as from a package index"  # InstallForm.INDEX.value
+
+
+def unlisted_refusal(
+    module: str,
+    file: str,
+    site: str,
+    name: str,
+    form: installed_distributions.InstallForm,
+    dist_info: str | None = None,
+) -> str:
+    """The refusal of reached module `module`, whose file `file` lies in site directory `site`,
+    where distribution `name`, installed as `form` says, has no RECORD file, and no RECORD there
+    lists that file (`UNLISTED_FILE_REFUSAL`): `name`'s metadata directory is `dist_info`, else
+    `{site}/{name}-0.1.dist-info`."""
+    return _unlisted_file_refusal(module, file, site, name, form.value, dist_info)
+
+
+def _unlisted_file_refusal(
+    module: str, file: str, site: str, name: str, form: str, dist_info: str | None
+) -> str:
+    """`UNLISTED_FILE_REFUSAL` filled as `unlisted_refusal` says, `form` being an `InstallForm`'s
+    value."""
+    return UNLISTED_FILE_REFUSAL.format(
+        module=module,
+        file=file,
+        site=site,
+        name=name,
+        dist_info=f"{site}/{name}-0.1.dist-info" if dist_info is None else dist_info,
+        form=form,
+        problem="has no RECORD file",
+    )
+
+
 # The refusals of a broken install of `Fix_Lib` and `fixdep`, `{site}` left in each for the venv's
 # resolved site-packages.
 UNCLASSIFIED_REFUSAL = DISTRIBUTION_REFUSAL.format(
@@ -145,19 +189,25 @@ RECORDLESS_DEPENDENCY_REFUSAL = DISTRIBUTION_REFUSAL.format(
     name="fixdep",
     dist_info="{site}/fixdep-0.1.dist-info",
     how=DEPENDED_ON,
-    reason="is installed from a local directory (dir_info) and has no RECORD file, so Pivot "
-    + "cannot read its files",
+    reason=f"is installed {_LOCAL_DIRECTORY_FORM} and has no RECORD file, so Pivot cannot read "
+    + "its files",
 )
 # A reached module `{module}`, whose file `{file}` no RECORD lists, beside `Fix_Lib` with no RECORD:
 # `{module}` and `{file}`, relative to `{site}`, left in it too.
-UNLISTED_REFUSAL = UNLISTED_FILE_REFUSAL.format(
-    module="{module}",
-    file="{site}/{file}",
-    site="{site}",
-    name="fix-lib",
-    dist_info="{site}/fix_lib-0.1.dist-info",
-    form="from a local directory (dir_info)",
-    problem="has no RECORD file",
+UNLISTED_REFUSAL = _unlisted_file_refusal(
+    "{module}",
+    "{site}/{file}",
+    "{site}",
+    "fix-lib",
+    _LOCAL_DIRECTORY_FORM,
+    "{site}/fix_lib-0.1.dist-info",
+)
+# A reached module `{module}`, whose file `{file}` no RECORD lists, beside `{name}.egg-info` in
+# `{site}`, the metadata a setuptools build or develop install leaves beside its code, with no
+# RECORD and no `direct_url.json`: `{module}`, `{name}` and `{file}`, relative to `{site}`, left in
+# it too.
+UNLISTED_EGG_INFO_REFUSAL = _unlisted_file_refusal(
+    "{module}", "{site}/{file}", "{site}", "{name}", _INDEX_FORM, "{site}/{name}.egg-info"
 )
 # How pivot starts the warning unsafe fingerprinting gives of `STAGE` in place of each of those
 # refusals, as it starts every refusal it can downgrade: with the stage's name.
@@ -698,6 +748,15 @@ def assert_runs_and_writes(project: Project, output: str, command: str = "`pivot
     written = (project.root / OUTPUT).read_text()
     assert written == output, f"{STAGE} must write {output!r}, not {written!r}"
     return shown
+
+
+def assert_runs_with_no_refusal(project: Project, output: str) -> dict[str, str]:
+    """`pivot repro` runs `STAGE`, which writes `output` (`assert_runs_and_writes`), and refuses
+    and warns of nothing (its output holds no `REFUSAL_FIX`); returns the lock's code manifest
+    (`lock_manifest`)."""
+    shown = assert_runs_and_writes(project, output)
+    assert REFUSAL_FIX not in shown, f"`pivot repro` must refuse and warn of nothing:\n{shown}"
+    return lock_manifest(project, STAGE)
 
 
 def assert_ran_then_cached(project: Project, output: str) -> None:

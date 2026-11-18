@@ -7,15 +7,20 @@ and the user's part of a namespace package shared with a library (in the project
 checkout in `<venv>/src`, as `is_user_code` takes it), give no `dist:` key and no refusal,
 whatever metadata lies beside them. A project's own metadata (the `<name>.egg-info` a setuptools
 build leaves beside the project's code, with no RECORD and no `direct_url.json`) refuses nothing
-in a path entry outside every `site-packages` and `dist-packages` directory.
+in a path entry outside every `site-packages` and `dist-packages` directory and the interpreter's
+prefix; the same metadata of a library's checkout under the prefix (pip's `install -e git+...`
+puts one in `<venv>/src`) is no project's, and a reached file there that no RECORD lists is
+refused beside it.
 
 Each test makes its own venv with uv over this test environment (`tests.installed_dists`), installs
-`Fix_Lib` and the namespace portion `company.client` from their paths, and drives its own pivot
-project, whose stage calls them and the project's code. The setuptools project `myproj`, which
-requires `Fix_Lib`, leaves `myproj.egg-info` beside its code when it is built: `uv pip install -e`
-with build isolation, as a user runs it, writes it there through setuptools' `egg_info`, and so
-does the wheel build these tests run, offline and with no build isolation (after `uv pip install
--e`, where a test installs the project editable).
+`Fix_Lib` from its path, and, but for the library checkout's test, the namespace portion
+`company.client`, and drives its own pivot project, whose stage calls that installed code and
+the code beside it that the test names. The setuptools project `myproj`, which requires
+`Fix_Lib`, leaves `myproj.egg-info` beside its code when it is built: `uv pip install -e` with
+build isolation, as a user runs it, writes it there through setuptools' `egg_info`, and so does
+the wheel build these tests run, offline and with no build isolation (after `uv pip install -e`,
+where a test installs the project editable); the checkout's project `foo` leaves `foo.egg-info`
+so.
 
 The in-process test of the same rule, over uv's cache inside the project root, is in
 `test_installed_distributions_snapshot.py`.
@@ -31,9 +36,6 @@ import shutil
 import pytest
 from tests import helpers, installed_dists
 
-# Each refusal of a broken install, and its warning under unsafe fingerprinting, ends with this.
-_REFUSAL_FIX = "Fix: reinstall"
-
 # The project's `@pivot.fingerprint_by_name` helper `helpers.stamp`, and `mymod`, whose `value()`
 # the walk hashes and whose `stamp()` is such a helper.
 _HELPERS = 'import pivot\n\n\n@pivot.fingerprint_by_name\ndef stamp():\n    return "h1"\n'
@@ -44,6 +46,8 @@ _MYMOD = (
 # The project's part of the namespace package `company`, and the installed `company.client`.
 _LOCAL = 'def value():\n    return "local-1"\n'
 _CLIENT = 'def value():\n    return "client-1"\n'
+# The package `foo` of a library's checkout, whose `value()` calls the installed `fixlib`.
+_FOO = 'import fixlib\n\n\ndef value():\n    return "foo-1:" + fixlib.value()\n'
 
 _HELPER_PIPELINE = """\
 import fixlib
@@ -129,16 +133,20 @@ def _helper_write_myproj(
 
 
 def _helper_build(
-    venv: installed_dists.Venv, source: pathlib.Path, wheels: pathlib.Path, holder: pathlib.Path
+    venv: installed_dists.Venv,
+    name: str,
+    source: pathlib.Path,
+    wheels: pathlib.Path,
+    holder: pathlib.Path,
 ) -> pathlib.Path:
-    """Build a wheel of `myproj` at `source` into `wheels` (`installed_dists.build_wheel`), which
-    leaves `myproj.egg-info` in `holder`, the directory that holds its packages, then delete the
-    `build` directory the build leaves in `source`, as `uv pip install -e` leaves none. The test
-    fails unless that `.egg-info` requires `Fix_Lib` and has no RECORD and no `direct_url.json`.
-    Returns it."""
+    """Build a wheel of the setuptools project `name` at `source` into `wheels`
+    (`installed_dists.build_wheel`), which leaves `<name>.egg-info` in `holder`, the directory
+    that holds its packages, then delete the `build` directory the build leaves in `source`, as
+    `uv pip install -e` leaves none. The test fails unless that `.egg-info` requires `Fix_Lib`
+    and has no RECORD and no `direct_url.json`. Returns it."""
     installed_dists.build_wheel(venv, source, wheels)
     shutil.rmtree(source / "build")
-    egg_info = holder / "myproj.egg-info"
+    egg_info = holder / f"{name}.egg-info"
     held = sorted(child.name for child in egg_info.iterdir())
     requires = importlib.metadata.Distribution.at(egg_info).requires
     assert requires == ["Fix_Lib"] and not {"RECORD", "direct_url.json"} & set(held), (
@@ -146,14 +154,6 @@ def _helper_build(
         + f"requires {requires}, holds {held}"
     )
     return egg_info
-
-
-def _helper_ran(project: installed_dists.Project, output: str) -> dict[str, str]:
-    """`pivot repro` runs the stage, which writes `output` (`assert_runs_and_writes`), and refuses
-    and warns of nothing; returns the lock's code manifest."""
-    shown = installed_dists.assert_runs_and_writes(project, output)
-    assert _REFUSAL_FIX not in shown, f"`pivot repro` must refuse and warn of nothing:\n{shown}"
-    return installed_dists.lock_manifest(project, installed_dists.STAGE)
 
 
 def _helper_sys_path(project: installed_dists.Project) -> list[str]:
@@ -181,7 +181,7 @@ def _helper_in_the_project_root(
     `myproj` (package `mymod`, and `company/local.py`), built there, which leaves
     `myproj.egg-info` in the root. Returns the root."""
     _helper_write_myproj(project.root, tmp_path / "myproj", ["mymod"], _PROJECT_CODE)
-    _helper_build(venv, project.root, tmp_path / "wheels", project.root)
+    _helper_build(venv, "myproj", project.root, tmp_path / "wheels", project.root)
     return project.root
 
 
@@ -207,7 +207,7 @@ def _helper_in_a_src_directory(
     installed_dists.install_directory(venv, project.root, editable=True)
     path = [os.path.realpath(entry) for entry in _helper_sys_path(project)]
     assert str(src.resolve()) in path, f"the editable install must put {src} on the path: {path}"
-    _helper_build(venv, project.root, tmp_path / "wheels", src)
+    _helper_build(venv, "myproj", project.root, tmp_path / "wheels", src)
     return src
 
 
@@ -223,7 +223,7 @@ def _helper_in_a_pythonpath_entry_with_an_egg_info(
     extra = tmp_path / "extra"
     extra.mkdir()
     _helper_write_myproj(extra, tmp_path / "myproj", ["mymod"], _PROJECT_CODE)
-    _helper_build(venv, extra, tmp_path / "wheels", extra)
+    _helper_build(venv, "myproj", extra, tmp_path / "wheels", extra)
     monkeypatch.setenv("PYTHONPATH", str(extra), prepend=os.pathsep)
     return extra
 
@@ -307,9 +307,9 @@ def test_a_flat_project_installed_editable_runs_as_with_its_egg_info_moved_out(
     assert url is not None and url["dir_info"] == {"editable": True}, (
         f"myproj must be installed editable: direct_url.json is {url!r}"
     )
-    egg_info = _helper_build(venv, project.root, tmp_path / "wheels", project.root)
+    egg_info = _helper_build(venv, "myproj", project.root, tmp_path / "wheels", project.root)
 
-    beside = _helper_ran(project, output)
+    beside = installed_dists.assert_runs_with_no_refusal(project, output)
     egg_info.rename(tmp_path / egg_info.name)
     installed_dists.pivot_ok(project, "repro", "--force")
 
@@ -341,13 +341,13 @@ def test_project_code_beside_metadata_with_no_record_outside_site_packages_is_wa
         pathlib.Path,
     ],
 ) -> None:
-    """Each kind of path entry outside every `site-packages` and `dist-packages` directory (the
-    project root, a `src/` directory, a `PYTHONPATH` entry) holds `mymod`, whose `value()` the
-    walk hashes and whose `stamp()` is a `@pivot.fingerprint_by_name` helper, and the project's
-    part of the namespace package `company`, beside a distribution with no RECORD there:
-    `myproj.egg-info`, which requires `Fix_Lib` and which a setuptools build of the project left
-    there, or `fixtarget`, which `uv pip install --target` installed there from its path, and
-    which has lost its RECORD. The stage calls `mymod.value()`, `mymod.stamp()`,
+    """Each kind of path entry outside every `site-packages` and `dist-packages` directory and the
+    interpreter's prefix (the project root, a `src/` directory, a `PYTHONPATH` entry) holds
+    `mymod`, whose `value()` the walk hashes and whose `stamp()` is a `@pivot.fingerprint_by_name`
+    helper, and the project's part of the namespace package `company`, beside a distribution with
+    no RECORD there: `myproj.egg-info`, which requires `Fix_Lib` and which a setuptools build of
+    the project left there, or `fixtarget`, which `uv pip install --target` installed there from
+    its path, and which has lost its RECORD. The stage calls `mymod.value()`, `mymod.stamp()`,
     `company.client.value()` and `fixlib.value()`. `pivot repro` runs it, refusing nothing, and
     its lock holds the keys of `company-client` and `Fix_Lib`. After one byte of `mymod.value()`
     changes, the stage is stale on `func:mymod.value` alone, and `pivot repro` writes the new
@@ -357,14 +357,16 @@ def test_project_code_beside_metadata_with_no_record_outside_site_packages_is_wa
     project = installed_dists.make_project_in(tmp_path, venv, _PROJECT_CODE_PIPELINE)
     directory = place(tmp_path, venv, project, monkeypatch)
 
-    manifest = _helper_ran(project, _PROJECT_CODE_OUTPUT)
+    manifest = installed_dists.assert_runs_with_no_refusal(project, _PROJECT_CODE_OUTPUT)
     assert installed_dists.dist_keys(manifest) == ["dist:company-client", "dist:fix-lib"], (
         f"the lock: {manifest}"
     )
     installed_dists.replace_once(directory / "mymod" / "__init__.py", '"mine-1"', '"mine-2"')
 
     installed_dists.assert_stale_on(project, installed_dists.STAGE, "func:mymod.value")
-    _helper_ran(project, _PROJECT_CODE_OUTPUT.replace("mine-1", "mine-2"))
+    installed_dists.assert_runs_with_no_refusal(
+        project, _PROJECT_CODE_OUTPUT.replace("mine-1", "mine-2")
+    )
 
 
 def test_the_part_of_a_namespace_package_in_a_checkout_under_the_venv_is_left_out(
@@ -389,8 +391,55 @@ def test_the_part_of_a_namespace_package_in_a_checkout_under_the_venv_is_left_ou
     (venv.site_packages / "checkout.pth").write_text(f"{checkout}\n")
     project = installed_dists.make_project_in(tmp_path, venv, _NAMESPACE_PIPELINE)
 
-    manifest = _helper_ran(project, "client-1:value-1")
+    manifest = installed_dists.assert_runs_with_no_refusal(project, "client-1:value-1")
 
     assert installed_dists.dist_keys(manifest) == ["dist:company-client", "dist:fix-lib"], (
         f"the lock: {manifest}"
+    )
+
+
+def test_a_library_checkout_under_the_venv_beside_its_develop_egg_info_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`<venv>/src/foo`, which a `.pth` file in site-packages puts on the path, as pip's `install
+    -e git+...#egg=foo` puts its checkout in `<venv>/src` there, holds the setuptools project
+    `foo` (package `foo`, whose `value()` calls `fixlib.value()`), which requires `Fix_Lib`,
+    installed from its path, and its build there leaves `foo.egg-info` beside its code, with no
+    RECORD and no `direct_url.json`, as a develop build does. The checkout lies under the
+    interpreter's prefix, so `foo`'s file is library code, which the walk records by name and
+    does not hash, and `foo.egg-info` is no project's own metadata: no RECORD lists that file
+    beside it, so `pivot repro` refuses the stage that calls `foo.value()`, naming `foo`'s file
+    and `foo.egg-info`, and writes no output. Taken as a project's own, as in an entry outside
+    the prefix, `foo.egg-info` would refuse nothing, and the stage would run with no key of
+    `Fix_Lib`, which `foo` runs, so a change to `Fix_Lib` would rerun nothing."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    fixlib = installed_dists.write_library(
+        tmp_path / "src", "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE
+    )
+    installed_dists.install_directory(venv, fixlib)
+    checkout = tmp_path / "venv" / "src" / "foo"
+    installed_dists.write_setuptools_project(
+        checkout,
+        "foo",
+        "0.1",
+        packages=["foo"],
+        files={"foo/__init__.py": _FOO},
+        dependencies=["Fix_Lib"],
+    )
+    _helper_build(venv, "foo", checkout, tmp_path / "wheels", checkout)
+    (venv.site_packages / "foo.pth").write_text(f"{checkout}\n")
+    project = installed_dists.make_project_in(tmp_path, venv, installed_dists.pipeline("foo"))
+
+    ran = installed_dists.run_pivot(project, "repro", "--json")
+
+    shown = installed_dists.shown(ran)
+    assert ran.returncode == 1, f"pivot must refuse {installed_dists.STAGE}:\n{shown}"
+    errors = [line for line in ran.stderr.splitlines() if line.startswith("Error:")]
+    refusal = installed_dists.UNLISTED_EGG_INFO_REFUSAL.format(
+        module="foo", file="foo/__init__.py", site=checkout.resolve(), name="foo"
+    )
+    expected = f"Error: {installed_dists.STAGE_FAILED}{refusal}"
+    assert errors == [expected], f"pivot must refuse with:\n{expected}\n{shown}"
+    assert not (project.root / installed_dists.OUTPUT).exists(), (
+        f"the refused {installed_dists.STAGE} must not run"
     )
