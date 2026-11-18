@@ -638,16 +638,18 @@ local path or a local archive, one it cannot classify, one whose requirements it
 one that requires such a distribution, directly or through others, of any install form (a
 package-index `.egg-info` directory, which never has a RECORD, included). Such a distribution
 owns no file, so Pivot cannot tell whether the module is that distribution's. A file's
-directories are the deepest entry of the worker's `sys.path` that holds it where Pivot judged it
-(a module's own file as `fingerprint.judged_file` gives it: as the import located it, its
-directory resolved, or, for a link outside every library path, the first file of its chain of
-links that is a library path; a file under a package where it lies in the package's directory),
-the deepest entry that holds each further file of a module file's chain of links that is a
-library path, and the deepest entry that holds its resolved path, where a link points; a RECORD
-in any of them lists the file when one of its paths resolves to the file's resolved path. So a
-module file linked from one entry into another that holds such a distribution is refused as the
-file it points to would be, also where that file is itself a link into uv's cache, while a file
-linked from an entry that holds one into an entry whose RECORD lists the file is not; where an
+directories are the deepest entries of the worker's `sys.path` that hold its places, and the
+deepest entry that holds its resolved path, where a link points; a RECORD in any of them lists
+the file when one of its paths resolves to the file's resolved path. A module's own file lies
+where Pivot judged it (`fingerprint.judged_file`: as the import located it, its directory
+resolved, or, for a link outside every library path, the first file of its chain of links that
+is a library path) and in every later file of that chain, library path or not; a file under a
+package lies where the walk lists it in the package's directory and, for a symbolic link, in
+every later file of its chain (`installed_distributions.link_chain`, which follows at most 40
+links). So a module or package file linked from one entry into another that holds such a
+distribution is refused as the file it points to would be, also where that file is itself a link
+into uv's cache or the entry is no library path (a `--target` directory), while a file linked
+from an entry that holds one into an entry whose RECORD lists the file is not; where an
 installer links each file into its cache, where that cache lies outside every entry of the path,
 no entry holds the resolved path, and the file is judged where it lies (for a cache inside an
 entry, see the Limits below). And a setuptools project's own `<name>.egg-info`, in the project
@@ -700,18 +702,20 @@ user code. So `fingerprint.is_library_file` decides a file in this order:
 
 The keys and the refusals of
 [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path)
-use the file Pivot judges a module's file by, found by the chain of rule 2 for every file, also
-one that rule 1 decides (`fingerprint.judged_file`): `fingerprint.reached_module_of` gives it to
-`installed_distributions` beside the module's origin, so the site directory and the package
-directory they name are those where the chain reaches a library path, in a copied environment
-as in a linked one. A file whose own path, its directory resolved, is a library path already, as
-every file of a virtual environment is, is its own judged file. Beside it go the further files of
-the chain that are library paths, followed to the chain's end within 40 links: the check of a
-file that no RECORD lists sees the site directory of each, so `A/site-packages/m.py`, a link made
-by hand to `B/site-packages/m.py`, lies in both, whether `B`'s file is a copy or a link into uv's
-cache (`test_installed_distributions_snapshot.py`, `test_installed_distributions_unlisted.py`). A
-virtual environment that uv builds with `UV_LINK_MODE=symlink` so fingerprints as one whose files
-uv copied, and gives the same `dist:` keys and the same refusals. A distribution owns each
+use the places of a module's file, found by the chain of rule 2 for every file, also one that
+rule 1 decides: `fingerprint.reached_module_of` gives `installed_distributions`, beside the
+module's origin, the file Pivot judges it by (`fingerprint.judged_file`) and every later file of
+its chain of links, library path or not, so the site directory and the package directory they
+name are those where the chain reaches a library path, in a copied environment as in a linked
+one. A file whose own path, its directory resolved, is a library path already, as every file of
+a virtual environment is, is its own judged file. The check of a file that no RECORD lists sees
+the entry of each place, and a package file it walks that is a link lies in each file of its
+chain too, so `A/site-packages/m.py`, a link made by hand to `B/site-packages/m.py` or to
+`P/libs/m.py` (a `--target` directory on the path), lies in both, whether that file is a copy or
+a link into uv's cache (`test_installed_distributions_snapshot.py`,
+`test_installed_distributions_unlisted.py`). A virtual environment that uv builds with
+`UV_LINK_MODE=symlink` so fingerprints as one whose files uv copied, and gives the same `dist:`
+keys and the same refusals. A distribution owns each
 directory above each path its RECORD lists inside its site directory, named as the RECORD names
 it, besides each directory above the file that path resolves to, so a namespace package, whose
 directories stay in `site-packages`, keeps its owner there, and so does a regular package, whose

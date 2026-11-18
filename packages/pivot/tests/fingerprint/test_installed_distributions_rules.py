@@ -605,76 +605,76 @@ def test_reach_meets_each_requirement_once_and_follows_none_of_a_stop() -> None:
 
 
 @pytest.mark.parametrize(
-    ("origin", "real", "expected"),
+    ("origin", "places", "expected"),
     [
         pytest.param(
             ("file", f"{_SITE}/fixlib/core.py"),
-            f"{_SITE}/fixlib/core.py",
+            (f"{_SITE}/fixlib/core.py",),
             {"fix-lib", "fix-lib-extra"},
             id="file",
         ),
         pytest.param(
             ("file", f"{_SITE}/company/__init__.py"),
-            f"{_SITE}/company/__init__.py",
+            (f"{_SITE}/company/__init__.py",),
             {"company-core", "company-vendor"},
             id="package-init",
         ),
         pytest.param(
             ("file", f"{_SITE}/company/__init__.cpython-313-x86_64-linux-gnu.so"),
-            f"{_SITE}/company/__init__.cpython-313-x86_64-linux-gnu.so",
+            (f"{_SITE}/company/__init__.cpython-313-x86_64-linux-gnu.so",),
             {"company-core", "company-vendor"},
             id="extension-package-init",
         ),
         pytest.param(
             ("file", f"{_SITE}/stray.py"),
-            f"{_SITE}/stray.py",
+            (f"{_SITE}/stray.py",),
             set[str](),
             id="file-no-record-lists",
         ),
         pytest.param(
             ("file", f"{_CACHE}/core/linked/__init__.py"),
-            f"{_SITE}/linked/__init__.py",
+            (f"{_SITE}/linked/__init__.py", f"{_CACHE}/core/linked/__init__.py"),
             {"linked-core", "linked-plugin"},
             id="linked-package-init-owned-through-its-directory-in-site-packages",
         ),
         pytest.param(
             ("file", f"{_CACHE}/core/linked/core.py"),
-            f"{_SITE}/linked/core.py",
+            (f"{_SITE}/linked/core.py", f"{_CACHE}/core/linked/core.py"),
             {"linked-core"},
             id="linked-file-owned-by-its-resolved-path",
         ),
         pytest.param(
             ("file", f"{_CACHE}/twice/twice.py"),
-            f"{_SITE}/twice.py",
+            (f"{_SITE}/twice.py", f"{_CACHE}/twice/twice.py"),
             {"twice-in-venv", "twice-in-target"},
             id="file-linked-from-two-site-directories-owned-by-both-installs",
         ),
         pytest.param(
             ("namespace", f"{_SITE}/nsco", "/home/user/other/nsco"),
-            None,
+            (),
             {"nsco-local", "nsco-other"},
             id="namespace",
         ),
-        pytest.param(("built-in",), None, set[str](), id="built-in"),
-        pytest.param(("frozen",), None, set[str](), id="frozen"),
-        pytest.param(("no file",), None, set[str](), id="no-file"),
-        pytest.param(("unknown", "ImportError: boom"), None, set[str](), id="unknown"),
-        pytest.param(None, None, set[str](), id="none"),
+        pytest.param(("built-in",), (), set[str](), id="built-in"),
+        pytest.param(("frozen",), (), set[str](), id="frozen"),
+        pytest.param(("no file",), (), set[str](), id="no-file"),
+        pytest.param(("unknown", "ImportError: boom"), (), set[str](), id="unknown"),
+        pytest.param(None, (), set[str](), id="none"),
     ],
 )
 def test_owners_maps_an_origin_to_the_candidates_by_file(
-    origin: tuple[str, ...] | None, real: str | None, expected: set[str]
+    origin: tuple[str, ...] | None, places: tuple[str, ...], expected: set[str]
 ) -> None:
     """A file maps to every candidate whose RECORD lists it, resolved, and a package's `__init__`
     of any suffix also to every candidate with a file under its directory, the directory of the
-    file as the import located it (`real`); a namespace package maps to every candidate with a
-    file under one of its directories; any other origin maps to none. Where an installer links
-    each file into its cache (`linked-core`'s files, and `linked-plugin`'s `linked/plugin.py`, in
-    two cache entries), a package's `__init__` maps through its directory in the site directory
-    to each candidate that lists a file there, not through the directory of its resolved path,
-    which only the candidate whose cache entry that is owns; a linked module file maps to the
-    candidate that lists its resolved path, and one cache entry linked from two site directories
-    (`twice.py`) to both installs, whose RECORDs resolve to it."""
+    file Pivot judged it by (the first of `places`); a namespace package maps to every candidate
+    with a file under one of its directories; any other origin maps to none. Where an installer
+    links each file into its cache (`linked-core`'s files, and `linked-plugin`'s
+    `linked/plugin.py`, in two cache entries), a package's `__init__` maps through its directory
+    in the site directory to each candidate that lists a file there, not through the directory of
+    its resolved path, which only the candidate whose cache entry that is owns; a linked module
+    file maps to the candidate that lists its resolved path, and one cache entry linked from two
+    site directories (`twice.py`) to both installs, whose RECORDs resolve to it."""
     file_owners = {
         f"{_SITE}/fixlib/core.py": {"fix-lib", "fix-lib-extra"},
         f"{_SITE}/company/__init__.py": {"company-core"},
@@ -698,7 +698,7 @@ def test_owners_maps_an_origin_to_the_candidates_by_file(
         f"{_SITE}/linked": {"linked-core", "linked-plugin"},
     }
 
-    found = installed_distributions.owners(origin, real, file_owners, directory_owners)
+    found = installed_distributions.owners(origin, places, file_owners, directory_owners)
 
     assert found == expected, found
 

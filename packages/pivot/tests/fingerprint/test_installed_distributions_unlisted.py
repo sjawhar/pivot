@@ -6,9 +6,9 @@ file linked into such an install's package, and a module file, beside such an in
 a file of another entry that an index install's RECORD lists, a copy or a link into a cache. A
 file lies in the entry where Pivot judges it (`fingerprint.judged_file`: where the import finds
 it, or, for a project file linked into `site-packages`, where its link reaches), in each entry
-that holds a further library file of its chain of links, and in the one it resolves into, and a
-RECORD of any of them lists it; where two are one entry, the refusal names the file where Pivot
-judged it. No test starts a process.
+that holds a later file of its chain of links, and in the one it resolves into, and a RECORD of
+any of them lists it; where two lie in one entry, the refusal names the file where Pivot judged
+it, else the first file of its chain that lies there. No test starts a process.
 
 The pure functions of `pivot.installed_distributions` are in
 `test_installed_distributions_rules.py`, and the same check over real installs in

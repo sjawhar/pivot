@@ -128,12 +128,6 @@ _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
 _SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
-# The most symbolic links `_library_chain` follows from a file: Linux's limit on the links one path
-# lookup follows (MAXSYMLINKS, 40). A file whose chain reaches a library path only after more is
-# judged where the import found it, and no library file the chain reaches only after more is a
-# place the file lies in (`reached_module_of`).
-_MAX_LINK_HOPS = 40
-
 # Type alias for AST hash cache entry tuple.
 # Format: (rel_path, source_digest, qualname, py_version, schema_version, hash_hex)
 type AstHashEntry = tuple[str, str, str, str, int, str]
@@ -2473,13 +2467,13 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
     A module's origin is the module this process holds, which is the code the walk saw
     (`loaded_source.check_worker_imports` refuses a worker that would import another), else where
     a worker would import it from, predicted without importing it (`loaded_source.worker_spec`,
-    which gives the origin and the file at once). Beside it goes the file Pivot judges the
-    module's file by (`judged_file` of the module's file as its import located it, else of the
-    predicted spec's), and the further library files of its chain of links: in a venv uv links
-    into its cache the origin lies in the cache, and only those files name the site directories
-    and the package's directory where the chain of links reaches a library path, where another
-    distribution may put a file. No origin is found when the manifest has no `byname:` entry, or
-    when no distribution on the worker's path can give a key or a refusal
+    which gives the origin and the file at once). Beside it go the places of the module's file
+    (`_places` of the module's file as its import located it, else of the predicted spec's): the
+    file Pivot judges it by (`judged_file`) and every later file of its chain of links. In a venv
+    uv links into its cache the origin lies in the cache, and only those files name the site
+    directories and the package's directory where the chain of links reaches a library path,
+    where another distribution may put a file. No origin is found when the manifest has no
+    `byname:` entry, or when no distribution on the worker's path can give a key or a refusal
     (`installed_distributions.needs_origins`)."""
     names = _by_name_names(manifest)
     if not names:
@@ -2520,19 +2514,15 @@ def reached_module_of(
     origin: import_origin.Origin | None, file: str | None
 ) -> installed_distributions.ReachedModule:
     """What `installed_distributions` takes of a module a stage reaches by name, whose origin is
-    `origin` and whose file, as its import located it or would locate it, is `file`: that origin,
-    the file Pivot judges `file` by (`judged_file`, `real`), and the further files of its chain
-    of links that are library paths (`_library_chain`, `hops`); no file and no hops when it has
-    none. So the keys and the refusals name the site directories and the package directory where
-    the chain of links reaches a library path. For a file whose path with its directory resolved
-    is a library path already (every file of a venv, copied or linked into uv's cache), `real` is
+    `origin` and whose file, as its import located it or would locate it, is `file`: that origin
+    and the places of `file` (`_places`: the file Pivot judges it by, `judged_file`, then every
+    later file of its chain of links), none when it has no file. So the keys and the refusals
+    name the site directories and the package directory where the chain of links reaches a
+    library path. For a file whose path with its directory resolved is a library path already
+    (every file of a venv, copied or linked into uv's cache), the first place is
     `with_real_directory(file)`. The one builder of both a module this process holds
     (`_held_module`) and one a worker would import (`loaded_source.worker_spec`)."""
-    if file is None:
-        return installed_distributions.ReachedModule(origin, None)
-    return installed_distributions.ReachedModule(
-        origin, judged_file(file), _library_chain(file)[1:]
-    )
+    return installed_distributions.ReachedModule(origin, () if file is None else _places(file))
 
 
 def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:
@@ -7102,7 +7092,8 @@ def is_library_file(filename: str) -> bool:
        file's site directory lists it (``installed_distributions.listed_by_editable``, on the
        worker's ``sys.path``). Then the resolved path decides, as in pivot 0.10.4: user code.
     3. Else user code: the chain meets a file that is no library path and no link before one that
-       is a library path, or reaches no library path within ``_MAX_LINK_HOPS`` links.
+       is a library path, or reaches no library path within the links
+       ``installed_distributions.link_chain`` follows.
 
     So a file that uv's ``UV_LINK_MODE=symlink`` links into its cache from a real directory of
     ``site-packages``, a library package linked into the project root, a ``sys.path`` entry that
@@ -7128,66 +7119,43 @@ def is_library_file(filename: str) -> bool:
     )
 
 
-@functools.lru_cache(maxsize=4096)
 def judged_file(filename: str) -> str:
-    """The file Pivot judges the file ``filename`` by (``is_library_file``), which
-    ``reached_module_of`` gives ``installed_distributions`` to name the site directory and the
-    package directory of a module: the first file of its chain of symbolic links that is a
-    library path (``_library_chain``), whatever the resolved path is, so a project file linked by
-    hand to a file of ``site-packages`` is judged there both where that file is a copy and where
-    it is a link into uv's cache. The file as the import found it (``with_real_directory``) when
-    no file of the chain is a library path: the chain meets a file that is no library path and
-    no link Pivot can read, or reaches no library path within ``_MAX_LINK_HOPS`` links (a loop of
-    links among them). For a file whose own path with its directory resolved is a library path
-    already (every file of a venv, copied or linked into uv's cache), that is the file as the
-    import found it. Decided once per file name per process."""
-    chain = _library_chain(filename)
-    return chain[0] if chain else with_real_directory(filename)
+    """The file Pivot judges the file ``filename`` by (``is_library_file``): the first of its
+    places (``_places``), which is the first file of its chain of symbolic links that is a
+    library path, whatever the resolved path is, so a project file linked by hand to a file of
+    ``site-packages`` is judged there both where that file is a copy and where it is a link into
+    uv's cache. The file as the import found it (``with_real_directory``) when no file of the chain
+    is a library path: the chain meets a file that is no library path and no link Pivot can read,
+    or reaches no library path within the links ``installed_distributions.link_chain`` follows (a
+    loop of links among them). For a file whose own path with its directory resolved is a library
+    path already (every file of a venv, copied or linked into uv's cache), that is the file as
+    the import found it."""
+    return _places(filename)[0]
 
 
 @functools.lru_cache(maxsize=4096)
-def _library_chain(filename: str) -> tuple[str, ...]:
-    """The files of the chain of symbolic links from the file ``filename`` that are library paths
-    (``is_library_path``), each once, in the order of the chain. Pivot starts from the file as the
-    import found it (``with_real_directory``) and follows the chain one link at a time to the file
-    each link names (``_link_hop``), to its end: a file that is no link Pivot can read, or
-    ``_MAX_LINK_HOPS`` links in all. The first is the file Pivot judges ``filename`` by
-    (``judged_file``); the others are the further places the file lies in, which
-    ``installed_distributions`` checks for a file that no RECORD lists (``reached_module_of``):
-    ``A/site-packages/m.py``, a link made by hand to ``B/site-packages/m.py``, lies in both,
-    whether ``B``'s file is a copy or a link into uv's cache. Each file of the chain costs one
-    ``os.readlink``. Decided once per file name per process."""
-    hop, links = with_real_directory(filename), 0
-    chain = dict[str, None]()
-    while True:
+def _places(filename: str) -> tuple[str, ...]:
+    """The places the file ``filename`` lies in, which ``reached_module_of`` gives
+    ``installed_distributions`` (``ReachedModule.places``): the chain of symbolic links from the
+    file as the import found it (``installed_distributions.link_chain`` of
+    ``with_real_directory``), from its first file that is a library path (``judged_file``) to its
+    end, every later file included, library path or not, so the check of a file that no RECORD
+    lists sees each path entry the links pass: ``A/site-packages/m.py``, a link made by hand to
+    ``B/site-packages/m.py`` or to ``P/libs/m.py`` (a ``--target`` directory), lies in both,
+    whether that file is a copy or a link into uv's cache. The file as the import found it alone
+    when no file of the chain is a library path. Decided once per file name per process."""
+    chain = installed_distributions.link_chain(with_real_directory(filename))
+    for index, hop in enumerate(chain):
         if is_library_path(pathlib.Path(hop)):
-            chain[hop] = None
-        target = _link_hop(hop) if links < _MAX_LINK_HOPS else None
-        if target is None:
-            return tuple(chain)
-        hop, links = target, links + 1
-
-
-def _link_hop(link: str) -> str | None:
-    """The file the symbolic link ``link``, a path whose directory is resolved, names: its target,
-    joined to the link's directory when relative, with its directory resolved by
-    ``os.path.realpath`` and its last name kept, as ``with_real_directory`` gives a file
-    (``realpath`` resolves a ``..`` after a link in the target as the kernel does, where
-    ``os.path.abspath`` would drop the name before it). None when ``link`` is no symbolic link
-    Pivot can read: not a link (``os.readlink`` raises ``EINVAL``), missing, or unreadable."""
-    try:
-        target = os.readlink(link)
-    except OSError:
-        return None
-    joined = os.path.join(os.path.dirname(link), target)
-    return os.path.join(os.path.realpath(os.path.dirname(joined)), os.path.basename(joined))
+            return chain[index:]
+    return chain[:1]
 
 
 def with_real_directory(filename: str) -> str:
     """The file ``filename`` made absolute, its directory resolved and its last name kept: the
     file as the import found it, whatever links its directory was reached through, and, where
-    the file is itself a link, not where that link points. ``_library_chain`` starts the chain of
-    links it follows from it."""
+    the file is itself a link, not where that link points. ``_places`` starts the chain of links
+    it follows from it."""
     absolute = os.path.abspath(filename)
     return os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
 
