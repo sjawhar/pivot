@@ -2487,7 +2487,7 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
         if isinstance(module, types.ModuleType):
             modules[name] = _held_module(module)
         else:
-            modules[name] = reached_module(*loaded_source.worker_spec(name))
+            modules[name] = reached_module_of(*loaded_source.worker_spec(name))
     found = installed_distributions.distribution_keys(modules, path, pivot_dirs)
     prefix = _stage_prefix()
     for message in found.refusals:
@@ -2496,20 +2496,20 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
 
 
 def _held_module(module: types.ModuleType) -> installed_distributions.ReachedModule:
-    """What `installed_distributions` takes of a module this process holds (`reached_module`),
+    """What `installed_distributions` takes of a module this process holds (`reached_module_of`),
     from its origin (`import_origin.of_module`) and its file as its import located it
     (`import_origin.file_of_module`), found once per module object within one
     `fingerprint_pass()`."""
     return _memoized(
         "reached-module",
         module,
-        lambda: reached_module(
+        lambda: reached_module_of(
             import_origin.of_module(module), import_origin.file_of_module(module)
         ),
     )
 
 
-def reached_module(
+def reached_module_of(
     origin: import_origin.Origin | None, file: str | None
 ) -> installed_distributions.ReachedModule:
     """What `installed_distributions` takes of a module a stage reaches by name, whose origin is

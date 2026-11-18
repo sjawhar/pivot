@@ -646,7 +646,8 @@ links each file into its cache, where that cache lies outside every entry of the
 holds the resolved path, and the file is judged where it lies (for a cache inside an entry, see
 the Limits below). And a setuptools project's own `<name>.egg-info`, in the project root first on
 `sys.path`, refuses nothing for a module in the site-packages of a `.venv` inside that root,
-which is a deeper entry. The files checked are the module's own and, for a package's `__init__`
+which is a deeper entry, where uv's cache, if it links files, lies outside that root (see the
+Limits below). The files checked are the module's own and, for a package's `__init__`
 file or a namespace package, the files under its directories but those under a `__pycache__`
 directory, which the key leaves out too (a `.pyc` file outside one is checked). Pivot walks such
 a directory only when the deepest entry of `sys.path` above it, or an entry at or under it,
