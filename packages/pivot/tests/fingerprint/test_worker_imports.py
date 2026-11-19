@@ -10,11 +10,11 @@ started as a worker starts before it raises.
 
 A submodule the program holds bound on a library package, which a stage reads through the
 package's name, is what the walk follows and records, so that its worker finds it bound there,
-sent with the stage or imported by name as what cloudpickle carries of it with the stage decides
-(`fingerprint.bound_submodule`, `fingerprint.read_submodules`, `loaded_source.carried_submodules`,
-`loaded_source.submodule_delivery`): a plain module with a source file, or a namespace package of
-the project's, that `sys.modules` holds under its name, re-read on a manifest cache hit, and, for a
-`@no_fingerprint` stage, found by a scan of the stage's own code.
+sent with the stage or imported by name as what loky's pickler carries of it with the stage
+decides (`fingerprint.bound_submodule`, `fingerprint.read_submodules`,
+`submodule_delivery.submodule_delivery`): a plain module with a source file, or a namespace
+package of the project's, that `sys.modules` holds under its name, re-read on a manifest cache
+hit, and, for a `@no_fingerprint` stage, found by a scan of the stage's own code.
 
 Each test names its modules uniquely: the test process puts `packages/pivot/tests` (with its own
 `helpers.py`) on `sys.path`.
@@ -41,7 +41,7 @@ import pytest
 import yaml
 from tests import helpers
 
-from pivot import discovery, exceptions, executor, fingerprint, loaded_source
+from pivot import discovery, exceptions, executor, fingerprint, loaded_source, submodule_delivery
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
@@ -1043,10 +1043,9 @@ def test_a_submodule_read_in_several_parts_of_a_walk_is_one_name_sent_with_the_s
     stage = pipeline.get_stage("p/use")
     names = stage.get("read_submodules", ())
     assert names == ("wi_joined.local",), names
-    carried = loaded_source.carried_submodules(stage["func"], names)
-    assert loaded_source.submodule_delivery(names, carried) == loaded_source.SubmoduleDelivery(
-        sent=(vars(package)["local"],), imported=()
-    )
+    assert submodule_delivery.submodule_delivery(
+        stage["func"], names
+    ) == submodule_delivery.SubmoduleDelivery(sent=(vars(package)["local"],), imported=())
 
 
 def test_a_submodule_a_later_import_session_removed_is_neither_walked_nor_sent(
@@ -1058,8 +1057,8 @@ def test_a_submodule_a_later_import_session_removed_is_neither_walked_nor_sent(
     pipeline, ends the project's import session, which takes `wi_gone.local` out of
     `sys.modules` while the package still holds it. The stage's walk then reads nothing of that
     module, and the coordinator neither sends it nor has the worker import it for what the walk of
-    the session read (`loaded_source.submodule_delivery`), as for a submodule no import bound: no
-    module of an ended session reaches a worker."""
+    the session read (`submodule_delivery.submodule_delivery`), as for a submodule no import
+    bound: no module of an ended session reaches a worker."""
     package = _helper_shared_namespace("wi_gone", tmp_path, monkeypatch)
     pipeline = helpers.discover_project(
         tmp_path,
@@ -1079,10 +1078,9 @@ def test_a_submodule_a_later_import_session_removed_is_neither_walked_nor_sent(
     assert [key for key in walked if "wi_gone.local" in key] == [], walked
     names = fingerprint.read_submodules(first)
     assert names == ("wi_gone.local",), first
-    carried = loaded_source.carried_submodules(pipeline.get_stage("p/use")["func"], names)
-    assert loaded_source.submodule_delivery(names, carried) == loaded_source.SubmoduleDelivery(
-        sent=(), imported=()
-    )
+    assert submodule_delivery.submodule_delivery(
+        pipeline.get_stage("p/use")["func"], names
+    ) == submodule_delivery.SubmoduleDelivery(sent=(), imported=())
 
 
 def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_walk(
@@ -1178,8 +1176,7 @@ def test_what_cloudpickle_carries_of_a_submodule_decides_whether_it_is_sent_or_i
     names = fingerprint.read_submodules(_walk(pipeline))
     assert names == (f"{name}.local",), names
 
-    carried = loaded_source.carried_submodules(pipeline.get_stage("p/use")["func"], names)
-    delivery = loaded_source.submodule_delivery(names, carried)
+    delivery = submodule_delivery.submodule_delivery(pipeline.get_stage("p/use")["func"], names)
 
     assert ([module.__name__ for module in delivery.sent], list(delivery.imported)) == expected
     assert all(module is vars(package)["local"] for module in delivery.sent), delivery

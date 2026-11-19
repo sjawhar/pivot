@@ -6,17 +6,23 @@ A stage that reads the project's part of a package it shares with an installed l
 the package's name (`import company.local`, then `company.local.value()` in the stage's code, a
 helper's, a lambda's or an output writer's) runs in the worker as a plain `python` run of its
 module does, and one byte changed in that part reruns it. The walk follows such a submodule and
-records it (`submodule:` entries). The coordinator pickles the worker's call once more to see
-what cloudpickle carries of the submodule (`loaded_source.carried_submodules`): when it carries
-the module or a function or class of it by value, the module is sent with the stage and bound on
-its package, so the stage's values and the module the code reads are one copy; when it carries
-nothing of it, the worker imports it by name before the stage runs, as the code that reads it
-would, and nothing of its values is pickled (`loaded_source.submodule_delivery`). An import that
-fails there fails the stage with its traceback and a note naming the module. A stage that reaches
-the module by another name (`from company import local`, or only `from company.local import
-value`) runs too. A `@no_fingerprint` stage's own code is scanned for the same reads
-(`fingerprint.submodule_entries`), but not a helper module it calls: a stated limit, which one
-case pins.
+records it (`submodule:` entries). The coordinator pickles the worker's call once more, with a
+pickler built on loky's, to see what cloudpickle carries of the submodule
+(`submodule_delivery.submodule_delivery`): when it carries the module itself by value, the module
+is sent with the stage and bound on its package, so the stage's values and the module the code
+reads are one copy; when it carries only a function or class of it, the module is sent so where
+it can be pickled whole, and imported by name in the worker otherwise, as pivot 0.10.4 does; when
+it carries nothing of it, the worker imports it by name before the stage runs, as the code that
+reads it would, and nothing of its values is pickled. A sent module joins what the call carries,
+so another submodule of which it holds a class is decided by the same rules. The worker binds the
+sent modules, imports the others by name, a package before its submodules, and binds the sent
+ones again, so neither a package it imports by name nor an import by name that loads a sent
+module from its file leaves the stage's code another copy. An import there that fails fails the
+stage with its traceback and a note naming the module, and one that exits fails it as an exit of
+the stage does. A stage that reaches the module by another name (`from company import local`, or
+only `from company.local import value`) runs too. A `@no_fingerprint` stage's own code is scanned
+for the same reads (`fingerprint.submodule_entries`), but not a helper module it calls: a stated
+limit, which one case pins.
 
 A namespace package's directory under the interpreter's prefix but in no `site-packages`
 directory, as a `uv pip install --target` directory that a `.pth` file in `site-packages` puts on
@@ -213,19 +219,22 @@ class Tools:
         return company.local.value()
 """
 _BY_REFERENCE_IMPORTS = "import company.client\nimport company.local\nimport fixlib\nimport helper"
-# The project's `company/local.py` that fails when a project's second import runs it: the first,
-# in pivot's own process, leaves a file beside it.
-_LOCAL_IMPORTED_ONCE = """\
+# The project's `company/local.py` that runs `{second}` when a project's second import runs it: the
+# first, in pivot's own process, leaves a file beside it. It raises (`_LOCAL_IMPORTED_ONCE`) or
+# exits with status 3 (`_LOCAL_EXITING_ON_A_SECOND_IMPORT`).
+_SECOND_IMPORT = """\
 import pathlib
 
 if pathlib.Path(__file__).with_name("imported").exists():
-    raise RuntimeError("a second import")
+    {second}
 pathlib.Path(__file__).with_name("imported").touch()
 
 
 def value():
     return "local-1"
 """
+_LOCAL_IMPORTED_ONCE = _SECOND_IMPORT.format(second='raise RuntimeError("a second import")')
+_LOCAL_EXITING_ON_A_SECOND_IMPORT = _SECOND_IMPORT.format(second="raise SystemExit(3)")
 # The project's `company/local.py` of the `Mode` tests: an enum `Mode`, and `run`, which tells its
 # members apart by identity, as code that compares enum members does.
 _MODES = """\
@@ -265,6 +274,60 @@ from pivot import Pipeline
 with Pipeline("p") as pipeline:
     make()
 """
+# The stage calls `company.sub.local.run` (`_MODES`, in `company/sub/local.py`) inside a lambda,
+# whose names cloudpickle does not follow, and holds its `Mode`: of the module, the stage's pickle
+# carries that class alone, and nothing of `company.sub`, a namespace package the project shares
+# with `company-client` (`_CLIENT_AND_SUB`).
+_SUB_MODES_PIPELINE = installed_dists.pipeline_text(
+    "import company.sub.local\nfrom company.sub.local import Mode",
+    "(lambda: company.sub.local.run(Mode.FAST))()",
+)
+# The project's `company/other.py`, which imports `company.local` itself (`_IMPORTS_LOCAL`), or
+# reads it through the package's name as it is imported (`_READS_LOCAL_AT_IMPORT`: `run` with
+# `Mode.FAST`); only `tools.g` (`_READS_OTHER`, in a `PYTHONPATH` entry) reads it through the
+# package's name, and the stage reads `company.local` (`_MODES`) so and holds its `Mode`.
+_IMPORTS_LOCAL = 'import company.local\n\n\ndef g():\n    return "g"\n'
+_READS_LOCAL_AT_IMPORT = """\
+import company
+
+FIRST = company.local.run(company.local.Mode.FAST)
+
+
+def g():
+    return FIRST
+"""
+_READS_OTHER = "import company\n\n\ndef g():\n    return company.other.g()\n"
+_READS_OTHER_PIPELINE = installed_dists.pipeline_text(
+    "import company.local\nimport company.other\nimport tools\nfrom company.local import Mode",
+    'tools.g() + ":" + company.local.run(Mode.FAST)',
+)
+# The project's `company/local.py` of `_MODES` with `kind`, which returns `Kind.A` of
+# `company/other.py` (`_KINDS`), bound by `from company.other import Kind`. `tools.check`
+# (`_CHECKS_KIND`, in a `PYTHONPATH` entry), which the stage calls with its `Mode.FAST`, reads both
+# modules through the package's name: what `run` returns, and whether `kind()` returns the member
+# of the `Kind` that `company.other` holds.
+_KINDS = 'import enum\n\n\nclass Kind(enum.Enum):\n    A = "a"\n'
+_MODES_AND_KIND = (
+    "from company.other import Kind\n" + _MODES + "\n\ndef kind():\n    return Kind.A\n"
+)
+_CHECKS_KIND = """\
+import company
+
+
+def check(mode):
+    same = company.local.kind() is company.other.Kind.A
+    return company.local.run(mode) + ":" + ("a" if same else "not-a")
+"""
+_CHECKS_KIND_PIPELINE = installed_dists.pipeline_text(
+    "import tools\nfrom company.local import Mode", "tools.check(Mode.FAST)"
+)
+# The project's `company/local.py` of `_LOCAL_WITH_LOCK` with `name`; the stage calls `name`, which
+# `from company.local import name` bound, and `helper.value()` (`_HELPER`, in a `PYTHONPATH`
+# entry), which reads the module through the package's name.
+_LOCAL_WITH_LOCK_AND_NAME = _LOCAL_WITH_LOCK + '\n\ndef name():\n    return "n"\n'
+_NAME_PIPELINE = installed_dists.pipeline_text(
+    "import helper\nfrom company.local import name", 'name() + ":" + helper.value()'
+)
 
 
 def _helper_in_site_packages(venv: installed_dists.Venv) -> tuple[pathlib.Path, list[str]]:
@@ -685,6 +748,150 @@ def test_a_stage_and_the_submodule_it_reads_through_its_package_hold_one_copy_of
     installed_dists.assert_runs_with_no_refusal(project, "fast")
 
 
+def _helper_project_with(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client: collections.abc.Mapping[str, str],
+    files: collections.abc.Mapping[str, str],
+    extra_files: collections.abc.Mapping[str, str],
+    pipeline_text: str,
+) -> installed_dists.Project:
+    """A project whose venv has `company-client`, whose files are `client`, and `Fix_Lib`
+    installed into site-packages from their paths (`installed_dists.install_client_and_fixlib`),
+    with `pipeline_text` as its `pipeline.py`, `files` in its root and `extra_files` in a
+    `PYTHONPATH` entry (`_helper_in_a_pythonpath_entry`), each path relative to the directory
+    that holds it."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    installed_dists.install_client_and_fixlib(venv, tmp_path / "src", client)
+    project = installed_dists.make_project_in(tmp_path, venv, pipeline_text)
+    extra = _helper_in_a_pythonpath_entry(tmp_path, project, monkeypatch)
+    for directory, held in ((project.root, files), (extra, extra_files)):
+        for relative, text in held.items():
+            (directory / relative).parent.mkdir(parents=True, exist_ok=True)
+            (directory / relative).write_text(text)
+    return project
+
+
+@pytest.mark.parametrize(
+    ("client", "files", "extra_files", "pipeline_text", "output"),
+    [
+        pytest.param(
+            _CLIENT_AND_SUB,
+            {"company/sub/local.py": _MODES},
+            {},
+            _SUB_MODES_PIPELINE,
+            "fast",
+            id="package-imported-by-name",
+        ),
+        pytest.param(
+            installed_dists.CLIENT_FILES,
+            {"company/local.py": _MODES, "company/other.py": _READS_LOCAL_AT_IMPORT},
+            {"tools.py": _READS_OTHER},
+            _READS_OTHER_PIPELINE,
+            "fast:fast",
+            id="read-by-an-import-by-name",
+        ),
+        pytest.param(
+            installed_dists.CLIENT_FILES,
+            {"company/local.py": _MODES, "company/other.py": _IMPORTS_LOCAL},
+            {"tools.py": _READS_OTHER},
+            _READS_OTHER_PIPELINE,
+            "g:fast",
+            id="loaded-again-by-an-import-by-name",
+        ),
+    ],
+)
+def test_a_submodule_sent_with_the_stage_is_bound_before_and_after_the_imports_by_name(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client: dict[str, str],
+    files: dict[str, str],
+    extra_files: dict[str, str],
+    pipeline_text: str,
+    output: str,
+) -> None:
+    """`company-client` is installed into site-packages from its path. The project holds `Mode`
+    and `run` (`_MODES`) in its part of a namespace package it shares with that library, and the
+    coordinator sends that module with the stage, whose pickle carries `Mode`: as
+    `company/sub/local.py`, which the stage reads through `company` and `company.sub` inside a
+    lambda, so that the pickle carries nothing of `company.sub`, which the worker imports by name
+    (`package-imported-by-name`); or as `company/local.py`, which the stage reads through the
+    package's name, beside `company/other.py`, which the worker imports by name, as only `tools.g`,
+    in a `PYTHONPATH` entry, reads it through the package, and which reads `company.local` through
+    the package's name as it is imported (`read-by-an-import-by-name`) or imports it itself
+    (`loaded-again-by-an-import-by-name`). `pivot repro` runs the stage, which writes what a plain
+    `python` run of `pipeline.py` writes (`fast`, `fast:fast`, `g:fast`), refusing nothing: the
+    worker binds the sent module on its package before its imports by name and again after them.
+    Were it bound only after them, the import of `company.other` would fail with
+    `AttributeError: module 'company' has no attribute 'local'`. Were it bound only before them,
+    the stage would fail with `AttributeError: module 'company.sub' has no attribute 'local'`, as
+    the package was not there to bind it on, or write `g:slow`, as the import of `company.other`
+    loads `company.local` from its file and binds that copy on the package, whose `Mode` is not the
+    stage's."""
+    project = _helper_project_with(tmp_path, monkeypatch, client, files, extra_files, pipeline_text)
+
+    found, shown = _helper_repro_outcome(project)
+
+    assert found == (0, "ran", output), shown
+
+
+def test_a_submodule_of_which_a_sent_module_holds_a_class_is_sent_with_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`company-client` is installed into site-packages from its path. The project's part of
+    `company` holds `company/local.py`, with `Mode`, `run` and `kind`, which returns `Kind.A` of
+    `company/other.py` (`from company.other import Kind`). The stage holds `Mode` and returns
+    `tools.check(Mode.FAST)` of the module `tools`, in a `PYTHONPATH` entry, which reads both
+    modules through the package's name and checks that `company.local.kind()` is
+    `company.other.Kind.A`. The stage's pickle carries `Mode` of `company.local` and nothing of
+    `company.other`; the coordinator sends `company.local` with the stage, and its namespace, which
+    the call then carries too, holds `Kind`, so the coordinator sends `company.other` with it.
+    `pivot repro` runs the stage, which writes `fast:a`, as a plain `python` run does, refusing
+    nothing. Were `company.other` decided by what the stage alone carries, the worker would import
+    it by name from its file, whose `Kind` is not the one the sent `company.local` holds, and the
+    stage would write `fast:not-a`."""
+    project = _helper_project_with(
+        tmp_path,
+        monkeypatch,
+        installed_dists.CLIENT_FILES,
+        {"company/local.py": _MODES_AND_KIND, "company/other.py": _KINDS},
+        {"tools.py": _CHECKS_KIND},
+        _CHECKS_KIND_PIPELINE,
+    )
+
+    found, shown = _helper_repro_outcome(project)
+
+    assert found == (0, "ran", "fast:a"), shown
+
+
+def test_a_submodule_whose_function_the_stage_holds_and_that_cannot_be_pickled_is_imported_by_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`company-client` is installed into site-packages from its path. The project's
+    `company/local.py`, in its root, which discovery sends by value, holds a lock no stage reads
+    and that cloudpickle cannot pickle, `value` and `name`. The stage calls `name`, which `from
+    company.local import name` bound in its module, and `helper.value()` of the module `helper`,
+    in a `PYTHONPATH` entry, which reads `company.local` through the package's name. The stage's
+    pickle carries `name` by value, and the module cannot be pickled whole, so the worker imports
+    it by name, as pivot 0.10.4 does: `pivot repro` runs the stage, which writes `n:local-1`,
+    refusing nothing, the stage's `name` and the worker's module being two copies (a stated
+    limit). Were the module sent because the stage carries a function of it, the stage would fail
+    as the pickling of its worker's call fails: `Could not pickle the task to send it to the
+    workers.`"""
+    project = _helper_project_with(
+        tmp_path,
+        monkeypatch,
+        installed_dists.CLIENT_FILES,
+        {"company/local.py": _LOCAL_WITH_LOCK_AND_NAME},
+        {"helper.py": _HELPER},
+        _NAME_PIPELINE,
+    )
+
+    found, shown = _helper_repro_outcome(project)
+
+    assert found == (0, "ran", "n:local-1"), shown
+
+
 def test_a_submodule_its_worker_fails_to_import_by_name_fails_the_stage_with_its_traceback(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -721,6 +928,35 @@ def test_a_submodule_its_worker_fails_to_import_by_name_fails_the_stage_with_its
         "Pivot imported company.local by name before the stage ran: the stage reads it through "
         + "its package.",
     ], shown
+
+
+def test_a_submodule_whose_import_by_name_exits_fails_the_stage_as_an_exit_of_the_stage_does(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`company-client` is installed into site-packages from its path. The project holds its part
+    of `company`, `company/local.py`, in its root, which raises `SystemExit(3)` when a second
+    import in the project runs it. `pipeline.py` imports it, and the stage calls `helper.value()`
+    of the module `helper`, in a `PYTHONPATH` entry, which reads `company.local` through the
+    package's name, so the worker imports `company.local` by name before the stage runs, a second
+    import. `pivot repro` exits 1, and the stage fails with the reason a `sys.exit(3)` in the
+    stage gives it: `Stage called sys.exit(3)`. Were the exit not handled there, the run would end
+    with `Error: Unexpected SystemExit: 3`, and the stage would complete with no event."""
+    project = _helper_project_with(
+        tmp_path,
+        monkeypatch,
+        installed_dists.CLIENT_FILES,
+        {"company/local.py": _LOCAL_EXITING_ON_A_SECOND_IMPORT},
+        {"helper.py": _IMPORTS_THE_PACKAGE},
+        installed_dists.pipeline_text(_BY_REFERENCE_IMPORTS, "helper.value()" + _LIBRARY_VALUES),
+    )
+
+    ran, event, shown = _helper_repro_event(project)
+
+    assert (ran.returncode, event["status"], event["reason"]) == (
+        1,
+        "failed",
+        "Stage called sys.exit(3)",
+    ), shown
 
 
 def test_a_stage_whose_submodule_cloudpickle_cannot_pickle_fails_as_its_pickling_fails(

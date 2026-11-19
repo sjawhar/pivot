@@ -206,8 +206,8 @@ before the stage ran (the covered thread rule, `_StageImports`):
 
 Discovery pickles `pipeline.py` and other modules under the project root by value, and importing
 one of them in the worker would run it again there, so a covered module is not imported ahead of
-the stage. There is one exception: a submodule the stage reads through its package of which
-cloudpickle carries nothing with the stage, which the worker imports by name before the stage
+the stage. There is one exception: a submodule the stage reads through its package that the
+coordinator does not send with the stage, which the worker imports by name before the stage
 runs (below). A plain run makes that import too, in the module of the code that reads the
 submodule, which reaches the worker by reference, or in `pipeline.py`, so it runs nothing a plain
 run does not.
@@ -230,44 +230,69 @@ stage's are. The registry keeps their names beside the stage's fingerprint
 (`RegistryStageInfo.read_submodules`).
 
 How each one bound on its package in the coordinator (`fingerprint.bound_submodule`) reaches the
-worker is decided by what cloudpickle carries of it with the stage. For a stage that reads at
-least one, the coordinator pickles the worker's call once more, before any submodule is added to
-it, with a pickler that records, for each such submodule, whether cloudpickle pickles something
-of it by value (`loaded_source.carried_submodules`): the module object itself (cloudpickle adds
-to a function it pickles by value each submodule of a package the function reads as a global,
-where the function's code names the submodule), or a function or class whose `__module__` names
-it. A stage that reads none pays nothing.
+worker is decided by what the pickling of the worker's call carries of it by value
+(`submodule_delivery.submodule_delivery`). For a stage that reads at least one, the coordinator
+pickles the stage's part of the call (`WorkerStageInfo`) once more, before any submodule is added
+to it and without writing it, with loky's own pickler (`loky.backend.reduction.get_loky_pickler`:
+cloudpickle's, with loky's reducers, so a bound method is reduced as loky reduces it) and a hook
+that records, for each such submodule, whether it pickles by value the module object itself
+(cloudpickle adds to a function it pickles by value each submodule of a package that a global or
+a closure cell of the function holds, where the function's own code names the submodule), or
+only a function or class whose `__module__` names it.
 
-- **Carried by value.** The module object is sent with the stage
-  (`WorkerStageInfo.sent_submodules`). It travels in the stage's pickle, so pickle's memo makes
-  it the module that the carried values belong to: a stage that holds `Mode`
-  (`from company.local import Mode`) and calls `company.local.run(Mode.FAST)` passes the class
-  that `run` compares with. The worker binds it on its package before anything of the stage runs
-  (parameter overrides, input loaders, the stage, output writers), as an import binds a submodule
-  (`worker._bind_sent_submodules`). The binding imports nothing and adds nothing to
-  `sys.modules`. A sent module that cloudpickle pickles by reference (`company/local.py` in a
-  `PYTHONPATH` entry, of which the stage holds a lambda) is imported by name as the worker
-  unpickles the stage, which binds it.
-- **Nothing carried.** Nothing the stage's pickle holds belongs to the module: the code that reads
-  it reaches the worker by reference (a helper module in a `PYTHONPATH` entry, whatever its
-  function's form: a lambda, a method, a function under a decorator), or reads it only in nested
-  code (a lambda in the stage), whose names cloudpickle does not follow. The worker imports the
-  submodule by name, as a plain run's import does (`WorkerStageInfo.imported_submodules`,
-  `worker._import_read_submodules`). The import runs
-  after the binding and before the parameter overrides and input loaders, before the stage's
-  import window opens. It goes through the worker's import machinery, as every import the worker
-  makes by name does, so the worker records the source it loads and the check of the modules the
-  stage used compares it with the coordinator's record (below). Nothing of its values is pickled,
-  so a module-level value that cloudpickle cannot pickle (a `threading.Lock`) does not stop the
-  stage. An import that raises fails the stage before anything of it runs, as a failure of the
-  stage's code does: the failure's reason is the import's traceback, which ends with a note that
-  names the module.
+- **The module object carried.** The module is sent with the stage
+  (`WorkerStageInfo.sent_submodules`). The call pickles it anyway, so sending it adds nothing to
+  what loky pickles, and since it travels in the stage's pickle, pickle's memo makes it the module
+  that the carried values belong to. A sent module that cloudpickle pickles by reference
+  (`company/local.py` in a `PYTHONPATH` entry, of which the stage holds a lambda) is imported by
+  name as the worker unpickles the stage, which binds it.
+- **Only a function or class of it carried.** A stage that holds `Mode`
+  (`from company.local import Mode`) and passes `Mode.FAST` to `company.local.run` through a
+  helper must pass the class that `run` compares with. The coordinator pickles the module alone
+  with the same pickler: where that succeeds, the module is sent, as above; where it raises (a
+  module-level `threading.Lock`), the worker imports the module by name, as in the next case (a
+  stated limit, below).
+- **Neither carried.** The code that reads the module reaches the worker by reference (a helper
+  module in a `PYTHONPATH` entry, whatever its function's form: a lambda, a method, a function
+  under a decorator), or reads it only in nested code (a lambda in the stage), whose names
+  cloudpickle does not follow, and the call carries no function or class of it by value. The
+  worker imports the submodule by name, as a plain run's import does
+  (`WorkerStageInfo.imported_submodules`, `worker._import_read_submodules`). Nothing of its values
+  is pickled, so a module-level value that cloudpickle cannot pickle (a `threading.Lock`) does not
+  stop the stage.
 
-When that extra pickling raises, the worker imports each such submodule by name, and the
-pickling of the call raises the same error, which fails the stage. A module the stage reaches by
-other names only (`from company.local import f`) is neither sent nor imported. The binding leaves
-alone a package the worker does not hold when the stage starts: nothing the stage's pickle holds
-refers to it.
+A sent module joins what the call carries, and loky pickles the whole namespace of one sent by
+value, which can carry a function or class of another such submodule (`company/local.py` does
+`from company.other import Kind`). What that namespace carries is decided by the same rules,
+until no sent module carries a new one: the extra pickling of the call holds the namespace of a
+module whose object the call carries, and the pickling of a module alone holds that of one sent
+for a function or class of it, so each submodule is pickled alone at most once. This runs on the
+engine's event loop, at each dispatch of a stage that reads such a submodule, before the call
+goes to the pool. It costs one more pickling of the stage's part of the call, without writing
+it, and one pickling of each module of which only a function or class is carried; a stage that
+reads none pays nothing.
+
+When the extra pickling of the call raises, every such submodule is marked to be imported by
+name; the call's own pickling then raises the same error, which fails the stage before a worker
+gets it. A module the stage reaches by other names only (`from company.local import f`) is
+neither sent nor imported.
+
+The worker gets them before anything of the stage runs (parameter overrides, input loaders, the
+stage, output writers) and before the stage's import window opens (`worker._deliver_submodules`):
+it binds each sent module on its package, as an import binds a submodule
+(`worker._bind_sent_submodules`), imports the others by name, a package before its submodules,
+then binds the sent ones again. An import by name can import the package that the first binding
+found missing (`company.sub`, imported by name, for a sent `company.sub.local`), or load from its
+file a module of a sent one's name, which that import binds over the sent one (`company/other.py`,
+imported by name, does `import company.local`): the second binding puts the sent module on each.
+The binding imports nothing and adds nothing to `sys.modules`, and it leaves alone a package the
+worker does not hold. An import by name goes through the worker's import machinery, as every
+import the worker makes by name does, so the worker records the source it loads and the check of
+the modules the stage used compares it with the coordinator's record (below). An import that
+raises an exception fails the stage before anything of it runs, as a failure of the stage's code
+does: the failure's reason is the import's traceback, which ends with a note that names the
+module. An import that exits (`sys.exit(3)` in the module) fails it with the reason an exit of the
+stage gives, `Stage called sys.exit(3)`.
 
 Three stated limits. A stage body that imports such a library package itself (`import company`
 inside the stage, which no function the stage's pickle holds reads as a global) gets it without
@@ -278,10 +303,11 @@ helper module the stage calls. A module that only a helper under the project roo
 its package reaches the worker neither way, and the stage fails there with
 `AttributeError: module 'company' has no attribute 'local'`. A helper the worker imports by name
 (one in a `PYTHONPATH` entry) works when it imports the module itself, as its own import binds
-it. And a module of which cloudpickle carries only a function or class by value (the stage holds
-`Mode`, and only a helper in a `PYTHONPATH` entry reads the module through its package) is sent
-whole, so a module-level value of it that cloudpickle cannot pickle fails the stage, as it does
-where the stage's own code reads the module through its package.
+it. And a module of which cloudpickle carries only a function or class by value, and that it
+cannot pickle whole (the stage holds `name` of a `company/local.py` that holds a
+`threading.Lock`, and only a helper in a `PYTHONPATH` entry reads the module through its
+package), is imported by name: the function or class the stage holds and the module the worker
+binds are then two copies, as in Pivot 0.10.4.
 
 A recorded module outside the covered set makes the result not reusable: the stage succeeds and
 logs one warning naming the modules; its lock carries an `uncovered-import:<modules>` key no
@@ -551,9 +577,9 @@ Limits of the comparison:
 A worker imports some user modules itself, from their files: a stage's module discovery does not
 send by value (outside the root, or under it in a `src` layout), a module outside the root that
 one sent by value refers to, a submodule the stage reads through its package that the
-coordinator sends with the stage while cloudpickle pickles it by reference, or of which
-cloudpickle carries nothing with the stage, which the worker imports by name before the stage
-runs (`loaded_source.submodule_delivery`, above), and any module a stage body imports. Such a
+coordinator sends with the stage while cloudpickle pickles it by reference, or does not send,
+which the worker imports by name before the stage runs (`submodule_delivery.submodule_delivery`,
+above), and any module a stage body imports. Such a
 module holds the file as the worker read it, which may be before or after an edit. Each worker
 gets the coordinator's
 records (`loaded_source.digests()`: each module's name, resolved path and digest) once, in its

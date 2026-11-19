@@ -54,7 +54,7 @@ import time
 import tokenize
 import types
 import warnings
-from typing import TYPE_CHECKING, Any, NamedTuple, cast, final, override
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import cloudpickle
 import xxhash
@@ -64,7 +64,7 @@ import xxhash
 from pivot import fingerprint, import_origin
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -577,7 +577,7 @@ def _suspect_origin(
         name == "__main__"
         or module is None
         or held_modules.get(name) is not module
-        or _pickled_by_value(name, by_value)
+        or pickled_by_value(name, by_value)
     ):
         return None
     held = import_origin.of_module(module)
@@ -609,115 +609,10 @@ def _held_suspects(
     return suspects
 
 
-class SubmoduleDelivery(NamedTuple):
-    """How a stage's worker gets the submodules the stage reads through the library packages that
-    hold them (`submodule_delivery`): the modules sent with the stage, which the worker binds on
-    their packages (`sent`), and the names of those it imports by name (`imported`), each before
-    the stage runs."""
-
-    sent: tuple[types.ModuleType, ...]
-    imported: tuple[str, ...]
-
-
-def submodule_delivery(names: Sequence[str], carried: Collection[str]) -> SubmoduleDelivery:
-    """How a stage's worker gets each submodule the stage reads through the library package that
-    holds it (`names`, from `fingerprint.read_submodules`, a package before its submodules) that
-    this process's package holds bound (`_bound_submodules`). When cloudpickle carries something
-    of it by value with the stage (`carried`, from `carried_submodules`), the module object is
-    sent too, so that the module the worker binds on the package is the one those values belong
-    to. Otherwise nothing the stage's pickle holds belongs to it, and the worker imports it by
-    name, as a plain run imports it; nothing of its values is pickled. Why, and what the worker
-    does with each: `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It
-    Runs"."""
-    sent = list[types.ModuleType]()
-    imported = list[str]()
-    for name, module in _bound_submodules(names).items():
-        if name in carried:
-            sent.append(module)
-        else:
-            imported.append(name)
-    return SubmoduleDelivery(sent=tuple(sent), imported=tuple(imported))
-
-
-def carried_submodules(value: object, names: Sequence[str]) -> frozenset[str]:
-    """The submodules among `names` (`fingerprint.read_submodules`) bound on their packages in
-    this process (`_bound_submodules`) of which cloudpickle carries something by value when it
-    pickles `value`, the part of a worker call that holds the stage (`_CarriedSubmodules`): the
-    module object itself (cloudpickle adds to a function it pickles by value each submodule of a
-    package the function reads as a global, where the function's code names the submodule), or a
-    function or class whose `__module__` names it. Empty when there is no such submodule, so
-    nothing is pickled, and when pickling `value` raises: the worker call, which holds `value`,
-    then fails to pickle with the same error, which fails the stage."""
-    candidates = _bound_submodules(names)
-    if not candidates:
-        return frozenset()
-    pickler = _CarriedSubmodules(candidates)
-    try:
-        pickler.dump(value)
-    except Exception:  # noqa: BLE001 - the worker call's own pickling raises it, see above
-        return frozenset()
-    return frozenset(pickler.carried)
-
-
-def _bound_submodules(names: Iterable[str]) -> dict[str, types.ModuleType]:
-    """Each of the submodules `names` that its package in this process holds bound
-    (`fingerprint.bound_submodule`), by name, in the order of `names`: not one an import session
-    took out of `sys.modules` since, nor one no import bound."""
-    bound = dict[str, types.ModuleType]()
-    for name in names:
-        package, _, attribute = name.rpartition(".")
-        parent = sys.modules.get(package)
-        if isinstance(parent, types.ModuleType):
-            module = fingerprint.bound_submodule(parent, attribute)
-            if module is not None:
-                bound[name] = module
-    return bound
-
-
-class _Discarded:
-    """A binary file that keeps nothing written to it."""
-
-    def write(self, data: bytes) -> int:
-        return len(data)
-
-
-@final
-class _CarriedSubmodules(cloudpickle.Pickler):
-    """A cloudpickle pickler that writes nothing (`_Discarded`) and records in `carried` each of
-    the submodules `candidates` (each by name) of which it pickles something by value
-    (`carried_submodules`), as cloudpickle decides it for each object it pickles: a function or
-    class whose `__module__` names the submodule and that cloudpickle's `reducer_override`
-    reduces, which it does for one it pickles by value; and the module object itself, which
-    cloudpickle pickles by value where it or one of its packages is registered so
-    (`_pickled_by_value`). That is what cloudpickle's private `_should_pickle_by_reference`
-    decides for a module that `sys.modules` holds, as it holds each candidate
-    (`fingerprint.bound_submodule`), so no private name of cloudpickle is called here."""
-
-    def __init__(self, candidates: Mapping[str, types.ModuleType]) -> None:
-        super().__init__(_Discarded())
-        self._names = frozenset(candidates)
-        # Each module object by its identity, so an object is matched without reading it.
-        self._modules = {id(module): name for name, module in candidates.items()}
-        self._registry = cloudpickle.list_registry_pickle_by_value()
-        self.carried = set[str]()
-
-    @override
-    def reducer_override(self, obj: object) -> object:
-        reduced = super().reducer_override(obj)
-        if reduced is not NotImplemented:
-            module = getattr(obj, "__module__", None)
-            if isinstance(module, str) and module in self._names:
-                self.carried.add(module)
-        elif (name := self._modules.get(id(obj))) is not None and _pickled_by_value(
-            name, self._registry
-        ):
-            self.carried.add(name)
-        return reduced
-
-
-def _pickled_by_value(name: str, registry: set[str]) -> bool:
-    """Whether cloudpickle sends module `name` by value: it or one of its packages is
-    registered (as `cloudpickle.cloudpickle._is_registered_pickle_by_value` decides)."""
+def pickled_by_value(name: str, registry: set[str]) -> bool:
+    """Whether cloudpickle sends module `name` by value: it or one of its packages is in
+    `registry` (`cloudpickle.list_registry_pickle_by_value()`), as cloudpickle's private
+    `_is_registered_pickle_by_value` decides."""
     parts = name.split(".")
     return any(".".join(parts[:index]) in registry for index in range(1, len(parts) + 1))
 
