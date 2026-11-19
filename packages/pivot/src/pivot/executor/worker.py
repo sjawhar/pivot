@@ -140,18 +140,23 @@ class _CoveredImportState(threading.local):
 
 
 class _HookRecordingState(threading.local):
-    """Whether this thread is running the import hooks' own recording work (`_hook_recording`:
-    `_record_hooked_import`, and `_tracked_reload`'s recording of the reloaded module).
+    """The import hooks' own recording work on this thread (`_hook_recording`:
+    `_record_hooked_import`, and `_tracked_reload`'s recording of the reloaded module): the queue
+    of the modules this thread imported during it that it has not recorded yet, None while no
+    such work runs.
 
-    That work can import: Debian's CPython 3.13.5 `pathlib` imports `ntpath` in every
-    `PurePath.__init__`, and `fingerprint.is_user_code` builds paths. An import this thread makes
-    meanwhile is the hooks' own machinery, not the stage's: `_tracked_import` and
-    `_tracked_import_module` pass it straight to the original import, which still imports, and
-    record nothing for it, so a hook never runs inside itself. Another thread's imports are
-    recorded as before.
+    That work can import, and not only the hooks' own machinery: Debian's CPython 3.13.5
+    `pathlib` imports `ntpath` in every `PurePath.__init__`, and `fingerprint.is_user_code` builds
+    paths and reads a module's `__name__`, which runs the body of a module that
+    `importlib.util.LazyLoader` set up, with every import that body makes. `_tracked_import` and
+    `_tracked_import_module` pass such an import straight to the original import, which still
+    imports, so a hook never runs inside itself, and queue the names of the modules it requested.
+    Once its own recording is done, the work records each batch it queued (`_record_queued`): in
+    the record of loaded source, and, when the work records for the running stage, for that
+    stage. Another thread's imports are recorded by that thread's hooks.
     """
 
-    recording: bool = False
+    queued: collections.deque[list[str]] | None = None
 
 
 _stage_imports: _StageImports | None = None
@@ -354,28 +359,80 @@ def _import_package(globals: Mapping[str, object] | None) -> str | None:
     return calc_package(globals)
 
 
-@contextlib.contextmanager
-def _hook_recording() -> Generator[None]:
-    """Run the block as the import hooks' own recording work: an import this thread makes
-    meanwhile passes through unrecorded (`_HookRecordingState`). The state it found is restored
-    after it."""
-    state = _hook_recording_state
-    previous = state.recording
-    state.recording = True
+def _import_request(
+    name: str, globals: Mapping[str, object] | None, fromlist: Sequence[str] | None, level: int
+) -> tuple[str | None, list[str]]:
+    """What a `builtins.__import__` call requests: its module's absolute name (None for a
+    relative one that cannot be resolved), and its `from` names other than `*`."""
+    items = [item for item in fromlist or () if item != "*"]
+    if not level:
+        return name, items
+    package = _import_package(globals)
     try:
-        yield
+        absolute = importlib.util.resolve_name(
+            "." * level + name, package if isinstance(package, str) else None
+        )
+    except (ImportError, ValueError):
+        return None, items
+    return absolute, items
+
+
+def _requested_modules(absolute: str, items: Sequence[str]) -> list[str]:
+    """The modules an import of `absolute` with the `from` names `items` requests: `absolute`,
+    its packages, and `absolute.<item>` for each item."""
+    return _package_chain(absolute) + [f"{absolute}.{item}" for item in items]
+
+
+def _import_module_request(name: str, package: str | None) -> str | None:
+    """The absolute name of the module an `importlib.import_module` call requests; None for a
+    relative one that cannot be resolved."""
+    try:
+        return importlib.util.resolve_name(name, package) if name.startswith(".") else name
+    except (ImportError, ValueError):
+        return None
+
+
+@contextlib.contextmanager
+def _hook_recording() -> Generator[collections.deque[list[str]]]:
+    """Run the block as the import hooks' own recording work, with a queue of its own for the
+    modules this thread imports meanwhile (`_HookRecordingState`), which it yields for the block
+    to record (`_record_queued`). The state it found is restored after it."""
+    state = _hook_recording_state
+    previous = state.queued
+    queued = collections.deque[list[str]]()
+    state.queued = queued
+    try:
+        yield queued
     finally:
-        state.recording = previous
+        state.queued = previous
+
+
+def _record_queued(queued: collections.deque[list[str]], *, for_stage: bool) -> None:
+    """Record each batch of module names in `queued`, the queue of the recording work running on
+    this thread (`_hook_recording`), until none is left: in the record of loaded source
+    (`loaded_source.record_modules`), and, when `for_stage`, for the running stage
+    (`_record_stage_import`). An import this makes is queued in turn. A batch recorded once is
+    skipped, so the loop ends even where every recording imports the same module again (under
+    Debian's `pathlib`, each path a recording builds imports `ntpath`)."""
+    recorded = set[tuple[str, ...]]()
+    while queued:
+        batch = queued.popleft()
+        key = tuple(batch)
+        if key in recorded:
+            continue
+        recorded.add(key)
+        loaded_source.record_modules(batch)
+        if for_stage:
+            _record_stage_import(batch)
 
 
 def _record_hooked_import(names: list[str], *, for_stage: bool) -> None:
-    """Record the modules `names` that a hooked import requested: in the record of loaded
-    source (`loaded_source.record_modules`), and, when `for_stage`, for the running stage
-    (`_record_stage_import`), as the hooks' own recording work (`_hook_recording`)."""
-    with _hook_recording():
-        loaded_source.record_modules(names)
-        if for_stage:
-            _record_stage_import(names)
+    """Record the modules `names` that a hooked import requested, and then each batch of modules
+    this thread imported while that ran, as the hooks' own recording work (`_hook_recording`,
+    `_record_queued`)."""
+    with _hook_recording() as queued:
+        queued.append(names)
+        _record_queued(queued, for_stage=for_stage)
 
 
 def _tracked_import(
@@ -385,8 +442,13 @@ def _tracked_import(
     fromlist: Sequence[str] | None = (),
     level: int = 0,
 ) -> object:
-    if _hook_recording_state.recording:
-        return _original_import(name, globals, locals, fromlist or (), level)
+    queued = _hook_recording_state.queued
+    if queued is not None:
+        result = _original_import(name, globals, locals, fromlist or (), level)
+        absolute, items = _import_request(name, globals, fromlist, level)
+        if absolute is not None:
+            queued.append(_requested_modules(absolute, items))
+        return result
     tracked = _stage_imports
     if tracked is None:
         result = _original_import(name, globals, locals, fromlist or (), level)
@@ -395,37 +457,29 @@ def _tracked_import(
             # each one the recorder saw compile; `record_unseen_modules` judges the rest.
             _record_hooked_import(_package_chain(name), for_stage=False)
         return result
-    package = _import_package(globals) if level else None
-    absolute: str | None = name
-    if level:
-        try:
-            absolute = importlib.util.resolve_name(
-                "." * level + name, package if isinstance(package, str) else None
-            )
-        except (ImportError, ValueError):
-            absolute = None
-    items = [item for item in fromlist or () if item != "*"]
+    absolute, items = _import_request(name, globals, fromlist, level)
     with _covered_import(tracked, absolute, items):
         result = _original_import(name, globals, locals, fromlist or (), level)
     if absolute is not None:
-        names = _package_chain(absolute) + [f"{absolute}.{item}" for item in items]
-        _record_hooked_import(names, for_stage=True)
+        _record_hooked_import(_requested_modules(absolute, items), for_stage=True)
     return result
 
 
 def _tracked_import_module(name: str, package: str | None = None) -> object:
-    if _hook_recording_state.recording:
-        return _original_import_module(name, package)
+    queued = _hook_recording_state.queued
+    if queued is not None:
+        result = _original_import_module(name, package)
+        absolute = _import_module_request(name, package)
+        if absolute is not None:
+            queued.append(_package_chain(absolute))
+        return result
     tracked = _stage_imports
     if tracked is None:
         result = _original_import_module(name, package)
         if not name.startswith("."):
             _record_hooked_import(_package_chain(name), for_stage=False)
         return result
-    try:
-        absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
-    except (ImportError, ValueError):
-        absolute = None
+    absolute = _import_module_request(name, package)
     with _covered_import(tracked, absolute, []):
         result = _original_import_module(name, package)
     if absolute is not None:
@@ -435,12 +489,14 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
 
 def _tracked_reload(module: ModuleType) -> ModuleType:
     """Reload `module`; the discovery recorder wraps the reload's loader and refreshes its record.
-    For the running stage, the reloaded module is recorded as the hooks' own recording work
-    (`_hook_recording`)."""
+    For the running stage, the reloaded module is recorded, and then each batch of modules this
+    thread imported while that ran, as the hooks' own recording work (`_hook_recording`,
+    `_record_queued`)."""
     result = _original_reload(module)
     if _stage_imports is not None:
-        with _hook_recording():
+        with _hook_recording() as queued:
             _record_stage_import([result.__name__])
+            _record_queued(queued, for_stage=True)
     return result
 
 
