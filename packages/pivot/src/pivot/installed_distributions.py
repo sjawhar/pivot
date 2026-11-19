@@ -5,14 +5,14 @@ comes from a file that the distribution's RECORD lists, or is a package or a nam
 whose directory, as the import searched it, holds one (`owners`). `fingerprint` gives only the
 library code of those modules: no module whose file is user code, which the walk hashes or the
 user names by name (`@pivot.fingerprint_by_name`), and of a namespace package only its
-directories in a site-packages directory (`in_site_packages`) or in pivot's own packages, so no
-distribution's RECORD decides user code. For each reached distribution installed from version
-control, from a local directory or from a local archive, and for each such distribution that a
-reached one depends on, the manifest gets the key `dist:<name>`, `<name>` normalised as PEP 503
-says. Its value hashes the distribution's own installed files, read from disk, so a change to them
-makes the stage stale, and a reinstall of the same files from another commit, path, installer or
-environment changes nothing. Package-index, remote-archive and editable distributions and
-pivot's own get no key.
+directories in a library location (`in_library_location`) or in pivot's own packages, the rule
+by which a file in them is library code, so no distribution's RECORD decides user code. For
+each reached distribution installed from version control, from a local directory or from a local
+archive, and for each such distribution that a reached one depends on, the manifest gets the key
+`dist:<name>`, `<name>` normalised as PEP 503 says. Its value hashes the distribution's own
+installed files, read from disk, so a change to them makes the stage stale, and a reinstall of the
+same files from another commit, path, installer or environment changes nothing. Package-index,
+remote-archive and editable distributions and pivot's own get no key.
 
 It also tells `fingerprint.is_library_file` whether the RECORD of an editable distribution lists a
 file linked into a site directory (`listed_by_editable`): such a file keeps the decision of its

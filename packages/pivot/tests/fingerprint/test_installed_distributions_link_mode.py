@@ -73,7 +73,7 @@ _UNCLASSIFIED_DEPENDENCY_REFUSAL = installed_dists.DISTRIBUTION_REFUSAL.format(
     name="fixdep",
     dist_info="{site}/fixdep-0.1.dist-info",
     how=installed_dists.DEPENDED_ON,
-    reason="is installed in a form Pivot cannot classify: its direct_url.json is not a JSON object",
+    reason=installed_dists.NOT_A_JSON_OBJECT_REASON,
 )
 
 

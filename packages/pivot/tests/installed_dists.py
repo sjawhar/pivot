@@ -177,13 +177,18 @@ def _unlisted_file_refusal(
     )
 
 
+# The reason `DISTRIBUTION_REFUSAL` gives for a distribution whose `direct_url.json` is no JSON
+# object (`InstallForm.UNCLASSIFIED`, `installed_distributions.classify`).
+NOT_A_JSON_OBJECT_REASON = (
+    "is installed in a form Pivot cannot classify: its direct_url.json is not a JSON object"
+)
 # The refusals of a broken install of `Fix_Lib` and `fixdep`, `{site}` left in each for the venv's
 # resolved site-packages.
 UNCLASSIFIED_REFUSAL = DISTRIBUTION_REFUSAL.format(
     name="fix-lib",
     dist_info="{site}/fix_lib-0.1.dist-info",
     how=REACHED,
-    reason="is installed in a form Pivot cannot classify: its direct_url.json is not a JSON object",
+    reason=NOT_A_JSON_OBJECT_REASON,
 )
 RECORDLESS_DEPENDENCY_REFUSAL = DISTRIBUTION_REFUSAL.format(
     name="fixdep",
@@ -201,6 +206,12 @@ UNLISTED_REFUSAL = _unlisted_file_refusal(
     "fix-lib",
     _LOCAL_DIRECTORY_FORM,
     "{site}/fix_lib-0.1.dist-info",
+)
+# A reached module `{module}`, whose file `{file}` no RECORD lists, beside `{name}` 0.1, installed
+# into `{site}` from a local directory, which has lost its RECORD: `{module}`, `{name}` and
+# `{file}`, relative to `{site}`, left in it too.
+UNLISTED_LOCAL_DIRECTORY_REFUSAL = _unlisted_file_refusal(
+    "{module}", "{site}/{file}", "{site}", "{name}", _LOCAL_DIRECTORY_FORM, None
 )
 # A reached module `{module}`, whose file `{file}` no RECORD lists, beside `{name}.egg-info` in
 # `{site}`, the metadata a setuptools build or develop install leaves beside its code, with no

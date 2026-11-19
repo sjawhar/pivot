@@ -3,14 +3,16 @@ CLI on real installs.
 
 The walk hashes user code, or the user names it by name (`@pivot.fingerprint_by_name`), so no
 installed distribution's RECORD, nor its lack of one, decides it: a module whose file is user code,
-and the user's part of a namespace package shared with a library (in the project, or in pip's
-checkout in `<venv>/src`, as `is_user_code` takes it), give no `dist:` key and no refusal,
-whatever metadata lies beside them. A project's own metadata (the `<name>.egg-info` a setuptools
-build leaves beside the project's code, with no RECORD and no `direct_url.json`) refuses nothing
-in a path entry outside every `site-packages` and `dist-packages` directory and the interpreter's
-prefix; the same metadata of a library's checkout under the prefix (pip's `install -e git+...`
-puts one in `<venv>/src`) is no project's, and a reached file there that no RECORD lists is
-refused beside it.
+and the project's part of a namespace package shared with a library (in the project root, a `src/`
+directory, a `PYTHONPATH` entry), give no `dist:` key and no refusal, whatever metadata lies
+beside them. A project's own metadata (the `<name>.egg-info` a setuptools build leaves beside the
+project's code, with no RECORD and no `direct_url.json`) refuses nothing in a path entry outside
+every `site-packages` and `dist-packages` directory and the interpreter's prefix. A library's
+checkout under the prefix (pip's `install -e git+...` puts one in `<venv>/src`) is no project's:
+its files are library code, and so is its part of a namespace package, so a reached file there
+that no RECORD lists is refused beside the checkout's metadata with no RECORD (a develop build's
+`.egg-info`, or a `--target` install that has lost its RECORD), for a module of the checkout and
+for a namespace package reached by its top name alike.
 
 Each test makes its own venv with uv over this test environment (`tests.installed_dists`), installs
 `Fix_Lib` from its path, and, but for the library checkout's test, the namespace portion
@@ -369,32 +371,87 @@ def test_project_code_beside_metadata_with_no_record_outside_site_packages_is_wa
     )
 
 
-def test_the_part_of_a_namespace_package_in_a_checkout_under_the_venv_is_left_out(
-    tmp_path: pathlib.Path,
-) -> None:
-    """`<venv>/src/checkout`, which a `.pth` file in site-packages puts on the path, as pip's
-    `install -e git+...` puts its checkout in `<venv>/src` there, holds `company/checkout.py`, the
-    checkout's part of the namespace package `company`, beside `fixtarget`, installed there with
-    `uv pip install --target`, which has lost its RECORD. The stage calls `company.client.value()`
-    and `fixlib.value()`. The checkout lies under the interpreter's prefix but in no
-    `site-packages` or `dist-packages` directory, so its directory is the user's part of
-    `company`, as `is_user_code` takes it, and is left out of the `dist:` keys' check: `pivot
-    repro` runs the stage, refusing nothing, and its lock holds the keys of `company-client` and
-    `Fix_Lib`. Taken as a library's directory, as a path under the prefix is for a file, it would
-    be walked beside `fixtarget`, and the stage refused."""
-    venv = installed_dists.make_venv(tmp_path / "venv")
-    _helper_install_libraries(venv, tmp_path / "src")
-    checkout = tmp_path / "venv" / "src" / "checkout"
+def _helper_checkout_beside_a_target_install_without_record(
+    tmp_path: pathlib.Path, venv: installed_dists.Venv, checkout: pathlib.Path
+) -> str:
+    """`checkout` holds `company/checkout.py`, the checkout's part of the namespace package
+    `company`, beside `fixtarget`, installed there with `uv pip install --target`, which has lost
+    its RECORD (`_helper_target_install_without_record`). Returns the refusal of `company`'s file
+    there, which no RECORD lists beside `fixtarget`."""
     _helper_target_install_without_record(venv, tmp_path / "src", checkout)
     (checkout / "company").mkdir()
     (checkout / "company" / "checkout.py").write_text(_LOCAL)
+    return installed_dists.UNLISTED_LOCAL_DIRECTORY_REFUSAL.format(
+        module="company", file="company/checkout.py", site=checkout.resolve(), name="fixtarget"
+    )
+
+
+def _helper_checkout_beside_its_develop_egg_info(
+    tmp_path: pathlib.Path, venv: installed_dists.Venv, checkout: pathlib.Path
+) -> str:
+    """`checkout` holds the setuptools project `foo`, whose one package is the namespace portion
+    `company.foo` (whose `value()` calls `fixlib.value()`), which requires `Fix_Lib`, and its build
+    there leaves `foo.egg-info` beside its code, with no RECORD and no `direct_url.json`, as a
+    develop build does (`_helper_build`). Returns the refusal of `company`'s file there, which no
+    RECORD lists beside `foo.egg-info`."""
+    installed_dists.write_setuptools_project(
+        checkout,
+        "foo",
+        "0.1",
+        packages=["company.foo"],
+        files={"company/foo/__init__.py": _FOO},
+        dependencies=["Fix_Lib"],
+    )
+    _helper_build(venv, "foo", checkout, tmp_path / "wheels", checkout)
+    return installed_dists.UNLISTED_EGG_INFO_REFUSAL.format(
+        module="company", file="company/foo/__init__.py", site=checkout.resolve(), name="foo"
+    )
+
+
+@pytest.mark.parametrize(
+    "place",
+    [
+        pytest.param(
+            _helper_checkout_beside_a_target_install_without_record,
+            id="target-install-without-record",
+        ),
+        pytest.param(_helper_checkout_beside_its_develop_egg_info, id="develop-egg-info"),
+    ],
+)
+def test_the_part_of_a_namespace_package_in_a_checkout_under_the_venv_is_refused_as_its_module_is(
+    tmp_path: pathlib.Path,
+    place: collections.abc.Callable[[pathlib.Path, installed_dists.Venv, pathlib.Path], str],
+) -> None:
+    """`<venv>/src/checkout`, which a `.pth` file in site-packages puts on the path, as pip's
+    `install -e git+...` puts its checkout in `<venv>/src` there, holds the checkout's part of the
+    namespace package `company`, beside metadata with no RECORD that Pivot looks at: `fixtarget`,
+    installed there with `uv pip install --target`, which has lost its RECORD
+    (`target-install-without-record`), or `foo.egg-info`, which requires `Fix_Lib` and which a
+    develop build of the checkout's project `foo` left there (`develop-egg-info`). The stage calls
+    `company.client.value()` and `fixlib.value()`, so it reaches `company` by its top name. The
+    checkout lies under the interpreter's prefix, so its directory of `company` is library code,
+    as each file in it is, and Pivot checks it as it checks a module of the checkout
+    (`test_a_library_checkout_under_the_venv_beside_its_develop_egg_info_is_refused`): no RECORD
+    lists `company`'s file there beside that metadata, so `pivot repro` refuses the stage, naming
+    that file and the metadata, and writes no output. Taken as the user's part of `company`, as
+    `is_user_code` takes a namespace directory under the prefix alone, the directory would be left
+    out, and the stage would run with it neither keyed nor refused."""
+    venv = installed_dists.make_venv(tmp_path / "venv")
+    _helper_install_libraries(venv, tmp_path / "src")
+    checkout = tmp_path / "venv" / "src" / "checkout"
+    refusal = place(tmp_path, venv, checkout)
     (venv.site_packages / "checkout.pth").write_text(f"{checkout}\n")
     project = installed_dists.make_project_in(tmp_path, venv, _NAMESPACE_PIPELINE)
 
-    manifest = installed_dists.assert_runs_with_no_refusal(project, "client-1:value-1")
+    ran = installed_dists.run_pivot(project, "repro", "--json")
 
-    assert installed_dists.dist_keys(manifest) == ["dist:company-client", "dist:fix-lib"], (
-        f"the lock: {manifest}"
+    shown = installed_dists.shown(ran)
+    assert ran.returncode == 1, f"pivot must refuse {installed_dists.STAGE}:\n{shown}"
+    errors = [line for line in ran.stderr.splitlines() if line.startswith("Error:")]
+    expected = f"Error: {installed_dists.STAGE_FAILED}{refusal}"
+    assert errors == [expected], f"pivot must refuse with:\n{expected}\n{shown}"
+    assert not (project.root / installed_dists.OUTPUT).exists(), (
+        f"the refused {installed_dists.STAGE} must not run"
     )
 
 

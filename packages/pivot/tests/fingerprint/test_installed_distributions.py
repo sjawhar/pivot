@@ -24,7 +24,8 @@ from tests import installed_dists
 
 _UNSAFE_CONFIG = "core:\n  unsafe_fingerprinting: true\n"
 
-# Each refusal of a broken install, and its warning under unsafe fingerprinting, ends with this.
+# `installed_dists.REFUSAL_FIX`, under the name the tester's red test
+# `test_the_unsafe_warning_of_a_broken_install_names_the_stage_it_lets_run` reads.
 _REFUSAL_FIX = installed_dists.REFUSAL_FIX
 
 # Item (e): `p/mid` calls an index-installed library, `p/chain` the first of three git installs.
@@ -125,7 +126,9 @@ def _helper_assert_changes(project: installed_dists.Project, keys: list[str]) ->
     """`pivot status --explain --json` names exactly `keys` changed, and refuses nothing."""
     changed, shown = installed_dists.code_changes(project, installed_dists.STAGE)
     assert changed == keys, f"`pivot status --explain` must name exactly {keys} changed:\n{shown}"
-    assert _REFUSAL_FIX not in shown, f"`pivot status` must refuse and warn of nothing:\n{shown}"
+    assert installed_dists.REFUSAL_FIX not in shown, (
+        f"`pivot status` must refuse and warn of nothing:\n{shown}"
+    )
 
 
 def _helper_without(manifest: dict[str, str], key: str) -> dict[str, str]:

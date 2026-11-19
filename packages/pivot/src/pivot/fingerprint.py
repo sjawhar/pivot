@@ -2485,13 +2485,14 @@ def add_distribution_keys(manifest: dict[str, str]) -> None:
 
     Only library code is given (`_library_part`): a module whose file is user code, which the
     walk hashes or the user names by name (`@pivot.fingerprint_by_name`), is left out, and a
-    namespace package keeps only its directories that are a library's (`_is_library_directory`,
-    the rule of `is_user_code`), and is left out when none is. So no distribution's RECORD, nor
-    its lack of one, decides a file or a directory of user code: a project's
-    `@pivot.fingerprint_by_name` helper whose file is user code, and the user's part of a
-    namespace package shared with a library (in the project, or in pip's checkout in
-    `<venv>/src`), give no key and no refusal, as in pivot 0.10.4, whatever metadata lies beside
-    them."""
+    namespace package keeps only its directories that are library paths (`is_library_path`, the
+    rule `is_library_file` gives the files in them), and is left out when none is. So no
+    distribution's RECORD, nor its lack of one, decides a file or a directory of user code: a
+    project's `@pivot.fingerprint_by_name` helper whose file is user code, and the project's part
+    of a namespace package shared with a library (in the project root, a `src/` directory, a
+    `PYTHONPATH` entry), give no key and no refusal, as in pivot 0.10.4, whatever metadata lies
+    beside them; a namespace package's directory under the interpreter's prefix (a `--target`
+    install, pip's checkout in `<venv>/src`) is keyed and refused as one in site-packages is."""
     names = _by_name_names(manifest)
     if not names:
         return
@@ -2536,17 +2537,18 @@ def _library_part(
     name, whose origin is `origin` and whose file, as its import located it or would locate it, is
     `file` (`reached_module_of`). None for a module whose file is user code (`is_library_file`):
     the walk hashes it, or the user names it by name, so no installed distribution's RECORD
-    decides it. A namespace package keeps only its directories that are a library's
-    (`_is_library_directory`, of each directory as `import_origin` resolves it, the rule by which
-    `is_user_code` decides a namespace package), and gives None when none is, so the user's part
-    of a namespace package it shares with a library is neither owned nor walked. Every other
-    origin (a library file, built-in, frozen, no file, unknown, None) is given whole."""
+    decides it. A namespace package keeps only its directories that are library paths
+    (`is_library_path`, of each directory as `import_origin` resolves it: the rule
+    `is_library_file` gives the files in it, so a directory under the interpreter's prefix outside
+    site-packages, as a `--target` install that a `.pth` file puts on `sys.path`, is kept as the
+    same install in site-packages is), and gives None when none is, so the project's part of a
+    namespace package it shares with a library (in the project root, a `src/` directory, a
+    `PYTHONPATH` entry) is neither owned nor walked. Every other origin (a library file,
+    built-in, frozen, no file, unknown, None) is given whole."""
     match origin:
         case ("namespace", *directories):
             library = tuple(
-                directory
-                for directory in directories
-                if _is_library_directory(pathlib.Path(directory))
+                directory for directory in directories if is_library_path(pathlib.Path(directory))
             )
             return reached_module_of(("namespace", *library), file) if library else None
         case ("file", _) if file is not None and not is_library_file(file):
@@ -7102,11 +7104,12 @@ def _is_user_code_impl(obj: Any) -> bool:
 def _is_library_directory(resolved: pathlib.Path) -> bool:
     """Whether the resolved path ``resolved`` lies in a library's directory: in a site-packages
     directory (``installed_distributions.in_site_packages``), or in one of pivot's own packages
-    (``_under_pivot_package_dirs``). The one rule for a namespace package's directory, in
-    ``is_user_code`` and in the `dist:` keys (``_library_part``): a directory under the
-    interpreter's prefix alone, as pip's checkout of a ``pip install -e git+...`` package in
-    ``<venv>/src``, is the user's part of a namespace package it shares with a library.
-    ``is_library_path`` adds the interpreter's prefix for every other path."""
+    (``_under_pivot_package_dirs``). The rule by which ``is_user_code`` decides a namespace
+    package, as in pivot 0.10.4: a directory under the interpreter's prefix alone, as pip's
+    checkout of a ``pip install -e git+...`` package in ``<venv>/src``, leaves a namespace package
+    the user shares with it user code, which the walk walks. The `dist:` keys judge each of a
+    namespace package's directories by ``is_library_path`` instead (``_library_part``), the rule
+    ``is_library_file`` gives the files in it, which adds the interpreter's prefix."""
     return installed_distributions.in_site_packages(resolved) or _under_pivot_package_dirs(resolved)
 
 
