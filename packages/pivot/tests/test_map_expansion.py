@@ -100,7 +100,10 @@ def test_a_current_producer_expands_every_template(
     result, known = status.expand_current(pipeline)
 
     assert result == expansion.Expansion(
-        expanded={"p/_stage_cut": _CUTS, "p/_stage_build": _BUILDS}, not_expanded={}, listings={}
+        expanded={"p/_stage_cut": _CUTS, "p/_stage_build": _BUILDS},
+        not_expanded={},
+        listings={},
+        refused={},
     )
     assert sorted(pipeline.list_stages()) == sorted(["p/_stage_plan", *_CUTS, *_BUILDS])
     assert list(known) == ["p/_stage_plan"], "the explanations it read, for the caller to reuse"
@@ -130,6 +133,7 @@ def test_a_stale_producer_leaves_its_templates_not_expanded_naming_why(
 
     assert result["expanded"] == {}
     assert result["not_expanded"]["p/_stage_cut"].startswith("waits for 'p/_stage_plan': ")
+    assert result["refused"] == {}, "a template waiting for its producer is not refused"
     assert [(row["name"], row["status"]) for row in rows] == [
         ("p/_stage_cut", "not_expanded"),
         ("p/_stage_build", "not_expanded"),
@@ -191,6 +195,9 @@ def test_a_listing_neither_committed_nor_cached_is_named_for_pull_to_fetch(
     assert result["listings"] == {"p/_stage_cut": record}
     assert result["not_expanded"]["p/_stage_build"] == (
         "mapped over the instances of 'p/_stage_cut', which is not expanded"
+    )
+    assert result["refused"] == {"p/_stage_cut": result["not_expanded"]["p/_stage_cut"]}, (
+        "the template over the missing listing is refused, its chain only waits"
     )
 
 
@@ -255,6 +262,7 @@ def test_a_missing_listing_names_the_run_that_writes_it_again(
     assert remedy in result["not_expanded"]["p/_stage_cut"], result["not_expanded"]
     assert remedy in run["p/_stage_cut"]["reason"], run["p/_stage_cut"]
     assert run["p/_stage_cut"]["reason"] == result["not_expanded"]["p/_stage_cut"]
+    assert result["refused"] == {"p/_stage_cut": run["p/_stage_cut"]["reason"]}
 
 
 def test_a_refused_key_reads_the_same_in_a_command_and_in_a_run(
@@ -271,6 +279,7 @@ def test_a_refused_key_reads_the_same_in_a_command_and_in_a_run(
     reason = run["p/_stage_cut"]["reason"]
     assert reason.startswith("cannot expand over the files of 'p/_stage_plan': file 'a b.yaml'")
     assert result["not_expanded"]["p/_stage_cut"] == reason
+    assert result["refused"] == {"p/_stage_cut": reason}
 
 
 def test_a_refused_expansion_leaves_its_template_and_its_chain_not_expanded(
@@ -296,6 +305,7 @@ def test_a_refused_expansion_leaves_its_template_and_its_chain_not_expanded(
 
     assert "both write" in result["not_expanded"]["p/_stage_fields"]
     assert "p/_stage_build" in result["not_expanded"]
+    assert result["refused"] == {"p/_stage_fields": result["not_expanded"]["p/_stage_fields"]}
     assert sorted(pipeline.list_stages()) == ["p/_stage_fields@b/_stage_y", "p/_stage_plan"]
 
 
@@ -312,7 +322,7 @@ def test_a_pipeline_without_templates_reads_nothing(
     monkeypatch.setattr(status, "_explanations_for", _no_explanation)
 
     assert status.expand_current(pipeline) == (
-        expansion.Expansion(expanded={}, not_expanded={}, listings={}),
+        expansion.Expansion(expanded={}, not_expanded={}, listings={}, refused={}),
         {},
     )
 

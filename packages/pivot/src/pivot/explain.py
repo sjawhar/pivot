@@ -243,9 +243,10 @@ def get_stage_explanation(
     of them tracks stays missing: the lock's own hash would compare with itself and call an
     input the restore changes unchanged.
 
-    ``assume_restored`` names dependencies whose hash is the one ``lock_data`` recorded, as if a
-    restore brought each back to what the stage last read (the dry run's notice,
-    ``status.restore_limits``); every other input is decided as always.
+    ``assume_restored`` names dependencies taken as if a restore brought each back to what the
+    stage last read (the dry run's notice, ``status.restore_limits``): each one ``lock_data``
+    records takes the lock's hash, and the disk is not read for it; one it does not record is
+    hashed from the disk as always, as is every other input.
     """
     if lock_data is None:
         return StageExplanation(

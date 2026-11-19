@@ -48,11 +48,15 @@ class Expansion(TypedDict):
         listings: For a template whose producer is current but whose listing neither the
             committed file nor the cache holds, the record of that listing: the cache object a
             pull fetches from the remote before it expands again.
+        refused: Each template of ``not_expanded`` that a refusal left unexpanded, with that
+            refusal, its ``not_expanded`` reason (``refusal_reason``): a run that finds its
+            producer current fails it with the same reason.
     """
 
     expanded: dict[str, list[str]]
     not_expanded: dict[str, str]
     listings: dict[str, types.DirHash]
+    refused: dict[str, str]
 
 
 def single_stage_refusal(
@@ -226,7 +230,8 @@ def expand_current(
     earlier call is removed first (``reset_expansions``), so a command sees the plan as it
     stands. A template mapped over an upstream template's instances expands with it, over the
     same keys, and stays unexpanded when that one does. Each template expands all or nothing
-    (``registry.StageRegistry.expand``); a refusal leaves it unexpanded with the reason.
+    (``registry.StageRegistry.expand``); a refusal leaves it unexpanded with the reason, and
+    names it in ``refused``.
     ``fetched`` holds listings read from the remote, by directory hash, already checked against
     their records: a listing neither committed nor cached is taken from it (a dry run's read,
     which writes nothing to the cache). A listing neither holds is named in ``listings`` for
@@ -237,7 +242,7 @@ def expand_current(
     instances' outputs over missing tracked files, ``ownership.tracked_output_refusal``).
     """
     pipeline.reset_expansions()
-    result = Expansion(expanded={}, not_expanded={}, listings={})
+    result = Expansion(expanded={}, not_expanded={}, listings={}, refused={})
     keys_by_source = dict[types.ArtifactIdentity, list[tuple[str, str]] | str]()
     # The record of each source's listing that is neither committed, cached nor fetched
     missing_by_source = dict[types.ArtifactIdentity, types.DirHash]()
@@ -286,16 +291,18 @@ def expand_current(
         if source in missing_by_source:
             result["listings"][name] = missing_by_source[source]
         if isinstance(keys, str):
-            result["not_expanded"][name] = keys
-            continue
-        refusal = None if refuse is None else refuse(template, keys)
-        if refusal is not None:
-            result["not_expanded"][name] = refusal_reason(source, refusal)
-            continue
-        try:
-            result["expanded"][name] = pipeline.expand_template(name, keys)
-        except exceptions.PivotError as e:
-            result["not_expanded"][name] = refusal_reason(source, e)
+            reason = keys
+        else:
+            refusal = None if refuse is None else refuse(template, keys)
+            if refusal is None:
+                try:
+                    result["expanded"][name] = pipeline.expand_template(name, keys)
+                    continue
+                except exceptions.PivotError as e:
+                    refusal = e
+            reason = refusal_reason(source, refusal)
+        result["not_expanded"][name] = reason
+        result["refused"][name] = reason
     return result
 
 

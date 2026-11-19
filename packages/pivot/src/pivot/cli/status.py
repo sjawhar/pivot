@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import collections
 import sys
+from typing import TYPE_CHECKING, NamedTuple
 
 import click
 import tqdm
@@ -28,6 +30,30 @@ from pivot.types import (
     TrackedFileStatus,
     dep_change_to_json,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+
+class ExplainRowKind(NamedTuple):
+    """How ``output_explain_text`` shows a row that is no stage's explanation: its status label
+    and color, and the words its summary counts such rows with."""
+
+    label: str
+    color: str
+    counted: str
+
+
+NOT_EXPANDED_ROW = ExplainRowKind("NOT YET EXPANDED", "cyan", "not yet expanded")
+"""A mapped stage (``Pipeline.map``) not yet expanded, with what it waits for."""
+REFUSED_ROW = ExplainRowKind("WILL FAIL", "red", "will fail")
+"""A mapped stage the run refuses to expand: it fails the stage with the reason and runs none
+of its instances."""
+BLOCKED_ROW = ExplainRowKind("WILL BE BLOCKED", "red", "will be blocked")
+"""A mapped stage mapped over the instances of one the run refuses: the run blocks it."""
+ORPHANED_ROW = ExplainRowKind("ORPHANED (WILL BE REMOVED)", "red", "orphaned")
+"""An instance of a mapped stage whose key left its producer's listing: the run that expands
+the mapped stage removes it."""
 
 
 @cli_decorators.pivot_command(allow_all=True)
@@ -78,7 +104,7 @@ def status(
 
     # Mapped stages expand first, as a run would expand them, so the stages shown hold their
     # instances and a target may name a mapped stage or one of its instances.
-    expansion_result = expansion.Expansion(expanded={}, not_expanded={}, listings={})
+    expansion_result = expansion.Expansion(expanded={}, not_expanded={}, listings={}, refused={})
     known = dict[str, StageExplanation]()
     shown_templates: list[str] | None = None
     given_targets = stages_list
@@ -269,8 +295,10 @@ def status(
                 remote_status,
                 suggestions,
                 show_tracked,
-                not_expanded=not_expanded,
-                orphaned=orphaned,
+                rows=[
+                    *((NOT_EXPANDED_ROW, row["name"], row["reason"]) for row in not_expanded),
+                    *((ORPHANED_ROW, row["name"], row["reason"]) for row in orphaned),
+                ],
             )
         else:
             _output_text(
@@ -439,37 +467,30 @@ def output_explain_text(
     suggestions: list[str] | None = None,
     show_tracked: bool = False,
     *,
-    not_expanded: list[PipelineStatusInfo] | None = None,
-    refused: list[PipelineStatusInfo] | None = None,
-    orphaned: list[PipelineStatusInfo] | None = None,
+    rows: Sequence[tuple[ExplainRowKind, str, str]] = (),
 ) -> None:
-    """Output detailed stage explanations as formatted text, then each mapped stage not yet
-    expanded (``not_expanded``) with what it waits for, then each mapped stage the run refuses to
-    expand (``refused``), which it fails, with the reason, then each orphaned instance of a
-    mapped stage (``orphaned``), which the run removes."""
+    """Output detailed stage explanations as formatted text, then each of ``rows`` (its kind,
+    name and reason; a mapped stage, ``Pipeline.map``, or an instance of one) in its order, then
+    a summary that counts them by kind, in the order the kinds first come."""
     sections_printed = 0
 
     # Always show stage explanations section
-    if not explanations and not not_expanded and not refused and not orphaned:
+    if not explanations and not rows:
         click.echo("No stages to run")
     else:
         con = console.Console()
         for exp in explanations:
             con.explain_stage(exp)
-        for row in not_expanded or []:
-            con.explain_not_expanded(row["name"], row["reason"])
-        for row in refused or []:
-            con.explain_refused(row["name"], row["reason"])
-        for row in orphaned or []:
-            con.explain_orphaned(row["name"], row["reason"])
+        counts = collections.Counter[ExplainRowKind]()
+        for kind, name, reason in rows:
+            con.explain_row(name, kind.label, kind.color, reason)
+            counts[kind] += 1
 
         will_run = sum(1 for e in explanations if e["will_run"])
         con.explain_summary(
             will_run,
             len(explanations) - will_run,
-            len(not_expanded or []),
-            refused=len(refused or []),
-            orphaned=len(orphaned or []),
+            [(kind.counted, kind.color, count) for kind, count in counts.items()],
         )
     sections_printed += 1
 

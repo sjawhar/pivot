@@ -375,7 +375,7 @@ def expand_current(
     pipeline.reset_expansions()
     templates = pipeline.list_templates()
     if not templates:
-        return expansion.Expansion(expanded={}, not_expanded={}, listings={}), {}
+        return expansion.Expansion(expanded={}, not_expanded={}, listings={}, refused={}), {}
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
@@ -456,7 +456,7 @@ def not_expanded_status(
 
 
 class RestoreLimit(NamedTuple):
-    """Why a ``--checkout-missing`` dry run may not expand a mapped stage the run expands."""
+    """Why the run may expand a mapped stage a ``--checkout-missing`` dry run leaves unexpanded."""
 
     reader: str
     """The producer, or a stage upstream of it, whose explanation reads ``path`` from the disk."""
@@ -475,28 +475,28 @@ def restore_limits(
     restorable: Mapping[str, PvtData],
     known: Mapping[str, StageExplanation],
     force: bool,
-    allow_missing: bool,
 ) -> dict[str, RestoreLimit]:
     """Each producer of ``producers`` (not current, ``expand_current``) that the run may find
     current although the dry run with ``--checkout-missing`` of the stages in ``graph`` explains
-    it as not current, with why: each stage, of it and its upstream stages, that runs by its own
-    explanation (``known``, ``expand_current``'s, with ``force`` and ``allow_missing``) reads
-    from the disk dependencies the restore of ``restorable`` changes (``_restore_reads``, over
-    ``present``), and explained again with them at the hashes its lock recorded
-    (``explain.get_stage_explanation``'s ``assume_restored``) would not run. The restore may
-    bring back other contents, so the run only MAY find it current. The limit names the last
-    such stage in execution order, with its first such dependency."""
+    it as not current, with why. Of it and its upstream stages, each that runs by its own
+    explanation (``known``, ``expand_current``'s, with ``force``) reads from the disk
+    dependencies the restore of ``restorable`` changes (``_restore_reads``, over ``present``),
+    and explained again with them at the hashes its lock recorded
+    (``explain.get_stage_explanation``'s ``assume_restored``) would not run; and none that is
+    current by its own explanation reads one. The restore may bring back other contents, so the
+    run only MAY find it current. The limit names the last such stage in execution order, with
+    its first such dependency."""
     if not restorable or not producers:
         return {}
     reads = _restore_reads(pipeline, present, restorable)
     stage_dag = engine_graph.get_stage_dag(graph)
     running = dict[str, list[str]]()
     for producer in producers:
-        names = [
-            name
-            for name in engine_graph.get_execution_order(stage_dag, [producer], single_stage=False)
-            if known[name]["will_run"]
-        ]
+        chain = engine_graph.get_execution_order(stage_dag, [producer], single_stage=False)
+        # A current stage that reads a restored path runs: the restore changes what it reads
+        if any(name in reads for name in chain if not known[name]["will_run"]):
+            continue
+        names = [name for name in chain if known[name]["will_run"]]
         assert names, f"'{producer}' waits, so it or a stage upstream of it runs"
         # A stage that runs with no dependency the restore changes runs after the restore too
         if all(name in reads for name in names):
@@ -510,7 +510,8 @@ def restore_limits(
             {name: pipeline.get_stage(name) for name in order},
             pipeline,
             force=force,
-            allow_missing=allow_missing,
+            # A restorable file exists only in leave-out mode, which refuses --allow-missing
+            allow_missing=False,
             known={name: known[name] for name in order if not known[name]["will_run"]},
             restorable=restorable,
             assume_restored={name: reads[name].keys() for name in order if known[name]["will_run"]},

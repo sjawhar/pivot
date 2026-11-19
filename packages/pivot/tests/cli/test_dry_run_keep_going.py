@@ -1,6 +1,6 @@
 """`pivot repro --all --keep-going --dry-run --jsonl` on mapped stages (``Pipeline.map``) beside a
-missing tracked file: the dry run lists the stages the run on the same tree runs or skips (spec
-R5).
+missing tracked file, or whose expansion the run refuses: the dry run lists the stages the run on
+the same tree runs, skips, fails or blocks (spec R5).
 
 Each test drives the installed ``pivot`` binary in a real git project, as
 ``tests/cli/test_map_removal.py`` does, and parses the dry run's stdout as one JSON document. The
@@ -78,6 +78,42 @@ with Pipeline("healthy") as pipeline:
 """
 
 _ORPHAN_REASON = "its key left the listing of 'healthy/plan'"
+
+# helpers.MAPPED_FILE_PIPELINE with p/build mapped over p/cut's instances and p/final over
+# p/build's. A stage that takes a mapped stage's output is mapped too, so these are what can be
+# downstream of p/cut
+_CHAIN_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+@stage
+def build(cut: str) -> str:
+    return cut + "!"
+
+
+@stage
+def final(build: str) -> str:
+    return build + "?"
+
+
+with Pipeline("p") as pipeline:
+    final(build(cut(pipeline.map(plan()))))
+"""
+
+_UNCHANGED = {"would_run": False, "reason": "unchanged"}
+_BLOCKED = {"would_run": False, "reason": "upstream 'p/cut' would fail"}
 
 
 def _ok(proc: subprocess.CompletedProcess[str]) -> str:
@@ -214,10 +250,12 @@ def test_dry_run_keep_going_leaves_out_a_mapped_stage_and_its_orphan(
     assert (root / ".pivot" / "stages" / "left" / "cut@b.lock").is_file(), "left/cut@b is kept"
 
 
-def _refused_mapped_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+def _refused_mapped_project(
+    tmp_path: pathlib.Path, code: str = helpers.MAPPED_FILE_PIPELINE
+) -> tuple[pathlib.Path, pathlib.Path]:
     """p/plan is current, and data/p/cut@a.txt, the output p/cut@a would write, is a missing
-    tracked file. It is tracked before p/cut is declared, since `pivot track` refuses a path an
-    output the pipeline declares holds."""
+    tracked file; then ``code`` declares p/cut. The file is tracked before p/cut is declared,
+    since `pivot track` refuses a path an output the pipeline declares holds."""
     root, home = _git_project(tmp_path)
     (root / "pipeline.py").write_text(helpers.PRODUCER_PIPELINE)
     _ok(helpers.run_pivot(root, home, "repro"))
@@ -225,7 +263,7 @@ def _refused_mapped_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathl
     tracked.write_text("tracked bytes")
     _ok(helpers.run_pivot(root, home, "track", "data/p/cut@a.txt"))
     tracked.unlink()
-    (root / "pipeline.py").write_text(helpers.MAPPED_FILE_PIPELINE)
+    (root / "pipeline.py").write_text(code)
     return root, home
 
 
@@ -233,35 +271,109 @@ def test_dry_run_keep_going_refuses_a_mapped_stage_over_a_missing_tracked_file(
     tmp_path: pathlib.Path,
 ) -> None:
     """R3 for instances in the dry run: p/cut's instance p/cut@a would write over the missing
-    tracked file, so the run fails p/cut with its refusal and adds no instance. The dry run shows
-    p/cut as one row that would not run, with the reason the run fails it with, and lists no
-    instance; its text says p/cut would fail, and so does --explain."""
-    root, home = _refused_mapped_project(tmp_path)
+    tracked file, so the run fails p/cut with its refusal, adds no instance, and blocks p/build
+    and p/final, mapped over p/cut's and p/build's instances. The dry run lists the same stages:
+    p/cut as one row that would not run, with the reason the run fails it with, and p/build and
+    p/final as rows that would not run, naming p/cut. Its text says p/cut would fail and the
+    others would be blocked, and so does --explain."""
+    root, home = _refused_mapped_project(tmp_path, _CHAIN_PIPELINE)
 
     document, stderr = _dry_run(root, home)
     text = _ok(helpers.run_pivot(root, home, "repro", "--all", "--keep-going", "--dry-run"))
     explained = _ok(helpers.run_pivot(root, home, "repro", "--all", "--keep-going", "--explain"))
     ran, events = _run(root, home)
 
-    stages = document["stages"]
-    assert stages.keys() == {"p/plan", "p/cut"}, document
-    assert stages["p/plan"] == {"would_run": False, "reason": "unchanged"}, document
-    assert "would_remove" not in document, document
-    assert _skipping_lines(stderr) == [], stderr
     assert ran.returncode == 1, ran.stdout + ran.stderr
     completed = {event["stage"]: event for event in events if event["type"] == "stage_complete"}
-    assert _statuses(events) == {"p/plan": "cached", "p/cut": "failed"}, ran.stdout
+    statuses = _statuses(events)
+    assert statuses == {
+        "p/plan": "cached",
+        "p/cut": "failed",
+        "p/build": "blocked",
+        "p/final": "blocked",
+    }, ran.stdout
     reason = completed["p/cut"]["reason"]
     assert reason.startswith(
         "cannot expand over the files of 'p/plan': The following tracked files are missing:\n"
     ), reason
     assert "data/p/cut@a.txt: it is output 'data/p/cut@a.txt' of stage 'p/cut@a'" in reason
-    shown = f"Not yet expanded: {reason}"
-    assert stages["p/cut"] == {"would_run": False, "reason": shown}, document
-    assert f"  p/cut: would fail ({shown})\n" in text, text
-    assert "p/cut: would expand" not in text, text
-    assert f"Stage: p/cut\n  Status: WILL FAIL\n  Reason: {shown}\n" in explained, explained
-    assert "Summary: 0 will run, 1 unchanged, 1 will fail\n" in explained, explained
+    assert document == {
+        "stages": {
+            "p/plan": _UNCHANGED,
+            "p/cut": {"would_run": False, "reason": reason},
+            "p/build": _BLOCKED,
+            "p/final": _BLOCKED,
+        }
+    }, document
+    assert document["stages"].keys() == statuses.keys()
+    assert _skipping_lines(stderr) == [], stderr
+    assert f"  p/cut: would fail ({reason})\n" in text, text
+    assert "would expand" not in text, text
+    assert f"Stage: p/cut\n  Status: WILL FAIL\n  Reason: {reason}\n" in explained, explained
+    for chained in ("p/build", "p/final"):
+        assert completed[chained]["reason"] == "upstream 'p/cut' failed", ran.stdout
+        assert f"  {chained}: would be blocked (upstream 'p/cut' would fail)\n" in text, text
+        assert (
+            f"Stage: {chained}\n  Status: WILL BE BLOCKED\n  Reason: upstream 'p/cut' would fail\n"
+        ) in explained, explained
+    assert "Summary: 0 will run, 1 unchanged, 1 will fail, 2 will be blocked\n" in explained, (
+        explained
+    )
+
+
+def test_dry_run_keep_going_shows_a_mapped_stage_the_run_fails_for_any_refusal(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A refusal over no missing tracked file: p/plan writes a.txt and a.csv, two files of one
+    key, so the run fails p/cut and blocks p/build and p/final. The dry run in leave-out mode
+    shows p/cut as one row that would not run, with the run's reason, and p/build and p/final as
+    blocked by it. Outside leave-out mode (`--all` without `--keep-going`) the dry run shows them
+    as 0.10.4 does: mapped stages not yet expanded, which would run."""
+    root, home = _git_project(tmp_path)
+    (root / "pipeline.py").write_text(
+        _CHAIN_PIPELINE.replace('{"a.txt": "a", "b.txt": "b"}', '{"a.txt": "a", "a.csv": "b"}')
+    )
+    first = helpers.run_pivot(root, home, "repro")
+    assert first.returncode == 1, "the first run fails p/cut too"
+
+    document, stderr = _dry_run(root, home)
+    outside = helpers.run_pivot(root, home, "repro", "--all", "--dry-run", "--jsonl")
+    ran, events = _run(root, home)
+
+    assert ran.returncode == 1, ran.stdout + ran.stderr
+    completed = {event["stage"]: event for event in events if event["type"] == "stage_complete"}
+    reason = "cannot expand over the files of 'p/plan': files 'a.csv' and 'a.txt' have one key 'a'"
+    assert {stage: (event["status"], event["reason"]) for stage, event in completed.items()} == {
+        "p/plan": ("cached", "unchanged (generation)"),
+        "p/cut": ("failed", reason),
+        "p/build": ("blocked", "upstream 'p/cut' failed"),
+        "p/final": ("blocked", "upstream 'p/cut' failed"),
+    }, ran.stdout
+    assert document == {
+        "stages": {
+            "p/plan": _UNCHANGED,
+            "p/cut": {"would_run": False, "reason": reason},
+            "p/build": _BLOCKED,
+            "p/final": _BLOCKED,
+        }
+    }, stderr
+    _ok(outside)
+    assert json.loads(outside.stdout) == {
+        "stages": {
+            "p/plan": _UNCHANGED,
+            "p/cut": {"would_run": True, "reason": f"Not yet expanded: {reason}"},
+            "p/build": {
+                "would_run": True,
+                "reason": "Not yet expanded: mapped over the instances of 'p/cut', which is not "
+                + "expanded",
+            },
+            "p/final": {
+                "would_run": True,
+                "reason": "Not yet expanded: mapped over the instances of 'p/build', which is not "
+                + "expanded",
+            },
+        }
+    }, outside.stdout
 
 
 def test_dry_run_keep_going_checks_only_the_instances_a_target_names(

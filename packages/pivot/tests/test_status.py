@@ -975,7 +975,6 @@ def test_dry_run_keep_going_restore_reads_name_each_stage_whose_explanation_miss
             restorable={},
             known={},
             force=False,
-            allow_missing=False,
         )
         == {}
     ), "with no restorable path it reads nothing"

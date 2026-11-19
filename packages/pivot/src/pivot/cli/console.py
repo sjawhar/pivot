@@ -158,44 +158,22 @@ class Console:
             "Dependency Changes:", explanation["dep_changes"], "identity", "old_hash", "new_hash"
         )
 
-    def explain_not_expanded(self, name: str, reason: str) -> None:
-        """Print a mapped stage (``Pipeline.map``) not yet expanded, and what it waits for."""
+    def explain_row(self, name: str, label: str, color: str, reason: str) -> None:
+        """Print a row that is no stage's explanation (a mapped stage, ``Pipeline.map``, or an
+        instance of one): its name, its status ``label`` in ``color``, and ``reason``."""
         self._echo(f"\nStage: {self._color(name, 'bold')}")
-        self._echo(f"  Status: {self._color('NOT YET EXPANDED', 'cyan')}")
-        self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
-
-    def explain_refused(self, name: str, reason: str) -> None:
-        """Print a mapped stage (``Pipeline.map``) the run refuses to expand: it fails the stage
-        with ``reason`` and runs none of its instances."""
-        self._echo(f"\nStage: {self._color(name, 'bold')}")
-        self._echo(f"  Status: {self._color('WILL FAIL', 'red')}")
-        self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
-
-    def explain_orphaned(self, name: str, reason: str) -> None:
-        """Print an orphaned instance of a mapped stage (``Pipeline.map``): its key left its
-        producer's listing, and the run that expands its mapped stage removes it."""
-        self._echo(f"\nStage: {self._color(name, 'bold')}")
-        self._echo(f"  Status: {self._color('ORPHANED (WILL BE REMOVED)', 'red')}")
+        self._echo(f"  Status: {self._color(label, color)}")
         self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
 
     def explain_summary(
-        self,
-        will_run: int,
-        unchanged: int,
-        not_expanded: int = 0,
-        *,
-        refused: int = 0,
-        orphaned: int = 0,
+        self, will_run: int, unchanged: int, counts: Sequence[tuple[str, str, int]] = ()
     ) -> None:
-        """Print summary after explain output."""
+        """Print summary after explain output: the stages that will run, those unchanged, then
+        each of ``counts`` (the words that count rows of one kind, their color, and the count)."""
         self._echo("")
         run_text = self._color(str(will_run), "green") if will_run > 0 else str(will_run)
         unchanged_text = self._color(str(unchanged), "yellow") if unchanged > 0 else str(unchanged)
         summary = f"Summary: {run_text} will run, {unchanged_text} unchanged"
-        if not_expanded:
-            summary += f", {self._color(str(not_expanded), 'cyan')} not yet expanded"
-        if refused:
-            summary += f", {self._color(str(refused), 'red')} will fail"
-        if orphaned:
-            summary += f", {self._color(str(orphaned), 'red')} orphaned"
+        for counted, color, count in counts:
+            summary += f", {self._color(str(count), color)} {counted}"
         self._echo(summary)

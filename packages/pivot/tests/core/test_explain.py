@@ -1388,3 +1388,54 @@ def test_get_stage_explanation_restorable_of_dry_run_keep_going_has_no_lock_fall
     assert result["reason"] == (
         "Input dependencies changed" if tracked else "Missing deps: data.csv"
     ), result
+
+
+def _helper_explain_assume_restored(
+    tmp_path: pathlib.Path, recorded: dict[ArtifactIdentity, HashInfo]
+) -> StageExplanation:
+    """The explanation of a stage reading data.csv, whose lock records ``recorded``, with
+    data.csv in ``assume_restored`` (the dry run's notice, ``status.restore_limits``)."""
+    state_dir = tmp_path / ".pivot"
+    dep = _input_ref("data.csv")
+    _write_lock(state_dir, "restored_stage", {"self:restored_stage": "abc"}, dep_hashes=recorded)
+    return explain.get_stage_explanation(
+        stage_name="restored_stage",
+        fingerprint={"self:restored_stage": "abc"},
+        deps={"data": dep},
+        outs=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=state_dir,
+        store=_store(tmp_path),
+        lock_data=_lock(state_dir, "restored_stage"),
+        assume_restored=[dep.identity],
+    )
+
+
+def test_get_stage_explanation_assume_restored_of_dry_run_keep_going_takes_the_lock_hash(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A dependency of ``assume_restored`` that the lock records takes the lock's hash and is not
+    read from the disk: missing from it, the dependency is neither missing nor changed."""
+    result = _helper_explain_assume_restored(
+        tmp_path, {_input_ref("data.csv").identity: {"hash": "4321432143214321"}}
+    )
+
+    assert not (tmp_path / "data.csv").exists()
+    assert (result["will_run"], result["reason"], result["dep_changes"]) == (False, "", []), result
+
+
+def test_get_stage_explanation_assume_restored_of_dry_run_keep_going_hashes_an_unrecorded_dep(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A dependency of ``assume_restored`` that the lock does not record is hashed from the disk
+    as always, and counts as a change."""
+    (tmp_path / "data.csv").write_bytes(b"beta")
+
+    result = _helper_explain_assume_restored(tmp_path, {})
+
+    assert result["will_run"] is True, result
+    assert result["reason"] == "Input dependencies changed", result
+    assert [(change["old_hash"], change["new_hash"]) for change in result["dep_changes"]] == [
+        (None, _BETA_HASH)
+    ], result
