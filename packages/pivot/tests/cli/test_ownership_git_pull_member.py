@@ -129,7 +129,7 @@ def test_after_git_pull_a_targetless_forced_checkout_restores_no_path_the_member
     listing A committed beside the lock, which B's cache has no copy of, so it drives no
     restore. B is still missing A's objects, so the stage's own output cannot be restored: the
     checkout fails over that output's objects, names none of the member's, and leaves the
-    workspace as it was (BET-412)."""
+    workspace as it was."""
     b = _b_after_as_rerun_arrived_through_git(tmp_path)
     tree = b / "data" / "b" / "tree"
     written = (tree / "fake.pvt").read_text()

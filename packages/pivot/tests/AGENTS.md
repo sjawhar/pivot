@@ -1,154 +1,26 @@
-# Pivot - Testing Rules
+# Pivot tests
 
-**Framework:** pytest | **Coverage Target:** 90%+
+pytest with pytest-xdist, pytest-mock and pytest-asyncio (`asyncio_mode = "auto"`). Read
+`docs/contributing/testing.md` before you write a test: it holds the test style, mocking rules and the
+project fixtures (`set_project_root`, `pipeline_dir`, `mock_discovery`, `isolated_pivot_dir`, the autouse ones).
 
----
+Run one file with `uv run pytest packages/pivot/tests/<dir>/test_<module>.py`, one test by adding
+`::test_name`; the suite command is in the root `AGENTS.md`.
 
-## Philosophy
+## Beyond the testing guide
 
-**Real assurance over passing tests.** Tests should prove correctness, not just exercise code paths. Prefer real execution over mocks — mock external boundaries (network, filesystem in unit tests), not internal logic.
-
----
-
-## Structure
-
-- **No `class Test*`** — use flat `def test_*` functions; group with comment separators if needed
-- **No `@pytest.mark.skip`** — if a test isn't ready, don't write it yet
-- **No lazy imports** — all imports at module level, never inside test functions
-- **No duplicate library code** — import and test the real library, don't reimplement helpers
-
-## Naming
-
-- Files: `test_<module>.py`
-- Functions: `test_<behavior>` — e.g., `test_helper_function_change_triggers_rerun` not `test_fingerprint`
-
----
-
-## Module-Level Helpers (Critical for Fingerprinting)
-
-Inline functions inside tests do NOT capture module imports in closures — `getclosurevars()` can't see them. Always define helpers at module level with `_helper_` prefix.
-
-```python
-# Module level — works
-def _helper_uses_math():
-    return math.pi
-
-# Inline in test — FAILS fingerprinting
-def test_it():
-    def uses_math():  # math won't be in closure!
-        return math.pi
-```
-
----
-
-## Parametrization
-
-- **Consolidate repetitive tests** with `@pytest.mark.parametrize`
-- **Put data in parameters, not logic** — no if/else in test bodies based on parameters
-- **Use `pytest.param(id="...")`** for readable test names instead of cryptic auto-generated IDs
-- **Consolidate when:** same test logic, different input data
-- **Keep separate when:** different behaviors, complex assertions, unique edge cases
-
----
-
-## Fixtures
-
-### Global State (autouse)
-
-`conftest.py` has autouse fixtures that reset state between tests: `clean_registry`, `reset_pivot_state`.
-
-**Never** manually reset these in individual tests or create duplicate fixtures.
-
-### usefixtures
-
-When a test needs a fixture's side effect but not its return value, use `@pytest.mark.usefixtures("name")` instead of an unused parameter.
-
-### Available Fixtures
-
-- `tmp_pipeline_dir` — temporary directory for pipeline tests
-- `sample_data_file` — create sample CSV
-- `set_project_root` — set project root to `tmp_path`
-- `git_repo` — create a git repo with commit function
-- `tmp_path` — pytest's, overridden so that at teardown every directory in it gets its owner's read, write and search bits back (`restore_owner_access`); a test that leaves a read-only tree there (a cache tree pivot published, a `chmod` to reach an error path) needs no `finally` to let pytest delete it
-
----
-
-## Mocking
-
-- **Use `mocker` or `monkeypatch`** — never manual assignment (they auto-restore)
-- **Always `autospec=True`** when mocking functions/methods (catches signature mismatches)
-- **Exception:** no autospec when patching to a literal value (None, {}, etc.)
-
-### Mock Boundaries Only
-
-Mock external boundaries (network, filesystem in unit tests, time, randomness). Never mock internal functions to control return values.
-
-**Signs of circular mock testing:**
-- Mock returns X, test asserts X is returned
-- Mocking the function you're trying to test
-- Mock setup mirrors the assertion exactly
-
----
-
-## Test Behavior, Not Implementation
-
-- **No private attribute access** in assertions — use public interfaces
-- **No position-based CLI output parsing** — use simple containment checks or `--json` output
-
----
-
-## Assertions
-
-Use assertion messages that appear in failure output: `assert x, "Should have y"` — not inline comments.
-
----
-
-## CLI Integration Tests
-
-Every CLI command needs an integration test that:
-1. Creates real filesystem (`tmp_path` or `runner.isolated_filesystem()`)
-2. Writes actual files (Python stages, data, `.git`)
-3. Runs actual CLI via `runner.invoke()`
-4. Verifies both output AND filesystem state
-
-Required: success paths, error paths, output formats (`--json`, `--md`).
-
----
-
-## Feature Integration Tests
-
-Major features (new CLI modes, protocols, architectural components) need E2E tests that exercise the complete path—unit tests for components are insufficient since they can pass individually but fail when wired together.
-
-**E2E test pattern:**
-1. Start the actual CLI command (subprocess if async)
-2. Exercise through public interface (socket, HTTP, filesystem)
-3. Verify end-to-end behavior, not just component existence
-
----
-
-## Coverage
-
-- Minimum: 90%
-- Critical files (100%): `fingerprint.py`, `lock.py`, `dag.py`, `scheduler.py`
-- CLI/explain: 80-85% acceptable
-
----
-
-## Fingerprint Tests
-
-All fingerprint tests live in `tests/fingerprint/`. Before modifying fingerprinting behavior, consult `tests/fingerprint/README.md` for the change detection matrix. Update it when adding tests.
-
----
-
-## S3 Tests
-
-Use `moto` for S3 testing, not manual mocks. Reuse existing fixtures — don't duplicate them.
-
-## Debugging
-
-```bash
-pytest -x       # Stop on first failure
-pytest -s       # Show print statements
-pytest --pdb    # Debugger on failure
-pytest --lf     # Re-run failed tests
-```
+- Every CLI command has an integration test: real files (stages, data, `.git`), the command run
+  through `CliRunner().invoke()`, output and filesystem both checked, for success, error paths
+  and each output format.
+- A feature that wires components together (a CLI mode, a protocol) gets an end-to-end test
+  through its public interface: a subprocess, a socket, the filesystem.
+- State shared across processes goes through files; each worker process has its own copy of a
+  module-level list.
+- `helpers.register_test_stage` adds a stage under `mock_discovery`; `helpers.create_pipeline_py`
+  writes a `pipeline.py` from stage functions for real discovery.
+- `helpers.run_pivot(cwd, home, *args)` runs the installed `pivot` beside `sys.executable`
+  (CI has no `uv` on `PATH`), without `PIVOT*` variables and with `HOME` set to `home`.
+- `worker_env` and `output_queue` set up a worker. `moto_s3_bucket` (moto) and `gcs_bucket`
+  (fake-gcs-server, needs Docker) give remote buckets.
+- `tmp_path` gives owner access back to every directory at teardown, so a read-only tree left
+  there needs no cleanup.

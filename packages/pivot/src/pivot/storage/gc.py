@@ -100,7 +100,7 @@ class Roots(TypedDict):
     linked: set[str]  # workspace links and cache refs
     counts: RootCounts
     # Directories inside a scope that are symlinks leaving the project. The collection does not
-    # follow one (BET-301 containment) and does not read its records, so it keeps every object
+    # follow one (the containment rule) and does not read its records, so it keeps every object
     # and removes none, naming the links so the user can fix the layout.
     outward_dirs: list[str]
 
@@ -1305,7 +1305,7 @@ def _walk_project(
     Both are read here. ``skip`` is the cache itself, listed object by object rather than walked.
 
     A symlinked directory is walked when the place it really is lies inside ``root``
-    (``project.real_location_outside``, BET-301's containment rule, against ``root`` resolved
+    (``project.real_location_outside``, the containment rule, against ``root`` resolved
     once for the walk), as a ``data -> data_real`` link inside the project is. A link that
     leaves the project — ``data -> /mnt/big/data``, or a plain ``.venv -> /opt/venvs/x`` — is
     not followed and is returned instead, because the records under it cannot be read and a
@@ -1384,7 +1384,7 @@ def _link_target(
     the cache (listed object by object, never walked), with the key of the whole-directory tree
     it links to when it is one.
 
-    ``project.real_location_outside`` is BET-301's containment rule (#533); a link it cannot
+    ``project.real_location_outside`` is the containment rule (#533); a link it cannot
     resolve counts as outside, because where it leads is unknown. Only a link into
     ``<cache>/files`` or ``<cache>/trees`` is the cache's own: the cache root can be a broad
     scratch directory that also holds a user's data (``PIVOT_CACHE_DIR=/scratch``), and records

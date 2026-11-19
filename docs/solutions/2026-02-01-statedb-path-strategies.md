@@ -50,19 +50,19 @@ changes the inode's ctime: every hardlink checkout, and every replica that hard-
 files, would invalidate the entries of every file it links.
 
 Earlier keys called `path.resolve()`. That cost more per warm lookup (16.2 µs) than reading
-and hashing a small file cold (8.8 µs), measured on main for BET-36 plan Task 1.10e, and
+and hashing a small file cold (8.8 µs), measured on main, and
 `str(...).encode()` failed on a file name that is not UTF-8. Moving to the lexical key re-keys
 every path that passes through a symlink, so after an upgrade each such file is read once
 more, until a command that writes the workspace records it.
 
 ## Replicas: finding an entry by the file's identity
 
-A replica of a project made outside pivot holds the original's state database: BET's replica
+A replica of a project made outside pivot holds the original's state database: a typical replica
 hard-links pivot's read-only outputs and copies the rest, `<state dir>/state.lmdb` included, and
 `cp -al` hard-links even the database, so the two share it. Its `hash:` keys name the
 original's paths. The replica's hard-linked outputs are the very inodes those entries
-describe, yet a lookup by the replica's path misses, so on BET's 180,000-file replicas every
-`pivot status` read every output again (Dispatch BET-263).
+describe, yet a lookup by the replica's path misses, so on a 180,000-file replica every
+`pivot status` read every output again.
 
 Every write of a `hash:` entry also writes `inode:<st_dev><st_ino>` → that entry's key, and a
 lookup that misses by path follows it. The other path's entry is served only when it matches

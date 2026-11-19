@@ -1,5 +1,5 @@
 """A read-only check saves the file hashes it read best-effort, and a state database this user
-cannot write still serves reads (Dispatch BET-263)."""
+cannot write still serves reads."""
 
 from __future__ import annotations
 

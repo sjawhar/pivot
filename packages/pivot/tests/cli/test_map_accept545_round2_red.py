@@ -1,4 +1,4 @@
-"""Red test from round 2 of the acceptance of sjawhar/pivot#545 (BET-473) at caf288134cc2.
+"""Red test from round 2 of the acceptance of sjawhar/pivot#545 at caf288134cc2.
 
 It drives the installed ``pivot repro --watch --serve`` in a real git project and calls the agent
 server over its Unix socket, as ``docs/architecture/agent-server.md``'s client example does. It

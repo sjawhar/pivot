@@ -1,7 +1,7 @@
-"""SKILL.md's "Common errors" table quotes the messages users actually see.
+"""The writing-pivot-stages skill's "Common errors" table quotes the messages users actually see.
 
 Each case builds the mistake a row describes, runs the CLI, and checks three things: the row's
-quoted text is in SKILL.md, that quote matches the concrete message the case expects (with
+quoted text is in the table, that quote matches the concrete message the case expects (with
 `<placeholder>` and quoted one-letter names such as `'x'` as wildcards), and the command prints
 that message, failing unless the row is a warning. A final test checks that every row of the
 table has a case.
@@ -22,7 +22,13 @@ from pivot import cli
 if TYPE_CHECKING:
     import click.testing
 
-_SKILL = pathlib.Path(__file__).parents[4] / "skills" / "writing-pivot-stages" / "SKILL.md"
+_SKILL = (
+    pathlib.Path(__file__).parents[4]
+    / "skills"
+    / "writing-pivot-stages"
+    / "references"
+    / "common-errors.md"
+)
 
 _HEAD = "import pandas as pd\n\nfrom pivot import Pipeline, loaders, stage\n\n\n"
 

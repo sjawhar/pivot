@@ -1,4 +1,4 @@
-"""Round two of #530 (BET-331): the gate's red tests R1-R5 (PR530Gate, at 3577dbc1), as written,
+"""Round two of #530: the review's red tests R1-R5 (at 3577dbc1), as written,
 and one test per behaviour a surviving mutant broke.
 
 A stage's console line is one line (`display_reason`) only when pivot's own I/O on state it owns

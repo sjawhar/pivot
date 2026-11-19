@@ -45,9 +45,9 @@ def test_it():
 
 ### Global State (autouse)
 
-`conftest.py` has autouse fixtures that reset state between tests: `clean_registry`, `reset_pivot_state`.
+`conftest.py` has autouse fixtures that reset state between tests: `reset_pivot_state` (points the project root cache at a shared default project and clears the config cache) and `restore_import_machinery` (undoes import-hook changes). `clean_registry` is a no-op kept for old tests.
 
-**Never** manually reset these in individual tests or create duplicate fixtures.
+**Never** manually reset these in individual tests or create duplicate fixtures. For a project of your own, use `set_project_root`, `pipeline_dir`, `mock_discovery`, or `isolated_pivot_dir(runner, tmp_path)` in place of `runner.isolated_filesystem()`.
 
 ### usefixtures
 
