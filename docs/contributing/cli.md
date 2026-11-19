@@ -6,13 +6,13 @@ Guidelines for developing Pivot CLI commands.
 
 Before submitting a PR with a new CLI command:
 
-- [ ] File created at `src/pivot/cli/<command>.py`
+- [ ] File created at `packages/pivot/src/pivot/cli/<command>.py`
 - [ ] Uses `@cli_decorators.pivot_command()` decorator
-- [ ] Registered in `_LAZY_COMMANDS` (and `COMMAND_CATEGORIES`) in `src/pivot/cli/__init__.py`
+- [ ] Registered in `_LAZY_COMMANDS` (and `COMMAND_CATEGORIES`) in `packages/pivot/src/pivot/cli/__init__.py`
 - [ ] Has shell completion for stage arguments
 - [ ] Validates inputs using Click types
 - [ ] Shows explicit message for empty states
-- [ ] Integration test at `tests/integration/test_cli_<command>.py`
+- [ ] Integration test at `packages/pivot/tests/cli/test_<command>.py`
 - [ ] Tests cover success path, error paths, and output formats
 
 ## The `pivot_command` Decorator
@@ -119,14 +119,14 @@ def mycommand(stages: tuple[str, ...], verbose: bool, output_json: bool) -> None
 Commands load lazily: `pivot --help` imports no command module, and `pivot <command> --help` imports only that command's. Add an entry to `_LAZY_COMMANDS` (command name, module, attribute, one-line help) and put the name in a `COMMAND_CATEGORIES` section:
 
 ```python
-# src/pivot/cli/__init__.py
+# packages/pivot/src/pivot/cli/__init__.py
 _LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
     ...
     "mycommand": ("pivot.cli.mycommand", "mycommand", "One-line description."),
 }
 ```
 
-Import pandas, numpy, loky, the engine or the executor worker inside the command function, not at module top; `tests/cli/test_cli_performance.py` fails a command whose `--help` loads them.
+Import pandas, numpy, loky, the engine or the executor worker inside the command function, not at module top; `packages/pivot/tests/cli/test_cli_performance.py` fails a command whose `--help` loads them, except the commands listed in its `_HEAVY_HELP_COMMANDS`.
 
 ### 3. Add Shell Completion
 

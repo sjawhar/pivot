@@ -66,9 +66,9 @@ Tier 3, skip until Tiers 1 and 2 are exhausted:
 2. Read `references/known-root-causes.md` before you choose a change. If the change exercises a listed root cause through a similar path, skip it, unless you are checking that a fixed one stays fixed.
 3. Before you edit, confirm the three bug conditions: trace the call chain from the stage function, say how the output will differ, and find the matrix row.
 4. Make one small change that alters what the code computes, not only names or annotations. Make one change per session, in pipeline code only; do not edit Pivot.
-5. Run `pivot repro --all --dry-run`. A stage that should rerun but prints `would skip (unchanged)` is a candidate bug; a `would run` line whose reason says `Code changed` or `Params changed` is a detection. Confirm a candidate with `pivot repro --all`.
+5. Run `pivot repro --all --dry-run`. A stage that should rerun but prints `would skip (unchanged)` is a candidate bug; a `would run` line whose reason says `Code changed` or `Params changed` is a detection. Confirm a candidate without the skip decision: copy the stage's output, run `pivot repro --force <stage>`, and compare. A different output confirms the bug.
 6. Append the result to the log in the format below.
-7. Revert the pipeline change and keep the log: `git checkout -- <file>` (or `jj restore --from @- <file>`). If step 5 ran `pivot repro --all`, run it again. Then `pivot repro --all --dry-run` must show `would skip` for every stage.
+7. Revert the pipeline change and keep the log: `git checkout -- <file>` (or `jj restore --from @- <file>`). If step 5 forced a run, run `pivot repro --force <stage>` again. Then `pivot repro --all --dry-run` must show `would skip` for every stage.
 
 ## Log format
 

@@ -4,8 +4,7 @@ StateDB (LMDB), lock and listing files, the content-addressed cache, restores, o
 and `pivot gc`. Which module keeps each rule below, and the StateDB prefix table:
 `docs/architecture/storage.md`. User-facing behaviour: `docs/concepts/caching.md`.
 
-Test: `uv run pytest packages/pivot/tests/storage -n auto`; one file:
-`uv run pytest packages/pivot/tests/storage/test_state.py`.
+Test: `uv run pytest packages/pivot/tests/storage -n auto`.
 
 ## StateDB
 - One LMDB environment per state directory (`state.py`). New state gets a key prefix constant in
@@ -16,8 +15,9 @@ Test: `uv run pytest packages/pivot/tests/storage -n auto`; one file:
 - Dependency generations live only in StateDB (`dep:`), never in lock files.
 - Writes go through `StateDB._write_transaction`: its flock on `pivot-write.lock` only adds a
   timeout (`PivotDBWriteTimeoutError`); LMDB serializes the writers.
-- `hash:` and `inode:` keys are absolute paths (one file on this machine); the other keys hold
-  artifact identities or project-relative paths. The `hash:` stat has no ctime: a hard link changes it.
+- `hash:` keys are absolute paths and `inode:` keys are device and inode numbers (both describe one machine's
+  files); the other keys hold artifact identities or project-relative paths. The `hash:` stat has no ctime: a
+  hard link changes it.
 
 ## File-hash write-back
 - A command that reads or writes workspace files saves each file's hash: pass `pending=` to

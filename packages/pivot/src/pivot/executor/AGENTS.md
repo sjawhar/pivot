@@ -14,7 +14,8 @@ Tests: `uv run pytest packages/pivot/tests/execution -n auto`.
   Multiprocessing).
 - A worker takes its paths from `WorkerStageInfo`: it changes into `project_root` and opens
   `state_dir`. `cache_dir` is a separate `execute_stage()` argument; derive no path from another.
-- Workers open StateDB read-only and return `DeferredWrites`; only the coordinator writes.
+- Workers open StateDB read-only and return `DeferredWrites` for the coordinator to apply; the one direct worker
+  write is the `*.pvt` member record (`storage/AGENTS.md`, StateDB).
 
 ## Worker lifecycle
 

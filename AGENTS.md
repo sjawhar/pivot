@@ -59,18 +59,13 @@ passwordless `sudo`. Test conventions: `packages/pivot/tests/AGENTS.md`.
 
 ## Code style
 
-- Type hints everywhere, and zero basedpyright warnings: a targeted ignore reads `# type: ignore[code] - reason`.
-  Prefer stub packages over ignores; check `typings/` before you add one (`scripts/generate_stubs.py`).
-- Import modules, not functions: `from pivot import fingerprint`, then `fingerprint.func()`. Exceptions:
-  `TYPE_CHECKING` blocks, `pivot.types`, `typing`, and lazy imports in the CLI. A module is imported either at run
-  time or under `TYPE_CHECKING`, never both (`pathlib.Path` in annotations, not a second `from pathlib import Path`).
+Follow `docs/contributing/style.md` (imports, Python 3.13 types, TypedDict, simplicity). Beyond it:
+
+- Zero basedpyright warnings: a targeted ignore reads `# type: ignore[code] - reason`. Prefer stub packages over
+  ignores; check `typings/` before you add one (`scripts/generate_stubs.py`).
+- A module is imported either at run time or under `TYPE_CHECKING`, never both (`pathlib.Path` in annotations, not
+  a second `from pathlib import Path`). Lazy imports are allowed in the CLI.
 - `_prefix` for private functions.
-- Empty collections as `list[int]()`, not `x: list[int] = []`; `Generator[int]`, not `Generator[int, None, None]`;
-  an enum, not a `Literal`, for a value code passes around.
-- TypedDict over dataclasses and namedtuples. Read keys directly, never with `.get()` (`if "key" in d: d["key"]`
-  for an optional key), and build one with its constructor: `Result(status="ok")`.
-- No thin wrappers around a single library call and no module with one public function; three similar lines beat a
-  premature abstraction.
 
 ## Error Handling
 

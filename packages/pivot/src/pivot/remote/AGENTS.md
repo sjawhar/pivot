@@ -32,10 +32,10 @@ Tests: `uv run pytest packages/pivot/tests/remote -n auto`.
   cache objects, and a failed transfer as `TransferResult(success=False)` in `batch.py`. A check
   on one object belongs in the backend's per-object coroutine.
 - Raise `RemoteUnreachableError` only when no connection could be made after the retries (DNS,
-  refused, connect timeout, TLS, proxy connect): `get` then stops using the remote for the rest
-  of the command. An HTTP status (403 included), a reply that breaks off, a missing or corrupt
-  object, and missing or refused credentials are a `RemoteConnectionError` for that object or
-  call.
+  refused, connect timeout, TLS, proxy connect; on S3 also a connection reset, which botocore
+  reports as `ConnectionError`): `get` then stops using the remote for the rest of the command.
+  Any other failure is that object's or that call's error (a `RemoteError` subclass); each
+  backend's docstrings say which.
 - No message, log line or exception chain carries an aiohttp exception's str or repr: it holds
   the request headers, and so the bearer token. Report the status and the server's message and
   raise `from None` (`gcs._describe`, `gcs._remote_error`).
