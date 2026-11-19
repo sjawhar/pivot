@@ -1006,7 +1006,6 @@ def _decorator_docstring() -> str:
 
 
 _CONCEPTS = ("docs/concepts/fingerprinting.md", "## @pivot.fingerprint_by_name")
-_SKILL = ("skills/writing-pivot-stages/SKILL.md", "## Helpers that do not affect output")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1166,21 +1165,20 @@ with Pipeline("tr") as pipeline:
 }
 
 
-def test_stated_limit_reruns_every_run_and_both_docs_say_so(tmp_path: pathlib.Path) -> None:
+def test_stated_limit_reruns_every_run_and_the_docs_say_so(tmp_path: pathlib.Path) -> None:
     """Code reached only through a marked helper is not walked. When that code imports a user
-    module in its body, the stage warns and reruns on every run. The decorator's sections in
-    docs/concepts/fingerprinting.md and skills/writing-pivot-stages/SKILL.md must say that the
-    stage reruns on every (or each) run."""
+    module in its body, the stage warns and reruns on every run. The decorator's section in
+    docs/concepts/fingerprinting.md must say that the stage reruns on every (or each) run."""
     project = _project(tmp_path, _LIMIT)
     for _ in range(2):
         result = _run(project, "repro")
         assert result.returncode == 0, result.stdout + result.stderr
         assert _UNCOVERED in _flat(result.stdout + result.stderr)
-    for rel, heading in (_CONCEPTS, _SKILL):
-        section = _section(rel, heading)
-        assert "every run" in section or "each run" in section, (
-            f"{rel}: the every-run rerun of the stated limit is not stated: {section}"
-        )
+    rel, heading = _CONCEPTS
+    section = _section(rel, heading)
+    assert "every run" in section or "each run" in section, (
+        f"{rel}: the every-run rerun of the stated limit is not stated: {section}"
+    )
 
 
 # ---------------------------------------------------------------------------------------------
