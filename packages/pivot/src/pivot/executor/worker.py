@@ -981,9 +981,11 @@ class WorkerStageInfo(TypedDict):
     loaded_sources_token: str
     loaded_sources: NotRequired[dict[str, str]]
     # The submodules the worker binds on their packages before the stage runs
-    # (`loaded_source.submodules_to_send`, `_bind_sent_submodules`), set when there is one. Why:
+    # (`loaded_source.submodule_delivery`, `_bind_sent_submodules`), and those it then imports by
+    # name (`_import_read_submodules`), each set when there is one. Why:
     # `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs".
     sent_submodules: NotRequired[tuple[ModuleType, ...]]
+    imported_submodules: NotRequired[tuple[str, ...]]
 
 
 def _bind_sent_submodules(modules: Sequence[ModuleType]) -> None:
@@ -1002,6 +1004,18 @@ def _bind_sent_submodules(modules: Sequence[ModuleType]) -> None:
         parent = sys.modules.get(package)
         if parent is not None:
             setattr(parent, attribute, module)
+
+
+def _import_read_submodules(names: Sequence[str]) -> None:
+    """Import each of `names` (`WorkerStageInfo.imported_submodules`) by name, as the import of
+    the code sent by reference that reads it through its package would, which binds it there. The
+    import goes through this process's import machinery, as every import this worker makes by
+    name does (the import hooks, and discovery's loader while an import session lasts), so the
+    source it loads is recorded and the check of the code the stage used sees it
+    (`_untrusted_modules`); a module this process holds already is not loaded again, as no second
+    import loads it."""
+    for name in names:
+        importlib.import_module(name)
 
 
 def _make_result(
@@ -1038,9 +1052,11 @@ def _execute_stage(
     # Clear metrics at start - each stage collects its own metrics
     metrics.clear()
     # Before anything of the stage runs: its parameter overrides, input loaders, the stage itself
-    # and its output writers may read a sent module through its package.
+    # and its output writers may read such a module through its package.
     if "sent_submodules" in stage_info:
         _bind_sent_submodules(stage_info["sent_submodules"])
+    if "imported_submodules" in stage_info:
+        _import_read_submodules(stage_info["imported_submodules"])
     # ``cache_dir`` is the cache root the engine resolved from config (the directory holding
     # ``files/``), as spelled there: the naming lock lives in it, the same file `pivot gc`
     # locks. The store's object root is resolved, so a ``files`` symlink would move its parent.

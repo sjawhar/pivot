@@ -374,7 +374,7 @@ async def test_watched_startup_fingerprints_each_stage_once(
 
     def _counting_compute(
         stage_name: str, info: registry.RegistryStageInfo
-    ) -> tuple[dict[str, str], bool, dict[str, tuple[str, ...]]]:
+    ) -> registry.ComputedFingerprint:
         calls.append(stage_name)
         return compute(stage_name, info)
 
@@ -419,7 +419,7 @@ async def test_watched_startup_serves_rpc_while_fingerprinting(
 
     def _slow_compute(
         stage_name: str, info: registry.RegistryStageInfo
-    ) -> tuple[dict[str, str], bool, dict[str, tuple[str, ...]]]:
+    ) -> registry.ComputedFingerprint:
         calls.append(stage_name)
         time.sleep(1.0)
         result = compute(stage_name, info)
@@ -509,7 +509,7 @@ async def test_reload_fingerprints_off_the_event_loop(
 
             def _slow_compute(
                 stage_name: str, info: registry.RegistryStageInfo
-            ) -> tuple[dict[str, str], bool, dict[str, tuple[str, ...]]]:
+            ) -> registry.ComputedFingerprint:
                 reload_started.set()
                 time.sleep(1.0)
                 finished.append(stage_name)
@@ -866,7 +866,7 @@ async def test_data_edit_during_reload_still_reruns_the_code_edited_stage(
 
             def _slow_compute(
                 stage_name: str, info: registry.RegistryStageInfo
-            ) -> tuple[dict[str, str], bool, dict[str, tuple[str, ...]]]:
+            ) -> registry.ComputedFingerprint:
                 reload_started.set()
                 time.sleep(1.0)
                 return compute(stage_name, info)
@@ -1053,7 +1053,7 @@ async def test_run_requested_during_startup_snapshot_is_refused_at_once(
 
     def _slow_compute(
         stage_name: str, info: registry.RegistryStageInfo
-    ) -> tuple[dict[str, str], bool, dict[str, tuple[str, ...]]]:
+    ) -> registry.ComputedFingerprint:
         time.sleep(1.0)
         finished.append(stage_name)
         return compute(stage_name, info)

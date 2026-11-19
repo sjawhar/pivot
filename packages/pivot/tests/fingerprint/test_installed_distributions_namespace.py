@@ -3,16 +3,17 @@ an installed library works, and stays keyed, wherever it is installed, checked t
 CLI on real installs.
 
 A stage that reads the project's part of a package it shares with an installed library through
-the package's name (`import company.local` in its module, `company.local.value()` in its code)
-runs in the worker as a plain `python` run of its module does, and one byte changed in that part
-reruns it: the walk follows a user submodule read through a library package and records it, with
-the modules that read it so (`submodule:` entries), and the coordinator sends with the stage each
-such submodule that the code of a module sent by value reads (`loaded_source.submodules_to_send`),
-which the worker binds on the package it imports by name when it is sent by value, and imports by
-name, which binds it, when it is sent by reference. A submodule that only a module the worker
-imports by name reads so is not sent, so a value it holds that cloudpickle cannot pickle stays
-out of the stage's pickle. A `@no_fingerprint` stage's own code is scanned for the same reads
-(`fingerprint.submodule_entries`), but not a helper module it calls, a stated limit.
+the package's name (`import company.local`, then `company.local.value()` in the stage's code, a
+helper's, a lambda's or an output writer's) runs in the worker as a plain `python` run of its
+module does, and one byte changed in that part reruns it. The walk follows such a submodule and
+records it with each module whose code reads it so (`submodule:` entries). The submodule reaches
+the worker the way that code does (`loaded_source.submodule_delivery`): when code cloudpickle
+sends by value reads it, the module is sent with the stage and bound on its package; when only
+code the worker imports by name reads it, the worker imports it by name before the stage runs,
+and nothing of its values is pickled. A stage that reaches the module by another name
+(`from company import local`, or only `from company.local import value`) runs too. A
+`@no_fingerprint` stage's own code is scanned for the same reads (`fingerprint.submodule_entries`),
+but not a helper module it calls: a stated limit, which one case pins.
 
 A namespace package's directory under the interpreter's prefix but in no `site-packages`
 directory, as a `uv pip install --target` directory that a `.pth` file in `site-packages` puts on
@@ -128,23 +129,68 @@ _FUNCTION_IMPORT_PIPELINE = installed_dists.pipeline_text(
     "value()" + _LIBRARY_VALUES,
 )
 _LOCAL_WITH_LOCK = "import threading\n\n_LOCK = threading.Lock()\n\n\n" + installed_dists.LOCAL
-# The `pipeline.py` of a project whose stage `make` is `@no_fingerprint`, which the walk does not
-# read: `{imports}` imports what `{expression}`, the value the stage returns, reads.
-_NO_FINGERPRINT_PIPELINE = """\
-{imports}
-
-from pivot import Pipeline, no_fingerprint, stage
-
-
-@stage
-@no_fingerprint()
-def make() -> str:
-    return {expression}
+# The module `helper`, in a `PYTHONPATH` entry, which the worker imports by name, with `import
+# company` alone (but `_HELPER`, which imports `company.local` itself), and code of it that reads
+# `company.local` through the package's name: a function, a static method, a class method, a
+# function under a `functools.wraps` decorator, a function under `functools.cache`, a property's
+# getter. The stage calls that code; `_BY_REFERENCE_IMPORTS` are the imports of its module.
+_IMPORTS_THE_PACKAGE = "import company\n\n\ndef value():\n    return company.local.value()\n"
+_STATIC_METHOD = """\
+import company
 
 
-with Pipeline("p") as pipeline:
-    make()
+class Tools:
+    @staticmethod
+    def value():
+        return company.local.value()
 """
+_CLASS_METHOD = """\
+import company
+
+
+class Tools:
+    @classmethod
+    def value(cls):
+        return company.local.value()
+"""
+_UNDER_WRAPS = """\
+import functools
+
+import company
+
+
+def traced(function):
+    @functools.wraps(function)
+    def wrapper():
+        return function()
+
+    return wrapper
+
+
+@traced
+def value():
+    return company.local.value()
+"""
+_UNDER_CACHE = """\
+import functools
+
+import company
+
+
+@functools.cache
+def value():
+    return company.local.value()
+"""
+_PROPERTY = """\
+import company
+
+
+class Tools:
+    @property
+    def value(self):
+        return company.local.value()
+"""
+_BY_REFERENCE_IMPORTS = "import company.client\nimport company.local\nimport fixlib\nimport helper"
 
 
 def _helper_in_site_packages(venv: installed_dists.Venv) -> tuple[pathlib.Path, list[str]]:
@@ -417,24 +463,43 @@ def test_the_projects_part_of_a_shared_package_read_through_its_name_runs_and_re
     _helper_runs_then_reruns_on_an_edit(project, directory / edited, key)
 
 
-def test_a_submodule_only_a_module_sent_by_reference_reads_through_its_package_is_not_sent(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("helper", "call"),
+    [
+        pytest.param(_IMPORTS_THE_PACKAGE, "helper.value()", id="function"),
+        pytest.param(_HELPER, "helper.value()", id="function-importing-it"),
+        pytest.param(_STATIC_METHOD, "helper.Tools.value()", id="staticmethod"),
+        pytest.param(_CLASS_METHOD, "helper.Tools.value()", id="classmethod"),
+        pytest.param(_UNDER_WRAPS, "helper.value()", id="wraps-decorator"),
+        pytest.param(_UNDER_CACHE, "helper.value()", id="functools-cache"),
+        pytest.param(_PROPERTY, "helper.Tools().value", id="property"),
+    ],
+)
+def test_a_submodule_only_code_sent_by_reference_reads_through_its_package_is_imported_by_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, helper: str, call: str
 ) -> None:
     """`company-client` is installed into site-packages from its path. The project holds its part
     of `company`, `company/local.py`, in its root, which discovery sends by value, and that module
-    holds a lock no stage reads and that cloudpickle cannot pickle. Only the module `helper`, in a
-    `PYTHONPATH` entry, which the worker imports by name, reads it through the package's name
-    (`import company.local`, `company.local.value()`), and the stage calls `helper.value()`.
-    `pivot repro` runs the stage, which writes `local-1:client-1:value-1`, refusing nothing, and
-    its lock holds the keys of `company-client` and `Fix_Lib` alone: the module is not sent with
-    the stage, and the worker's import of `helper` binds it. After one byte of the project's
-    module changes, the stage is stale on that module's `func:` entry alone, and `pivot repro`
-    writes the new value. Were the module sent, the stage could not be pickled, for its lock."""
+    holds a lock no stage reads and that cloudpickle cannot pickle. `pipeline.py` imports it, and
+    the stage calls code of the module `helper`, in a `PYTHONPATH` entry, which the worker imports
+    by name; only that code reads `company.local` through the package's name: a function, whose
+    module imports `company` alone or `company.local` itself (`function-importing-it`), a static
+    method, a class method, a function under a `functools.wraps` decorator, a function under
+    `functools.cache`, or a property's getter. `pivot repro` runs the stage, which writes
+    `local-1:client-1:value-1`, refusing nothing: the worker imports `company.local` by name
+    before the stage runs, as the import of that code would, and nothing of the module is pickled.
+    After one byte of the project's module changes, the stage is stale on that module's `func:`
+    entry alone, and `pivot repro` writes the new value. Were the module neither sent nor imported,
+    the stage would fail in the worker with
+    `AttributeError: module 'company' has no attribute 'local'` where `helper` imports `company`
+    alone; were its reader taken for code cloudpickle sends by value, the module would be sent, and
+    the stage could not be pickled, for its lock."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
-    project = installed_dists.make_project_in(tmp_path, venv, _HELPER_PIPELINE)
+    pipeline_text = installed_dists.pipeline_text(_BY_REFERENCE_IMPORTS, call + _LIBRARY_VALUES)
+    project = installed_dists.make_project_in(tmp_path, venv, pipeline_text)
     extra = _helper_in_a_pythonpath_entry(tmp_path, project, monkeypatch)
-    (extra / "helper.py").write_text(_HELPER)
+    (extra / "helper.py").write_text(helper)
     local = project.root / "company" / "local.py"
     local.parent.mkdir()
     local.write_text(_LOCAL_WITH_LOCK)
@@ -468,63 +533,79 @@ def test_a_lambda_of_a_module_sent_by_reference_that_reads_the_projects_part_get
     _helper_runs_then_reruns_on_an_edit(project, local, "func:company.local.value")
 
 
-def test_a_no_fingerprint_stage_reads_the_projects_part_of_a_shared_package_through_its_name(
+def _helper_repro_outcome(project: installed_dists.Project) -> tuple[tuple[int, str, str], str]:
+    """What one `pivot repro --json`, which must refuse and warn of nothing, gives of `STAGE`: its
+    exit code, the status of the stage's one `stage_complete` event
+    (`installed_dists.stage_complete_events`), and what the stage wrote when it ran, else the last
+    line of the reason the event gives; and the command's output."""
+    ran = installed_dists.run_pivot(project, "repro", "--json")
+    shown = installed_dists.shown(ran)
+    events = [
+        event
+        for event in installed_dists.stage_complete_events(ran)
+        if event["stage"] == installed_dists.STAGE
+    ]
+    assert len(events) == 1, f"`pivot repro` must complete {installed_dists.STAGE} once:\n{shown}"
+    assert installed_dists.REFUSAL_FIX not in shown, f"`pivot repro` must refuse nothing:\n{shown}"
+    status = events[0]["status"]
+    detail = (
+        (project.root / installed_dists.OUTPUT).read_text()
+        if status == "ran"
+        else events[0]["reason"].splitlines()[-1]
+    )
+    return (ran.returncode, status, detail), shown
+
+
+@pytest.mark.parametrize(
+    ("imports", "expression", "files", "outcome"),
+    [
+        pytest.param(
+            "import company.client\nimport company.local\nimport fixlib",
+            "company.local.value()" + _LIBRARY_VALUES,
+            {"company/local.py": installed_dists.LOCAL},
+            (0, "ran", _SHARED_OUTPUT),
+            id="own-code",
+        ),
+        pytest.param(
+            "import company.client\nimport fixlib\nimport helper",
+            "helper.value()" + _LIBRARY_VALUES,
+            {"helper.py": _HELPER, "company/local.py": installed_dists.LOCAL},
+            (1, "failed", "AttributeError: module 'company' has no attribute 'local'"),
+            id="limit-helper-under-the-root",
+        ),
+    ],
+)
+def test_a_no_fingerprint_stage_gets_the_projects_part_its_own_code_reads_not_a_helpers(
     tmp_path: pathlib.Path,
+    imports: str,
+    expression: str,
+    files: dict[str, str],
+    outcome: tuple[int, str, str],
 ) -> None:
     """`company-client` is installed into site-packages from its path, and the project holds its
     part of `company`, `company/local.py`, in its root, which discovery sends by value. A
     `@no_fingerprint` stage, whose code the walk does not read, reads that module through the
-    package's name in its own code (`company.local.value()`). `pivot repro` runs the stage, which
-    writes `local-1:client-1:value-1`, refusing nothing: a scan of the stage function's code finds
-    the module (`fingerprint.submodule_entries`), which the coordinator sends with the stage. Were
-    it not sent, the stage would fail in the worker with
-    `AttributeError: module 'company' has no attribute 'local'`."""
+    package's name in its own code (`own-code`): `pivot repro` runs the stage, which writes
+    `local-1:client-1:value-1`, refusing nothing, as a scan of the stage function's code finds the
+    module (`fingerprint.submodule_entries`), which the coordinator sends with the stage; were it
+    not sent, the stage would fail in the worker with
+    `AttributeError: module 'company' has no attribute 'local'`. The case
+    `limit-helper-under-the-root` pins a stated limit (`docs/architecture/fingerprinting.md`,
+    "Imports a Stage Makes While It Runs"): the scan reads the stage function's own code, not a
+    helper module it calls. Only the project's module `helper`, in its root, which discovery
+    sends by value, reads `company.local` so (`import company.local`, `company.local.value()`),
+    and the stage calls `helper.value()`: `pivot repro` exits 1, the stage failing in its worker
+    with that `AttributeError`, as no code the scan read reads the module through the package."""
     venv = installed_dists.make_venv(tmp_path / "venv")
     installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
-    pipeline_text = _NO_FINGERPRINT_PIPELINE.format(
-        imports="import company.client\nimport company.local\nimport fixlib",
-        expression="company.local.value()" + _LIBRARY_VALUES,
+    pipeline_text = installed_dists.pipeline_text(
+        imports + "\nfrom pivot import no_fingerprint", expression, "@no_fingerprint()"
     )
     project = installed_dists.make_project_in(tmp_path, venv, pipeline_text)
-    (project.root / "company").mkdir()
-    (project.root / "company" / "local.py").write_text(installed_dists.LOCAL)
+    for relative, text in files.items():
+        (project.root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (project.root / relative).write_text(text)
 
-    installed_dists.assert_runs_with_no_refusal(project, _SHARED_OUTPUT)
+    found, shown = _helper_repro_outcome(project)
 
-
-def test_limit_a_no_fingerprint_stage_whose_helper_reads_the_projects_part_fails_in_the_worker(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Pins a stated limit (`docs/architecture/fingerprinting.md`, "Imports a Stage Makes While
-    It Runs"): the scan of a `@no_fingerprint` stage reads the stage function's own code, not a
-    helper module it calls. `company-client` is installed into site-packages from its path, and
-    the project holds its part of `company`, `company/local.py`, and the module `helper`, which
-    reads it through the package's name (`import company.local`, `company.local.value()`), in its
-    root, which discovery sends by value. The `@no_fingerprint` stage calls `helper.value()`.
-    `pivot repro` fails the stage in its worker with
-    `AttributeError: module 'company' has no attribute 'local'`: no code the scan read reads the
-    module through the package, so it is not sent with the stage."""
-    venv = installed_dists.make_venv(tmp_path / "venv")
-    installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
-    pipeline_text = _NO_FINGERPRINT_PIPELINE.format(
-        imports="import company.client\nimport fixlib\nimport helper",
-        expression="helper.value()" + _LIBRARY_VALUES,
-    )
-    project = installed_dists.make_project_in(tmp_path, venv, pipeline_text)
-    (project.root / "helper.py").write_text(_HELPER)
-    (project.root / "company").mkdir()
-    (project.root / "company" / "local.py").write_text(installed_dists.LOCAL)
-
-    ran = installed_dists.run_pivot(project, "repro", "--json")
-
-    shown = installed_dists.shown(ran)
-    completed = [
-        event
-        for line in ran.stdout.splitlines()
-        if line.startswith("{") and (event := json.loads(line))["type"] == "stage_complete"
-    ]
-    assert ran.returncode == 1, f"`pivot repro` must fail:\n{shown}"
-    assert [event["status"] for event in completed] == ["failed"], shown
-    assert completed[0]["reason"].splitlines()[-1] == (
-        "AttributeError: module 'company' has no attribute 'local'"
-    ), f"the stage must fail for the module missing on its package:\n{shown}"
+    assert found == outcome, shown

@@ -542,7 +542,8 @@ it shares with an installed library (`import company.local`, then
 project root that the stage calls is not read for this: a module that only the
 helper reads so is missing there, and the stage fails with `AttributeError:
 module 'company' has no attribute 'local'`. A helper outside the project root,
-which the worker imports by name, works
+which the worker imports by name, works when it imports the module itself
+(`import company.local`), as that import binds it there
 ([Imports a Stage Makes While It Runs](../architecture/fingerprinting.md#imports-a-stage-makes-while-it-runs)).
 
 

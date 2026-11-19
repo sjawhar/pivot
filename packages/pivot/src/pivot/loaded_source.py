@@ -64,7 +64,7 @@ import xxhash
 from pivot import fingerprint, import_origin
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -609,32 +609,44 @@ def _held_suspects(
     return suspects
 
 
-def submodules_to_send(read: Mapping[str, Sequence[str]]) -> tuple[types.ModuleType, ...]:
-    """The modules a stage's worker must find bound on their packages before the stage runs, sent
-    with the stage: of the submodules the stage reads through the library packages that hold them
-    (`read`, from `fingerprint.read_submodules`: each name, in order, with the readers whose code
-    reads it so), each one bound on this process's package (`fingerprint.bound_submodule`) that a
-    reader cloudpickle sends by value reads: a function of a module it sends by value
-    (`_pickled_by_value`), or one it sends by value whatever its module, as a lambda
-    (`fingerprint.reader_sent_by_value`). Code sent by reference is imported by name in the
-    worker, whose own import binds the submodule; code sent by value does not run that import.
-    Why, and what the worker does with each sent module:
+class SubmoduleDelivery(NamedTuple):
+    """How a stage's worker gets the submodules the stage reads through the library packages that
+    hold them (`submodule_delivery`): the modules sent with the stage, which the worker binds on
+    their packages (`sent`), and the names of those it imports by name (`imported`), each before
+    the stage runs."""
+
+    sent: tuple[types.ModuleType, ...]
+    imported: tuple[str, ...]
+
+
+def submodule_delivery(read: Mapping[str, fingerprint.SubmoduleReaders]) -> SubmoduleDelivery:
+    """How a stage's worker gets each submodule the stage reads through the library package that
+    holds it (`read`, from `fingerprint.read_submodules`, by name in order) that this process's
+    package holds bound (`fingerprint.bound_submodule`): the way the code that reads it reaches
+    the worker. When a reader is code cloudpickle sends by value (`always_sent`, or one of
+    `modules` it sends by value, `_pickled_by_value`), that code runs no import of it in the
+    worker, so the module object is sent and bound. Otherwise the readers are code the worker
+    imports by name, and the worker imports the submodule by name too, as their own import would;
+    nothing of its values is pickled. Why, and what the worker does with each:
     `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs"."""
     by_value = cloudpickle.list_registry_pickle_by_value()
     sent = list[types.ModuleType]()
+    imported = list[str]()
     for name, readers in read.items():
-        if not any(
-            fingerprint.reader_sent_by_value(reader) or _pickled_by_value(reader, by_value)
-            for reader in readers
-        ):
-            continue
         package, _, attribute = name.rpartition(".")
         parent = sys.modules.get(package)
-        if isinstance(parent, types.ModuleType):
-            module = fingerprint.bound_submodule(parent, attribute)
-            if module is not None:
-                sent.append(module)
-    return tuple(sent)
+        module = (
+            fingerprint.bound_submodule(parent, attribute)
+            if isinstance(parent, types.ModuleType)
+            else None
+        )
+        if module is None:
+            continue
+        if readers.always_sent or any(_pickled_by_value(m, by_value) for m in readers.modules):
+            sent.append(module)
+        else:
+            imported.append(name)
+    return SubmoduleDelivery(sent=tuple(sent), imported=tuple(imported))
 
 
 def _pickled_by_value(name: str, registry: set[str]) -> bool:

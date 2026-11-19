@@ -15,7 +15,8 @@ when `packages/pivot/src` is pivot 0.10.4's.
 
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
-(`pipeline`, or `pipeline_text` for any imports and expression), the sources of the fixture
+(`pipeline`, or `pipeline_text` for any imports, expression and decorator), the `stage_complete`
+events a `pivot repro --json` prints (`stage_complete_events`), the sources of the fixture
 libraries `Fix_Lib` and `fixdep`, the project's part `LOCAL` of the namespace package `company`
 and the module `CLIENT` of the library's part of it, installed with `Fix_Lib`
 (`install_client_and_fixlib`), the two refusals of an
@@ -68,7 +69,7 @@ STAGE = "p/make"
 OUTPUT = pathlib.Path("data/p/make.txt")
 
 # The `pipeline.py` that `pipeline_text` writes: `{imports}` imports what `{expression}`, the
-# value the stage returns, reads.
+# value the stage returns, reads, and `{decorator}` is a decorator line under `@stage`, or nothing.
 _PIPELINE = """\
 {imports}
 
@@ -76,7 +77,7 @@ from pivot import Pipeline, stage
 
 
 @stage
-def make() -> str:
+{decorator}def make() -> str:
     return {expression}
 
 
@@ -85,10 +86,13 @@ with Pipeline("p") as pipeline:
 """
 
 
-def pipeline_text(imports: str, expression: str) -> str:
+def pipeline_text(imports: str, expression: str, decorator: str = "") -> str:
     """The `pipeline.py` of a project whose stage `STAGE`, after the lines `imports`, writes the
-    value of `expression`."""
-    return _PIPELINE.format(imports=imports, expression=expression)
+    value of `expression`, with the decorator line `decorator` under `@stage` unless it is
+    empty."""
+    return _PIPELINE.format(
+        imports=imports, expression=expression, decorator=f"{decorator}\n" if decorator else ""
+    )
 
 
 def pipeline(*modules: str) -> str:
@@ -728,15 +732,22 @@ def module_file(project: Project, module: str) -> pathlib.Path:
     return pathlib.Path(ran.stdout.strip()).resolve()
 
 
-def repro_statuses(project: Project) -> tuple[dict[str, str], str]:
-    """What one `pivot repro --json` did to each stage (`ran`, `cached`, ...), by the stage's
-    name, from the stage's one `stage_complete` event, and the command's output."""
-    ran = pivot_ok(project, "repro", "--json")
-    completed = [
-        (event["stage"], event["status"])
+def stage_complete_events(ran: subprocess.CompletedProcess[str]) -> list[dict[str, Any]]:
+    """The `stage_complete` events that `pivot repro --json`, run as `ran`, printed, in order,
+    whatever its exit code."""
+    return [
+        event
         for line in ran.stdout.splitlines()
         if line.startswith("{") and (event := _parsed(line, ran))["type"] == "stage_complete"
     ]
+
+
+def repro_statuses(project: Project) -> tuple[dict[str, str], str]:
+    """What one `pivot repro --json` did to each stage (`ran`, `cached`, ...), by the stage's
+    name, from the stage's one `stage_complete` event (`stage_complete_events`), and the
+    command's output; the test fails unless it exits 0."""
+    ran = pivot_ok(project, "repro", "--json")
+    completed = [(event["stage"], event["status"]) for event in stage_complete_events(ran)]
     statuses = dict(completed)
     assert len(statuses) == len(completed), (
         f"pivot repro must complete each stage once:\n{shown(ran)}"
