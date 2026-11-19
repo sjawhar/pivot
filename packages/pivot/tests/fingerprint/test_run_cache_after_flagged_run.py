@@ -36,7 +36,7 @@ with Pipeline("t") as pipeline:
 """
 
 # The lock `pivot repro` at main 19fd78cb (release 0.5.2) writes for `_RUNTIME_IMPORT` with
-# `_LINES` as its input (VM pivot-slices, python 3.13.16, sha256 742157a1...). It is the same
+# `_LINES` as its input (python 3.13.16, sha256 742157a1...). It is the same
 # fixture `test_runtime_import_limits.py` uses.
 _LOCK_0_5_2 = """\
 schema_version: 2

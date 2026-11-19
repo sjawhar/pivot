@@ -123,7 +123,7 @@ def test_targetless_checkout_force_skips_the_stages_own_pvt(
     that says so reads the listing committed beside the lock: with the lock's listing object
     gone from the cache (a teammate's lock that arrived through `git pull`, without
     `pivot pull`), the checkout still restores the output whole and writes nothing `fake.pvt`
-    names (BET-412)."""
+    names."""
     with isolated_pivot_dir(runner, tmp_path) as root:
         _built_without_cached_listing(runner, root, drop)
         tree = root / "data" / "b" / "tree"

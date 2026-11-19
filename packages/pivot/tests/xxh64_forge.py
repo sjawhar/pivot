@@ -5,7 +5,7 @@ XXH64's finalization is invertible step by step: 16 bytes placed right after the
 picks the first 8 at random from an alphabet and computes the other 8, retrying until those land
 in the alphabet too. ``forge_value`` does that for one string a document builder embeds; every
 result is checked against the ``xxhash`` library. Adapted from the round-5 reviewer's
-``xxcollide.py`` (Dispatch BET-237, #516).
+``xxcollide.py`` (#516).
 """
 
 from __future__ import annotations

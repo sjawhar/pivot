@@ -1,5 +1,5 @@
 """The fingerprint caches are saved best-effort, so a read command never waits a pivot write's
-30 s for another process's state-database write lock (Dispatch BET-263)."""
+30 s for another process's state-database write lock."""
 
 from __future__ import annotations
 

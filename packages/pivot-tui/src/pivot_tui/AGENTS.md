@@ -1,20 +1,12 @@
-# Pivot TUI - Development Guidelines
+# Pivot TUI
 
-Pure RPC client over the engine's JSON-RPC 2.0 Unix socket.
+Textual app that is a client of the engine's JSON-RPC 2.0 Unix socket and nothing else
+(`docs/architecture/tui.md`).
 
-## Boundary Rules
-
-- **No direct state access.** Must not read lock files, cache files, or state files. All state goes through engine RPC.
-- **Import boundary:** May import `pivot.types` (pure type definitions). Must not import runtime modules (`engine`, `storage`, `config`).
-
-## Lifecycle
-
-One-shot and watch mode are source-configuration differences, not different lifecycles. The TUI should outlive run completion.
-
-## Event Stream
-
-Engine emits explanation events in the event stream. The TUI reconstructs history client-side from this stream.
-
-## Testing
-
-Use `FakeRpcServer` (`testing/fake_server.py`) for TUI tests — test against client interface contracts, not engine internals.
+- All state comes through engine RPC; do not read lock, cache or state files.
+- Import from `pivot` only modules without runtime state (`pivot.types`, `pivot.display`), never
+  `engine`, `storage`, `executor` or `config`.
+- Do not raise the `pivot>=` bound in `packages/pivot-tui/pyproject.toml` by hand; the release
+  writes it (`scripts/set_tui_pivot_bound.py`).
+- Test against `FakeRpcServer` (`testing/fake_server.py`) and the protocols in `client.py`, not
+  engine internals: `uv run pytest packages/pivot-tui/tests`.

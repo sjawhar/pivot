@@ -2,8 +2,7 @@
 
 `pivot status --explain` and `status.get_pipeline_explanations` open the StateDB read-only and
 look each file up by its (mtime_ns, size, device, inode). A file with no matching entry is read
-again on every call (Dispatch BET-237), so each command that writes or checks an output records
-it.
+again on every call, so each command that writes or checks an output records it.
 The tests drive the installed `pivot` binary, as a user does.
 """
 

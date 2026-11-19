@@ -266,7 +266,7 @@ def _helper_project_with_a_stage_member(
     root: pathlib.Path,
 ) -> tuple[dict[str, RegistryStageInfo], pathlib.Path]:
     """A stage `b/tree` whose directory output holds `value.txt` and a `value.txt.pvt` the stage
-    wrote (BET-412's shape: a `.pvt`-shaped file inside the stage's own output), recorded as the
+    wrote (a `.pvt`-shaped file inside the stage's own output), recorded as the
     stage's member by the listing committed beside its lock. Returns the stages (with the
     consumer `smoke/total`) and the cache root."""
     cache_dir = root / ".pivot" / "cache"

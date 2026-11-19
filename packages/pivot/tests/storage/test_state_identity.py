@@ -1,6 +1,6 @@
 """A file-hash entry is also found by the file's identity, (st_dev, st_ino), on a filesystem
 that keeps one identity for one live file, and that match is never weaker than a path match
-at the recorded path (Dispatch BET-263)."""
+at the recorded path."""
 
 from __future__ import annotations
 

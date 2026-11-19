@@ -1006,7 +1006,6 @@ def _decorator_docstring() -> str:
 
 
 _CONCEPTS = ("docs/concepts/fingerprinting.md", "## @pivot.fingerprint_by_name")
-_SKILL = ("skills/writing-pivot-stages/SKILL.md", "## Helpers that do not affect output")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1166,21 +1165,20 @@ with Pipeline("tr") as pipeline:
 }
 
 
-def test_stated_limit_reruns_every_run_and_both_docs_say_so(tmp_path: pathlib.Path) -> None:
+def test_stated_limit_reruns_every_run_and_the_docs_say_so(tmp_path: pathlib.Path) -> None:
     """Code reached only through a marked helper is not walked. When that code imports a user
-    module in its body, the stage warns and reruns on every run. The decorator's sections in
-    docs/concepts/fingerprinting.md and skills/writing-pivot-stages/SKILL.md must say that the
-    stage reruns on every (or each) run."""
+    module in its body, the stage warns and reruns on every run. The decorator's section in
+    docs/concepts/fingerprinting.md must say that the stage reruns on every (or each) run."""
     project = _project(tmp_path, _LIMIT)
     for _ in range(2):
         result = _run(project, "repro")
         assert result.returncode == 0, result.stdout + result.stderr
         assert _UNCOVERED in _flat(result.stdout + result.stderr)
-    for rel, heading in (_CONCEPTS, _SKILL):
-        section = _section(rel, heading)
-        assert "every run" in section or "each run" in section, (
-            f"{rel}: the every-run rerun of the stated limit is not stated: {section}"
-        )
+    rel, heading = _CONCEPTS
+    section = _section(rel, heading)
+    assert "every run" in section or "each run" in section, (
+        f"{rel}: the every-run rerun of the stated limit is not stated: {section}"
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1268,7 +1266,7 @@ def test_recorded_file_claim_matches_behavior(tmp_path: pathlib.Path) -> None:
     """A marked helper is recorded by its module and qualified name, and by no file. The
     manifest entry is `ext:<binding> = <module>.<qualname>`, so moving `lib/procs.py` to
     `lib/procs/__init__.py` leaves the stage cached. Neither the decorator's docstring nor the
-    fingerprinting guide says that the file is part of the record. BET's helpers sit outside
+    fingerprinting guide says that the file is part of the record. A helper can sit outside
     the project root, where no project-relative file exists."""
     project = _project(tmp_path, _MOVE)
     assert _status(_run(project, "repro", "--json"), "mv/s")[0] == "ran"
@@ -2963,7 +2961,7 @@ _R6_FORMS = {
 
 
 # A fix the refusal lists must work when a user follows it. Removing the mark does not: without
-# it a library wrapper over the class is accepted with the class's `__call__` unseen (BET-253),
+# it a library wrapper over the class is accepted with the class's `__call__` unseen,
 # and a bare class-based decorator gets main's non-scalar refusal.
 _REMOVE_FIX = re.compile(r"remov\w*[^\n]*fingerprint_by_name|remov\w* the mark", re.IGNORECASE)
 
