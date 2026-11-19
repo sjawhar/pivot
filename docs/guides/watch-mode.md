@@ -135,7 +135,7 @@ By default, watch mode stops on the first failure (`--fail-fast`). Use `--keep-g
 pivot repro --watch --keep-going
 ```
 
-If a stage reads an input file that does not exist yet, for example because you saved `pipeline.py` with a new stage before creating its file, watch mode logs `Pipeline invalid - waiting for fix` with the missing path, runs nothing and keeps watching. Creating the file runs the stages that were waiting for it, also when the file arrives inside a new directory (`mkdir -p`, `mv`, `cp -r` or `tar -x`). With `--all --keep-going`, a stage whose input is missing is instead skipped with a `Skipping:` warning while the other stages run; watch mode waits as above only when no stage is left to run.
+If a stage reads an input file that does not exist yet, for example because you saved `pipeline.py` with a new stage before creating its file, watch mode logs `Pipeline invalid - waiting for fix` with the missing path, runs nothing and keeps watching. Creating the file runs the stages that were waiting for it, also when the file arrives inside a new directory (`mkdir -p`, `mv`, `cp -r` or `tar -x`). With `--all --keep-going`, a stage whose input is missing is instead skipped with a `Skipping:` warning, and the other stages run. Watch mode waits as above only when no stage is left to run. A missing tracked file (one with a `.pvt` sidecar) is different, also with `--all --keep-going`: it stops the run before any stage runs and ends watch mode with the error `The following tracked files are missing`.
 
 ## Tips
 

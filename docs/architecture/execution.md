@@ -304,6 +304,8 @@ StateDB is an LMDB-backed key-value store for all pipeline state. Keys use prefi
 
 **`.pvt` discovery:** finding tracked files walks the whole project, as `os.walk` does, and reads every `.pvt` it finds. The repro/run pre-flight (`verify_tracked_files`) records, for each directory that changed at least 2 s before the walk, its subdirectory and `.pvt` names under its stamp (`st_dev`, `st_ino`, `st_mtime_ns`, `st_ctime_ns`). Every later walk still stats each directory, and lists only those whose stamp changed, or changed in the last 2 s; adding, removing or renaming an entry changes its directory's stamp. Two kinds of stamp are never trusted: one whose mtime and ctime are both whole seconds, so a filesystem with one-second timestamps is always listed, and one with a time outside the stamp's signed 64-bit nanoseconds (before 1677 or after 2262). The memo is used only on ext2/3/4, xfs, btrfs (subvolumes included), tmpfs, f2fs and zfs mounts (read from `/proc/self/mountinfo`); NFS, overlayfs, FUSE and any other filesystem are listed every time. It holds no `.pvt` content, other commands only read it (a memo that cannot be read means a full listing), and a memo recorded under another project root is not used. The memo is not in the state database, which other accounts can read: it is a file of each account's own, `state.lmdb/pvt-memo-<uid>` in the state directory, created with mode 0600 in a `state.lmdb` that already exists on an allowlisted filesystem, and rewritten in place through its descriptor. A walk opens it without following a symlink and uses it only when an `fstat` of the open file shows a regular file on the same filesystem allowlist (where owner and mode are the file's own; bindfs, CIFS and NFS can report the mount's), owned by the running account, with no group or other access and one link; otherwise every directory is listed and nothing is written. A file of another account is never touched; the account's own memo that its owner loosened (group or other bits, or a second link) is emptied and replaced by a new 0600 file at the next pre-flight. So no other account reads its names, whatever the modes of the project's directories, except while the owner leaves the file loose, at the cost of one `fstat` per walk (one more when a loosened memo is replaced). A listing in which an entry's type could not be read is never recorded.
 
+**Missing tracked files:** after the walk, the pre-flight checks that each tracked file exists, as a file or a directory (symlinks followed). With `--checkout-missing`, it restores each missing one that the cache holds. [Missing inputs](#missing-inputs) says what happens to a file that is still missing. The dry run and `--explain` of `repro --all --keep-going` find the missing files with the same walk and existence rule (`find_missing_tracked_files`). They restore nothing and only read the memo.
+
 ### Multi-process safety
 
 - Workers open StateDB in `readonly=True` mode (no write contention)
@@ -380,6 +382,22 @@ Two error modes:
 
 See `pivot.types.OnError` for the enum definition.
 
+### Missing inputs
+
+Before any stage runs, the engine looks for missing inputs in two steps:
+
+1. The pre-flight (`executor.core.verify_tracked_files`) finds each tracked file (`.pvt`) that does not exist. With `--checkout-missing`, it first restores each one that the cache holds.
+2. `engine.graph.get_runnable_stages` finds each dependency that no stage produces and that does not exist on disk.
+
+When step 2 finds a missing dependency, a run across all pipelines (`Engine(all_pipelines=True)`, as `pivot repro --all` builds it) with `OnError.KEEP_GOING` (`engine.graph.skips_missing_dependencies`) excludes the stage that has it, and every stage downstream of it. It logs one `Skipping:` warning for each missing dependency and runs the other stages. When no stage is left, or in any other run, the run stops with the missing-dependency errors. A watch run waits for the input instead (see [Watch Mode](watch.md)).
+
+A missing tracked file stops the run at step 1 with `TrackedFileMissingError`, except in leave-out mode: `skips_missing_dependencies` is true and the engine has no `FilesystemSource` (no `--watch` or `--serve`). `pivot run` and `executor.core.run` never set `all_pipelines`. In leave-out mode:
+
+- The pre-flight returns the missing files (`tolerate_missing=True`) instead of raising. `get_runnable_stages` excludes each stage with a dependency that is such a file, lies inside one, or is an existing input directory that holds one. A stage gets one error, and one `Skipping:` warning, for each missing tracked file it reads.
+- A missing tracked file that is, lies inside or holds an output of a loaded stage still raises `TrackedFileMissingError` at step 1, naming the output and its stage (`ownership.tracked_output_overlaps`). A mapped stage whose planned instance outputs overlap one fails at expansion and adds no instance (`expansion.tracked_output_refusal`).
+- A named target whose stage, or a stage upstream of it, is excluded does not stop the run. The engine runs the other targets and keeps the excluded ones in `Engine.left_out_targets`. `pivot repro` then raises `TargetsLeftOutError` (exit 1) after its summary. When every target is excluded, the engine runs no stage.
+- `pivot repro --dry-run` and `--explain` make the same decisions and restore nothing (`cli/repro.py` `_leave_out_plan`, with `executor.core.find_missing_tracked_files`).
+
 ## Cancellation
 
 The engine supports graceful cancellation via a `CancelRequested` event. When set:
@@ -420,7 +438,7 @@ Shows:
 
 ## Checkout Missing Mode
 
-The `--checkout-missing` flag restores tracked output files from cache before running:
+The `--checkout-missing` flag restores missing tracked files (`.pvt`) from the cache before running:
 
 ```bash
 # Restore missing tracked files, then run pipeline
@@ -429,13 +447,18 @@ pivot repro --checkout-missing
 
 This is useful when:
 
-- Switching branches where outputs were generated on another branch
-- After `git clean` or accidental deletion of output files
-- Cloning a repo where lock files exist but outputs don't
+- A branch switch leaves the data that the new branch's `.pvt` files name missing from disk
+- After `git clean` or an accidental deletion of tracked files
 
-Without this flag, Pivot validates that all tracked outputs exist before running. If files are missing, it fails with an error suggesting either `pivot checkout --only-missing` (to restore without running) or `pivot repro --checkout-missing` (to restore and run).
+Without this flag, a missing tracked file stops the run, except in leave-out mode (see [Missing inputs](#missing-inputs)). The error (`TrackedFileMissingError`) suggests how to restore the files:
 
-**How it works:** Files are restored using the hashes recorded in existing lock files—no stages are re-executed during restoration. The cache must contain the files (push/pull from remote if needed). After restoration, the normal execution flow continues and may skip stages if nothing else changed.
+- For one missing file: `pivot checkout <path>`, or `pivot checkout --only-missing` to restore all missing files.
+- For more than one: `pivot checkout --only-missing` (restore without running), or `pivot run --checkout-missing` (restore and run).
+- After a `--checkout-missing` restore: the error says `These files are not in local cache.` and suggests `pivot pull`.
+
+**How it works:** the pre-flight restores each missing file from the hash that its `.pvt` records, and a directory from its listing. It never replaces a file that exists, and no stage runs during the restore. The cache must hold the objects (`pivot pull` fetches them from a remote). After the restore, the normal execution flow continues and may skip stages if nothing else changed. In leave-out mode, the run then excludes only the stages that read a file that the pre-flight could not restore.
+
+Under `repro --all --keep-going`, `--dry-run` and `--explain` restore nothing. With `--checkout-missing`, they count a missing tracked file as present when the local cache holds every object that its restore needs (`executor.core.find_missing_tracked_files`).
 
 ## Deferred Commit Mode
 

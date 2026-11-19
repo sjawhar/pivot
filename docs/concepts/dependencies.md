@@ -55,8 +55,12 @@ Without `t` or `format`, the extension picks the loader:
 | anything else | `pathlib.Path` (`PathOnly()`) |
 
 An input whose file does not exist fails before anything runs:
-`Stage 'demo/keep' depends on 'missing.csv' which is not produced by any stage
-and does not exist on disk`.
+`Stage 'demo/keep' depends on input 'missing.csv' (path data/raw/missing.csv),
+which does not exist`. `pivot repro --all --keep-going` is the exception. It
+logs a `Skipping:` warning for each missing input of a stage, excludes that
+stage and every stage downstream of it, and runs the other stages. A
+missing tracked file has its own rules (see
+[Files tracked outside the pipeline](#files-tracked-outside-the-pipeline)).
 
 ### Directory inputs and `.pivotignore`
 
@@ -313,6 +317,24 @@ The sidecar sits beside its data, and its `path:` is the data's name
 (`values.csv` in `data/raw/values.csv.pvt`). `pivot checkout`, `pivot pull` and
 `pivot repro --checkout-missing` restore the file that `path:` names, under the
 directory holding the `.pvt`.
+
+**A missing tracked file stops the run.** Before any stage runs, `pivot repro`
+and `pivot run` check that each tracked file exists. With `--checkout-missing`,
+they first restore the files that the cache holds. A missing file stops the run
+with the error `The following tracked files are missing`.
+`pivot repro --all --keep-going` without `--watch` is the exception: it
+excludes each stage that reads the missing file, and every stage downstream of
+it, and runs the other stages.
+
+A stage reads the file when one of its dependencies is the file, lies inside
+it, or is an input directory that holds it. A `Skipping:` line names the stage
+and each missing file that it reads. When the run excludes a named target, the
+command exits 1 after the other targets run.
+
+A missing tracked file that is, lies inside or holds a stage output still
+stops the run before any stage runs, also under `--all --keep-going`. The error
+names the output and its stage. Under `--all --keep-going`, a mapped stage
+whose instance output overlaps such a file fails instead and adds no instance.
 
 **A `.pvt` restores its file only inside the project.** A sidecar whose `path:`
 names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file

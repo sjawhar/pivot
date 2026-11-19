@@ -1191,7 +1191,10 @@ def _run_oneshot_mode(
     "--keep-going",
     "-k",
     is_flag=True,
-    help="Continue running stages after failures; skip only downstream dependents.",
+    help="Continue running stages after failures, and skip only downstream dependents. With "
+    + "--all, also exclude each stage that reads a missing input file, and its downstream "
+    + "dependents. Without --watch, this includes a missing tracked file that overlaps no stage "
+    + "output, and an excluded target fails the command after the other targets run.",
 )
 @click.option(
     "--serve",

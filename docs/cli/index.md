@@ -176,11 +176,11 @@ pivot repro [STAGES...] [OPTIONS]
 | `--no-commit` | Run stages without writing locks or cache; StateDB keeps a record of the `*.pvt` files each stage wrote, and file hashes are still saved |
 | `--resources NAME=CAPACITY` | Override a scheduler resource capacity; may be repeated |
 | `--fail-fast` | Stop on first failure (default) |
-| `--keep-going` / `-k` | Continue running stages after failures; skip only downstream dependents |
+| `--keep-going` / `-k` | Continue running stages after failures. Skip only the stages downstream of a failed stage. With `--all`, a missing input file does not stop the other stages. Pivot excludes each stage that reads the file, and every stage downstream of it. A `Skipping:` line names each stage that reads the file, and the file. With `--watch`, a missing tracked file (`.pvt`) still stops the run. Without `--watch`, an excluded named target makes the command exit 1 after the other targets run. Without `--watch`, `--dry-run` and `--explain` exclude the same stages and targets as the run. A missing tracked file that is, lies inside or holds a stage output still stops the run before any stage runs. If that output belongs to an instance of a mapped stage, that mapped stage fails instead and adds no instance. |
 | `--serve` | Start RPC server for agent control (requires --watch) |
 | `--allow-uncached-incremental` | Allow running stages with incremental output files not in cache |
-| `--checkout-missing` | Restore tracked files from cache before running |
-| `--allow-missing` | Allow missing dep files if tracked (only affects --dry-run) |
+| `--checkout-missing` | Restore tracked files that do not exist on disk from the cache before running. Without `--watch`, `--all --keep-going` then excludes only the stages that read a file the cache cannot restore. `--dry-run` and `--explain` restore nothing. With `--all --keep-going`, they count a missing tracked file as present when the local cache can restore it, so they do not exclude the stages that read it. Limit: when such a file lies inside a directory that a stage reads, the stage is listed, but its `would_run` and reason come from the directory as it is on disk. |
+| `--allow-missing` | Allow missing dep files if tracked (`.pvt` exists). Only affects `--dry-run` and `--explain`. Refused with `--all --keep-going` (exit 2), which excludes each stage with a missing input. |
 | `--all` | Run across all pipelines in the project |
 
 **Examples:**
