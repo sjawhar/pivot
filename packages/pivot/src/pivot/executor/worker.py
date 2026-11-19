@@ -139,9 +139,25 @@ class _CoveredImportState(threading.local):
     starting_pivot_thread: bool = False
 
 
+class _HookRecordingState(threading.local):
+    """Whether this thread is running the import hooks' own recording work
+    (`_record_hooked_import`).
+
+    That work can import: Debian's CPython 3.13.5 `pathlib` imports `ntpath` in every
+    `PurePath.__init__`, and `fingerprint.is_user_code` builds paths. An import this thread makes
+    meanwhile is the hooks' own machinery, not the stage's: `_tracked_import` and
+    `_tracked_import_module` pass it straight to the original import, which still imports, and
+    record nothing for it, so a hook never runs inside itself. Another thread's imports are
+    recorded as before.
+    """
+
+    recording: bool = False
+
+
 _stage_imports: _StageImports | None = None
 _stage_imports_lock = threading.Lock()
 _covered_import_state = _CoveredImportState()
+_hook_recording_state = _HookRecordingState()
 _original_import = builtins.__import__
 _original_import_module = importlib.import_module
 _original_reload = importlib.reload
@@ -347,6 +363,21 @@ def _import_package(globals: Mapping[str, object] | None) -> str | None:
     return calc_package(globals)
 
 
+def _record_hooked_import(names: list[str], *, for_stage: bool) -> None:
+    """Record the modules `names` that a hooked import requested: in the record of loaded
+    source (`loaded_source.record_modules`), and, when `for_stage`, for the running stage
+    (`_record_stage_import`). This thread's imports meanwhile pass through unrecorded
+    (`_HookRecordingState`)."""
+    state = _hook_recording_state
+    state.recording = True
+    try:
+        loaded_source.record_modules(names)
+        if for_stage:
+            _record_stage_import(names)
+    finally:
+        state.recording = False
+
+
 def _tracked_import(
     name: str,
     globals: Mapping[str, object] | None = None,  # noqa: A002 - CPython's `__import__` signature
@@ -354,13 +385,15 @@ def _tracked_import(
     fromlist: Sequence[str] | None = (),
     level: int = 0,
 ) -> object:
+    if _hook_recording_state.recording:
+        return _original_import(name, globals, locals, fromlist or (), level)
     tracked = _stage_imports
     if tracked is None:
         result = _original_import(name, globals, locals, fromlist or (), level)
         if not level:
             # Unpickling a stage imports the modules it refers to before the stage starts. Record
             # each one the recorder saw compile; `record_unseen_modules` judges the rest.
-            loaded_source.record_modules(_package_chain(name))
+            _record_hooked_import(_package_chain(name), for_stage=False)
         return result
     package = _import_package(globals) if level else None
     absolute: str | None = name
@@ -376,17 +409,18 @@ def _tracked_import(
         result = _original_import(name, globals, locals, fromlist or (), level)
     if absolute is not None:
         names = _package_chain(absolute) + [f"{absolute}.{item}" for item in items]
-        loaded_source.record_modules(names)
-        _record_stage_import(names)
+        _record_hooked_import(names, for_stage=True)
     return result
 
 
 def _tracked_import_module(name: str, package: str | None = None) -> object:
+    if _hook_recording_state.recording:
+        return _original_import_module(name, package)
     tracked = _stage_imports
     if tracked is None:
         result = _original_import_module(name, package)
         if not name.startswith("."):
-            loaded_source.record_modules(_package_chain(name))
+            _record_hooked_import(_package_chain(name), for_stage=False)
         return result
     try:
         absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
@@ -395,8 +429,7 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
     with _covered_import(tracked, absolute, []):
         result = _original_import_module(name, package)
     if absolute is not None:
-        loaded_source.record_modules(_package_chain(absolute))
-        _record_stage_import(_package_chain(absolute))
+        _record_hooked_import(_package_chain(absolute), for_stage=True)
     return result
 
 

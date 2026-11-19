@@ -164,7 +164,11 @@ binding `threading.Thread.start` calls (`worker.install_import_hooks`). Importin
 `pivot.executor.worker` alone changes none of them, and a stage executed in a process without
 that initializer gets the hooks for its call only. For a relative `builtins.__import__`, the hook
 uses CPython 3.13's `_calc___package__` order (`__package__`, `__spec__.parent`, then
-`__name__`/`__path__`) before it records the absolute module. Pivot-owned threads start through
+`__name__`/`__path__`) before it records the absolute module. The hooks' own recording can import
+(Debian's CPython 3.13.5 `pathlib` imports `ntpath` in every `PurePath.__init__`, and
+`is_user_code` builds paths); an import a thread makes while its hook records passes straight to
+the original import, unrecorded, so a hook never runs inside itself (`worker._HookRecordingState`).
+Pivot-owned threads start through
 `worker._start_pivot_thread`, which bypasses coverage: a pipe reader, parent watcher or
 stop-grace timer is not user work and cannot excuse a later user module registration. While a
 stage runs, the import hooks record each user module (and its user packages) the stage requests,
