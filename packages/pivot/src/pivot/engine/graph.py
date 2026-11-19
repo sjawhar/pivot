@@ -20,7 +20,8 @@ if TYPE_CHECKING:
 
     from pivot.exceptions import DependencyNotFoundError
     from pivot.registry import RegistryStageInfo
-    from pivot.storage.store import Store
+    from pivot.storage.store import Store, WorkspaceStore
+    from pivot.storage.track import PvtData
 
 __all__ = [
     "artifact_node",
@@ -30,6 +31,8 @@ __all__ = [
     "skips_missing_dependencies",
     "RunnableStages",
     "get_runnable_stages",
+    "RestoreLimit",
+    "restore_limits",
     "get_consumers",
     "get_producer",
     "get_downstream_stages",
@@ -495,6 +498,89 @@ def _restore_creates(
         return False
 
     return creates
+
+
+class RestoreLimit(NamedTuple):
+    """Why a dry run's explanation of a stage may not follow the ``--checkout-missing`` restore
+    (``restore_limits``)."""
+
+    reader: str
+    """The stage that reads ``path``: the stage itself, or a stage upstream of it."""
+    path: pathlib.Path
+    """The dependency of ``reader`` that the restore changes (absolute normalized)."""
+    tracked: str
+    """The restorable missing tracked path whose restore changes ``path`` (absolute
+    normalized)."""
+
+
+def restore_limits(
+    stages: dict[str, RegistryStageInfo],
+    store: WorkspaceStore,
+    restorable: Mapping[str, PvtData],
+    restored: Mapping[str, AbstractSet[tuple[str, ...]]],
+) -> dict[str, RestoreLimit]:
+    """Each stage of ``stages`` whose dry-run explanation may not follow the restore of the
+    missing tracked paths of ``restorable``, with why. A dry run with ``--checkout-missing``
+    counts these paths as present (``executor.core.find_missing_tracked_files`` gives
+    ``restorable`` and ``restored``), and ``stages`` are the stages and templates it keeps.
+
+    The explanation takes a dependency's hash from a ``.pvt`` only where
+    ``explain.find_tracked_hash`` gives one: for a restorable path itself, and for a file of a
+    restorable directory's listing. It reads every other dependency from the disk, which does not
+    hold the restored files yet. So a stage has a limit when a dependency that no stage produces,
+    found on disk or created by the restore (``validate_dependency_sources``' ``present``), is,
+    holds or lies inside a restorable path in either form (``_forms``), and
+    ``find_tracked_hash`` gives it no hash: a directory on disk that holds a restorable path, a
+    subdirectory of a restorable directory, or a path that reaches a restorable path through a
+    symlink. Its limit names its first such dependency, with the restorable path that dependency
+    is or lies inside, else the first one it holds. Every stage downstream of a stage with a
+    limit has one too: its own, else that of the first such stage upstream of it. Path parts
+    decide containment, never a string prefix. With no restorable path it reads nothing.
+    """
+    if not restorable:
+        return {}
+    from pivot import explain
+
+    present = list[tuple[str, pivot_types.ArtifactRef]]()
+    # The kept stages have no missing dependency: get_runnable_stages left out each stage with
+    # one, and every stage downstream of it
+    validate_dependency_sources(
+        stages, store=store, present=present, created=_restore_creates(restored)
+    )
+    roots = _forms_trie(restorable)
+    # The restorable paths keyed as the dry run's explanation keys them
+    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie(
+        (pathlib.Path(path).parts, path) for path in restorable
+    )
+    readers = dict[str, RestoreLimit]()
+    for stage_name, dep in present:
+        if stage_name in readers:
+            continue
+        path = project.normalize_path(store.checkout(dep))
+        forms = _forms(path)
+        tracked = _enclosing_path(roots, forms)
+        if tracked is None:
+            held = [
+                inside
+                for form in forms
+                if roots.has_subtrie(form.parts)
+                for inside in roots.values(prefix=form.parts)
+            ]
+            if not held:
+                continue
+            tracked = min(held)
+        if explain.find_tracked_hash(path, restorable, tracked_trie, store.cache_dir) is not None:
+            # The explanation takes its hash from the .pvt, the hash the restore brings back
+            continue
+        readers[stage_name] = RestoreLimit(reader=stage_name, path=path, tracked=tracked)
+    if not readers:
+        return readers
+    graph = build_graph(stages)
+    limits = dict(readers)
+    for name, limit in readers.items():
+        for downstream in get_downstream_stages(graph, name):
+            limits.setdefault(downstream, limit)
+    return limits
 
 
 def _forms(path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:

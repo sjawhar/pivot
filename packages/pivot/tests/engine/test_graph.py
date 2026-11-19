@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import pickle
 import random
+import shutil
 from typing import TYPE_CHECKING
 
 import networkx as nx
 import pytest
 
-from pivot import exceptions, loaders
+from pivot import cli, exceptions, loaders
 from pivot.engine import graph, types
 from pivot.executor import core as executor_core
 from pivot.registry import RegistryStageInfo
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Set as AbstractSet
     from pathlib import Path
+
+    import click.testing
 
 
 def _artifact_ref(identity: ArtifactIdentity) -> ArtifactRef:
@@ -867,6 +870,77 @@ def test_get_runnable_stages_reports_a_missing_tracked_file_reached_through_a_sy
     assert error.stage == "p/read"
     assert error.input_path == set_project_root / "data" / "alias" / "a.csv"
     assert found.left_out == {"p/read": error}
+
+
+def test_dry_run_keep_going_restore_limits_name_each_stage_whose_explanation_misses_the_restore(
+    pipeline_dir: Path, runner: click.testing.CliRunner
+) -> None:
+    """A dry run with --checkout-missing takes a dependency's hash from a .pvt only for a
+    restorable path itself and for a file of a restorable directory's listing; it reads any
+    other dependency from the disk. So these stages have a limit: p/dir reads an existing
+    directory that holds the restorable file dir/f.txt, p/link a symlink to that directory,
+    p/sub a subdirectory of the restorable directory images, and p/alias a path that reaches the
+    restorable file inputs/x.txt through a symlink; p/after, downstream of p/dir, has p/dir's.
+    p/file, p/images and p/png read a restorable path or a file of its listing, and p/input
+    reads the directory input, which holds none: path parts decide, so inputs/x.txt is not
+    inside input, though its path starts with input's. No limit for these."""
+    raw = pipeline_dir / "data" / "raw"
+    (raw / "dir").mkdir(parents=True)
+    (raw / "dir" / "present.txt").write_text("present")
+    (raw / "dir" / "f.txt").write_text("f")
+    (raw / "images" / "sub").mkdir(parents=True)
+    (raw / "images" / "a.png").write_text("a")
+    (raw / "images" / "sub" / "b.png").write_text("b")
+    (raw / "inputs").mkdir()
+    (raw / "inputs" / "x.txt").write_text("x")
+    (raw / "input").mkdir()
+    for name in ("dir/f.txt", "images", "inputs/x.txt"):
+        tracking = runner.invoke(cli.cli, ["track", f"data/raw/{name}"])
+        assert tracking.exit_code == 0, tracking.output
+    (raw / "dir" / "f.txt").unlink()
+    (raw / "inputs" / "x.txt").unlink()
+    shutil.rmtree(raw / "images")
+    (raw / "link").symlink_to("dir")
+    (raw / "alias").symlink_to("inputs")
+    found = executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
+    assert found.missing == []
+    assert list(found.restorable) == [
+        str(raw / "dir" / "f.txt"),
+        str(raw / "images"),
+        str(raw / "inputs" / "x.txt"),
+    ]
+    bindings = {
+        "dir": "data/raw/dir",
+        "link": "data/raw/link",
+        "sub": "data/raw/images/sub",
+        "alias": "data/raw/alias/x.txt",
+        "file": "data/raw/dir/f.txt",
+        "images": "data/raw/images",
+        "png": "data/raw/images/sub/b.png",
+        "input": "data/raw/input",
+    }
+    stages = {f"p/{name}": _helper_input_stage(f"p/{name}", [name]) for name in bindings}
+    stages["p/after"] = _create_stage("p/after", [_output("p/dir")], [_output("p/after")])
+    store = store_mod.WorkspaceStore(
+        project_root=pipeline_dir,
+        pipeline_name="p",
+        input_bindings=bindings,
+        cache_dir=pipeline_dir / ".pivot" / "cache" / "files",
+    )
+
+    limits = graph.restore_limits(stages, store, found.restorable, found.restored)
+
+    in_dir = graph.RestoreLimit("p/dir", raw / "dir", str(raw / "dir" / "f.txt"))
+    assert limits == {
+        "p/dir": in_dir,
+        "p/link": graph.RestoreLimit("p/link", raw / "link", str(raw / "dir" / "f.txt")),
+        "p/sub": graph.RestoreLimit("p/sub", raw / "images" / "sub", str(raw / "images")),
+        "p/alias": graph.RestoreLimit(
+            "p/alias", raw / "alias" / "x.txt", str(raw / "inputs" / "x.txt")
+        ),
+        "p/after": in_dir,
+    }
+    assert graph.restore_limits(stages, store, {}, {}) == {}
 
 
 def test_get_runnable_stages_leaves_out_downstream_stages_with_their_first_upstream_error(

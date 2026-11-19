@@ -135,6 +135,9 @@ class _LeaveOut(NamedTuple):
     restorable: dict[str, PvtData]
     """The missing tracked files the cache can restore (``--checkout-missing``), with their
     ``.pvt`` data: they count as present, and nothing restores them."""
+    restored: dict[str, set[tuple[str, ...]]]
+    """Each path of ``restorable``, with every path its restore creates inside it
+    (``executor.core.MissingTrackedFiles.restored``)."""
     stages: dict[str, registry.RegistryStageInfo] | None
     """The run's own stages and templates that it keeps; None for every one."""
     left_out: dict[str, exceptions.DependencyNotFoundError]
@@ -154,6 +157,7 @@ def _no_leave_out(stages_list: list[str] | None) -> _LeaveOut:
     return _LeaveOut(
         missing=[],
         restorable={},
+        restored={},
         stages=None,
         left_out={},
         targets=stages_list,
@@ -221,6 +225,7 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     return _LeaveOut(
         missing=found.missing,
         restorable=found.restorable,
+        restored=found.restored,
         stages=runnable,
         left_out=left_out,
         targets=targets,
@@ -262,6 +267,42 @@ def _instance_output_refusal(
     )
 
 
+def _log_restore_limits(not_expanded: list[PipelineStatusInfo], plan: _LeaveOut) -> None:
+    """Log one notice for each mapped stage of ``not_expanded`` (its rows) whose producer, or a
+    stage upstream of it, reads a path that the ``--checkout-missing`` restore changes and that
+    the dry run's explanation reads from the disk (``engine_graph.restore_limits``). The dry run
+    shows such a mapped stage as not yet expanded, but the run may restore the path, find the
+    producer current and add its instances. With no restorable file it reads nothing."""
+    if plan.stages is None or not plan.restorable or not not_expanded:
+        return
+    limits = engine_graph.restore_limits(
+        plan.stages, cli_helpers.require_workspace_store(), plan.restorable, plan.restored
+    )
+    pipeline = cli_helpers.get_pipeline()
+    for row in not_expanded:
+        template = row["name"]
+        # A template mapped over another one's instances shares its source: this is the
+        # producer of the first template of its chain
+        producer = pipeline.get_template(template)["source"].producer
+        if producer not in limits:
+            continue
+        limit = limits[producer]
+        reader = (
+            f"Its producer '{producer}'"
+            if limit.reader == producer
+            else f"Stage '{limit.reader}', upstream of its producer '{producer}',"
+        )
+        path = project.to_relative_path(limit.path)
+        tracked = project.to_relative_path(limit.tracked)
+        _logger.warning(
+            "Notice: %s",
+            f"mapped stage '{template}' is shown as not yet expanded. {reader} reads '{path}', "
+            + f"which changes when --checkout-missing restores tracked path '{tracked}'. The dry "
+            + f"run explains '{limit.reader}' from the files on disk, so the run may restore "
+            + f"'{tracked}', find '{producer}' current and add the instances of '{template}'.",
+        )
+
+
 class _Explained(NamedTuple):
     """What ``--explain`` and ``--dry-run`` show (``_get_explanations``)."""
 
@@ -298,8 +339,10 @@ def _get_explanations(
     refused (``_instance_output_refusal``). A left-out stage, every instance of a left-out
     mapped stage, its not-expanded row and its orphaned instances are not shown, and a left-out
     stage changes no orphan the run would remove (``cli_helpers.eligible_templates`` over the
-    stages the run keeps). Any other mode leaves out nothing (``_no_leave_out``), and a missing
-    dependency stops it unless ``allow_missing``.
+    stages the run keeps). With ``--checkout-missing``, a notice on stderr names each mapped
+    stage shown as not yet expanded whose producer the dry run may explain apart from the run
+    (``_log_restore_limits``). Any other mode leaves out nothing (``_no_leave_out``), and a
+    missing dependency stops it unless ``allow_missing``.
 
     Shared by --explain and --dry-run modes.
     """
@@ -376,12 +419,9 @@ def _get_explanations(
         known=known,
         restorable=plan.restorable,
     )
-    return _Explained(
-        explanations,
-        status_mod.not_expanded_status(kept, shown_templates),
-        orphans,
-        plan.left_out_targets,
-    )
+    not_expanded = status_mod.not_expanded_status(kept, shown_templates)
+    _log_restore_limits(not_expanded, plan)
+    return _Explained(explanations, not_expanded, orphans, plan.left_out_targets)
 
 
 def _output_explain(

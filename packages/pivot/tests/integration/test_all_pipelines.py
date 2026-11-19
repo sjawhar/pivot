@@ -714,6 +714,311 @@ def test_repro_all_dry_run_keep_going_leaves_out_a_restored_directory_holding_a_
         assert not (cwd / "data" / "dirs" / "scan.txt").exists()
 
 
+# p/cut is mapped over p/plan's files, and p/plan reads the directory data/raw/dir/, writing one
+# file for each .txt file it holds
+_MAPPED_OVER_A_READ_DIRECTORY_CODE = """\
+import pathlib
+from typing import Annotated
+
+from pivot.compose import Pipeline, directory, stage
+
+
+@stage
+def plan(folder: pathlib.Path) -> Annotated[dict[str, str], directory]:
+    return {entry.name: entry.read_text() for entry in sorted(folder.glob("*.txt"))}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan(pipeline.input("dir", t=pathlib.Path))))
+"""
+
+# The same, with p/prep reading data/raw/dir/ upstream of p/plan
+_MAPPED_BELOW_A_READ_DIRECTORY_CODE = """\
+import pathlib
+from typing import Annotated
+
+from pivot.compose import Pipeline, directory, stage
+
+
+@stage
+def prep(folder: pathlib.Path) -> str:
+    return ",".join(sorted(entry.name for entry in folder.glob("*.txt")))
+
+
+@stage
+def plan(names: str) -> Annotated[dict[str, str], directory]:
+    return {name: name for name in names.split(",")}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan(prep(pipeline.input("dir", t=pathlib.Path)))))
+"""
+
+# p/cut is mapped over p/plan's files, and p/plan reads the file data/raw/plan.txt, writing one
+# file for each name it holds
+_MAPPED_OVER_A_READ_FILE_CODE = """\
+from typing import Annotated
+
+from pivot.compose import Pipeline, directory, stage
+
+
+@stage
+def plan(names: str) -> Annotated[dict[str, str], directory]:
+    return {f"{name}.txt": name for name in names.split()}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan(pipeline.input("plan.txt", t=str))))
+"""
+
+
+def _helper_track(runner: CliRunner, cwd: pathlib.Path, name: str, text: str) -> pathlib.Path:
+    """Write ``text`` to ``cwd / name`` and track it with the real ``pivot track``, which puts its
+    object in the cache; return its path."""
+    path = cwd / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    tracking = runner.invoke(cli.cli, ["track", name])
+    assert tracking.exit_code == 0, tracking.output
+    return path
+
+
+def _helper_first_run(runner: CliRunner) -> None:
+    first = runner.invoke(cli.cli, ["repro", "--all", "--keep-going"])
+    assert first.exit_code == 0, first.output
+
+
+def _helper_notices(stderr: str) -> list[str]:
+    return [line for line in stderr.splitlines() if "Notice:" in line]
+
+
+def _helper_restore_limit_project(runner: CliRunner, cwd: pathlib.Path, code: str) -> pathlib.Path:
+    """Pipeline p of ``code`` and the healthy alpha/stage_a. data/raw/dir/ holds present.txt and
+    the tracked file f.txt. A first run expands p/cut over both files, then f.txt is removed
+    from the workspace; the cache keeps its object. Returns the path of f.txt."""
+    _helper_write_pipeline(cwd, "p", code)
+    _helper_write_pipeline(cwd, "alpha", _helper_pipeline_code("alpha", "stage_a"))
+    tracked = _helper_track(runner, cwd, "data/raw/dir/f.txt", "f")
+    (tracked.parent / "present.txt").write_text("present")
+    _helper_first_run(runner)
+    tracked.unlink()
+    return tracked
+
+
+def _helper_restore_limit_notice(reader: str) -> str:
+    """The notice for p/cut when ``reader``, p/plan or p/prep upstream of it, reads data/raw/dir/,
+    which holds the tracked file f.txt that --checkout-missing restores."""
+    who = (
+        "Its producer 'p/plan'"
+        if reader == "p/plan"
+        else f"Stage '{reader}', upstream of its producer 'p/plan',"
+    )
+    return (
+        f"Notice: mapped stage 'p/cut' is shown as not yet expanded. {who} reads 'data/raw/dir', "
+        + "which changes when --checkout-missing restores tracked path 'data/raw/dir/f.txt'. "
+        + f"The dry run explains '{reader}' from the files on disk, so the run may restore "
+        + "'data/raw/dir/f.txt', find 'p/plan' current and add the instances of 'p/cut'."
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "reader"),
+    [
+        pytest.param(_MAPPED_OVER_A_READ_DIRECTORY_CODE, "p/plan", id="producer"),
+        pytest.param(_MAPPED_BELOW_A_READ_DIRECTORY_CODE, "p/prep", id="upstream"),
+    ],
+)
+def test_repro_all_dry_run_keep_going_checkout_missing_notes_a_mapped_stage_it_cannot_expand(
+    runner: CliRunner, tmp_path: pathlib.Path, code: str, reader: str
+) -> None:
+    """D7's limit, named: ``reader`` (p/plan, or p/prep upstream of it) reads data/raw/dir/,
+    which holds the missing tracked file f.txt whose object the cache holds. With
+    --checkout-missing the dry run explains the directory from the disk, so it shows p/cut as
+    one row not yet expanded, stdout stays one JSON document, and one notice on stderr names
+    p/cut, its producer, ``reader``, the directory and the file. The run on the same tree
+    restores f.txt, finds p/plan current and adds p/cut's instances. Without --checkout-missing
+    the dry run leaves ``reader`` out and prints no notice; once the run restored f.txt, the dry
+    run with it prints none either and lists p/cut's instances."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        tracked = _helper_restore_limit_project(runner, cwd, code)
+
+        dry_run = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "--checkout-missing"])
+        without = runner.invoke(cli.cli, _DRY_RUN_KEEP_GOING)
+        ran = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+        )
+        restored = tracked.read_text()
+        after = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "--checkout-missing"])
+
+        upstream = reader != "p/plan"
+        stale = {"would_run": True, "reason": "Input dependencies changed"}
+        unchanged = {"would_run": False, "reason": "unchanged"}
+        why = "Upstream stale (p/prep)" if upstream else "Input dependencies changed"
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {
+                "alpha/stage_a": unchanged,
+                **({"p/prep": stale} if upstream else {}),
+                "p/plan": {"would_run": True, "reason": why},
+                "p/cut": {
+                    "would_run": True,
+                    "reason": f"Not yet expanded: waits for 'p/plan': {why}",
+                },
+            }
+        }, dry_run.output
+        assert _helper_notices(dry_run.stderr) == [_helper_restore_limit_notice(reader)]
+        assert _helper_skipping_lines(dry_run.stderr) == [], dry_run.output
+        assert without.exit_code == 0, without.output
+        assert json.loads(without.stdout) == {"stages": {"alpha/stage_a": unchanged}}
+        assert _helper_skipping_lines(without.stderr) == [
+            f"Skipping: Stage '{reader}' depends on directory 'dir', which holds tracked file "
+            + "'data/raw/dir/f.txt' that does not exist"
+        ], without.output
+        assert _helper_notices(without.stderr) == [], without.output
+        assert ran.exit_code == 0, ran.output
+        assert restored == "f"
+        events = [json.loads(line) for line in ran.stdout.splitlines()]
+        instances = ["p/cut@f", "p/cut@present"]
+        assert [event for event in events if event["type"] == "stages_expanded"] == [
+            {"type": "stages_expanded", "template": "p/cut", "stages": instances}
+        ], ran.output
+        assert {
+            stage: event["status"] for stage, event in _helper_completed(ran.stdout).items()
+        } == {
+            "alpha/stage_a": "cached",
+            **({"p/prep": "cached"} if upstream else {}),
+            "p/plan": "cached",
+            **dict.fromkeys(instances, "cached"),
+        }, ran.output
+        assert after.exit_code == 0, after.output
+        assert json.loads(after.stdout) == {
+            "stages": {
+                "alpha/stage_a": unchanged,
+                **({"p/prep": unchanged} if upstream else {}),
+                "p/plan": unchanged,
+                **dict.fromkeys(instances, unchanged),
+            }
+        }, after.output
+        assert _helper_notices(after.stderr) == [], after.output
+
+
+def test_repro_all_dry_run_keep_going_explain_checkout_missing_notes_a_mapped_stage(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """--explain makes the same decisions as the dry run: on the tree where p/plan reads
+    data/raw/dir/, which holds the missing tracked file f.txt whose object the cache holds, it
+    shows p/cut as not yet expanded and prints the same one notice on stderr."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_restore_limit_project(runner, cwd, _MAPPED_OVER_A_READ_DIRECTORY_CODE)
+
+        result = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--explain", "--checkout-missing"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            "Stage: p/cut\n  Status: NOT YET EXPANDED\n"
+            + "  Reason: Not yet expanded: waits for 'p/plan': Input dependencies changed\n"
+        ) in result.output, result.output
+        assert _helper_notices(result.stderr) == [_helper_restore_limit_notice("p/plan")]
+
+
+@pytest.mark.parametrize("reads", ["the-tracked-file", "a-directory-beside-it"])
+def test_repro_all_dry_run_keep_going_checkout_missing_notes_no_mapped_stage_stale_otherwise(
+    runner: CliRunner, tmp_path: pathlib.Path, reads: str
+) -> None:
+    """No notice for a mapped stage not yet expanded because its producer is stale for a reason
+    the restore does not hide, while a missing tracked file the cache holds exists. With
+    `the-tracked-file`, p/plan reads the tracked file data/raw/plan.txt itself, whose hash the
+    dry run takes from its .pvt, and its code changed. With `a-directory-beside-it`, p/plan reads
+    data/raw/dir/, which holds no tracked file (data/raw/dir-backup/f.txt is beside it, not
+    inside it), and a file was added to it."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_write_pipeline(cwd, "alpha", _helper_pipeline_code("alpha", "stage_a"))
+        raw = cwd / "data" / "raw"
+        if reads == "the-tracked-file":
+            _helper_write_pipeline(cwd, "p", _MAPPED_OVER_A_READ_FILE_CODE)
+            tracked = _helper_track(runner, cwd, "data/raw/plan.txt", "a b")
+            _helper_first_run(runner)
+            (cwd / "p" / "pipeline.py").write_text(
+                _MAPPED_OVER_A_READ_FILE_CODE.replace("names.split()", "names.split(' ')")
+            )
+            reason = "Code changed"
+        else:
+            _helper_write_pipeline(cwd, "p", _MAPPED_OVER_A_READ_DIRECTORY_CODE)
+            (raw / "dir").mkdir(parents=True)
+            (raw / "dir" / "present.txt").write_text("present")
+            tracked = _helper_track(runner, cwd, "data/raw/dir-backup/f.txt", "f")
+            _helper_first_run(runner)
+            (raw / "dir" / "new.txt").write_text("new")
+            reason = "Input dependencies changed"
+        tracked.unlink()
+
+        dry_run = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "--checkout-missing"])
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {
+                "alpha/stage_a": {"would_run": False, "reason": "unchanged"},
+                "p/plan": {"would_run": True, "reason": reason},
+                "p/cut": {
+                    "would_run": True,
+                    "reason": f"Not yet expanded: waits for 'p/plan': {reason}",
+                },
+            }
+        }, dry_run.output
+        assert _helper_notices(dry_run.stderr) == [], dry_run.output
+        assert _helper_skipping_lines(dry_run.stderr) == [], dry_run.output
+
+
+def test_repro_all_dry_run_keep_going_checkout_missing_notes_no_left_out_mapped_stage(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """No notice for a mapped stage the run leaves out: p/plan reads data/raw/dir/, which holds
+    the missing tracked file f.txt whose object the cache holds, but p/cut also reads the missing
+    tracked file missing.txt, which no cache holds. The dry run with --checkout-missing leaves
+    p/cut out with its `Skipping:` line, shows no row for it and prints no notice."""
+    code = _MAPPED_OVER_A_READ_DIRECTORY_CODE.replace(
+        "def cut(entry: str) -> str:", "def cut(entry: str, shared: str) -> str:"
+    ).replace(
+        'pipeline.input("dir", t=pathlib.Path))))',
+        'pipeline.input("dir", t=pathlib.Path))), pipeline.input("missing.txt", t=str))',
+    )
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        helpers.track_without_data(cwd / "data" / "raw" / "missing.txt")
+        _helper_restore_limit_project(runner, cwd, code)
+
+        dry_run = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "--checkout-missing"])
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {
+                "alpha/stage_a": {"would_run": False, "reason": "unchanged"},
+                "p/plan": {"would_run": True, "reason": "Input dependencies changed"},
+            }
+        }, dry_run.output
+        assert _helper_skipping_lines(dry_run.stderr) == [
+            "Skipping: Stage 'p/cut' depends on input 'missing.txt' "
+            + "(path data/raw/missing.txt), which does not exist"
+        ], dry_run.output
+        assert _helper_notices(dry_run.stderr) == [], dry_run.output
+
+
 def test_repro_all_dry_run_keep_going_target_naming_no_stage_lists_what_the_run_runs(
     runner: CliRunner, tmp_path: pathlib.Path
 ) -> None:

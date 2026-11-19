@@ -1109,7 +1109,7 @@ def test_find_tracked_hash_exact_match() -> None:
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     tracked_trie[("/", "project", "data.csv")] = "/project/data.csv"
 
-    result = explain._find_tracked_hash(
+    result = explain.find_tracked_hash(
         pathlib.Path("/project/data.csv"), tracked_files, tracked_trie, None
     )
 
@@ -1123,7 +1123,7 @@ def test_find_tracked_hash_reads_a_member_from_the_committed_listing(
     """With the directory gone and no cache, ``corpus.pvt.listing`` gives a member's hash."""
     tracked = _track_corpus(mock_discovery.root, runner)
 
-    result = explain._find_tracked_hash(
+    result = explain.find_tracked_hash(
         tracked["corpus"] / "sub" / "b.csv", tracked["tracked_files"], tracked["tracked_trie"], None
     )
 
@@ -1137,7 +1137,7 @@ def test_find_tracked_hash_reads_a_member_from_the_cache_without_a_committed_lis
     tracked = _track_corpus(mock_discovery.root, runner)
     (mock_discovery.root / "corpus.pvt.listing").unlink()
 
-    result = explain._find_tracked_hash(
+    result = explain.find_tracked_hash(
         tracked["corpus"] / "sub" / "b.csv",
         tracked["tracked_files"],
         tracked["tracked_trie"],
@@ -1157,7 +1157,7 @@ def test_find_tracked_hash_has_no_hash_for_a_member_when_no_listing_exists(
     shutil.rmtree(tracked["cache_dir"])
 
     assert (
-        explain._find_tracked_hash(
+        explain.find_tracked_hash(
             tracked["corpus"] / "sub" / "b.csv",
             tracked["tracked_files"],
             tracked["tracked_trie"],
@@ -1170,7 +1170,7 @@ def test_find_tracked_hash_has_no_hash_for_a_member_when_no_listing_exists(
 def test_find_tracked_hash_not_tracked() -> None:
     """Returns None for an untracked path."""
     assert (
-        explain._find_tracked_hash(
+        explain.find_tracked_hash(
             pathlib.Path("/project/untracked.csv"),
             {},
             pygtrie.Trie(),
@@ -1187,7 +1187,7 @@ def test_find_tracked_hash_not_in_listing(
     tracked = _track_corpus(mock_discovery.root, runner)
 
     assert (
-        explain._find_tracked_hash(
+        explain.find_tracked_hash(
             tracked["corpus"] / "sub" / "c.csv",
             tracked["tracked_files"],
             tracked["tracked_trie"],
@@ -1209,7 +1209,7 @@ def test_find_tracked_hash_refuses_an_edited_committed_listing_the_cache_cannot_
     cache.get_cache_path(tracked["cache_dir"], listing.digest(original)).unlink()
 
     with pytest.raises(exceptions.CorruptListingError, match=r"corpus\.pvt\.listing: its bytes"):
-        explain._find_tracked_hash(
+        explain.find_tracked_hash(
             tracked["corpus"] / "sub" / "b.csv",
             tracked["tracked_files"],
             tracked["tracked_trie"],
@@ -1227,7 +1227,7 @@ def test_find_tracked_hash_reads_a_member_from_an_old_directory_pvt_with_one_war
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.track"):
         tracked = _discover_corpus(mock_discovery.root)
-        result = explain._find_tracked_hash(
+        result = explain.find_tracked_hash(
             tracked["corpus"] / "sub" / "b.csv",
             tracked["tracked_files"],
             tracked["tracked_trie"],

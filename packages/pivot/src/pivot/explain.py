@@ -162,16 +162,19 @@ def _find_tracked_ancestor(dep: Path, tracked_trie: pygtrie.Trie[str]) -> Path |
     return None
 
 
-def _find_tracked_hash(
+def find_tracked_hash(
     dep: Path,
-    tracked_files: dict[str, track.PvtData],
+    tracked_files: Mapping[str, track.PvtData],
     tracked_trie: pygtrie.Trie[str],
     cache_dir: pathlib.Path | None,
 ) -> HashInfo | None:
     """Find hash for dep from tracked files data.
 
     Returns HashInfo if dep is tracked (exact match or inside tracked directory, found in its
-    listing), None otherwise.
+    listing), None otherwise. ``tracked_trie`` keys each path of ``tracked_files`` by its
+    ``Path.parts``. A missing dependency's explanation takes its hash from here
+    (``get_stage_explanation``), and the dry run's notice of a restore it cannot follow asks the
+    same (``engine.graph.restore_limits``).
     """
     tracked_path = _find_tracked_ancestor(dep, tracked_trie)
     if not tracked_path:
@@ -305,7 +308,7 @@ def get_stage_explanation(
                 tracked_hash = None
                 if tracked_files is not None and tracked_trie is not None:
                     dep_path = project.normalize_path(store.checkout(ref))
-                    tracked_hash = _find_tracked_hash(
+                    tracked_hash = find_tracked_hash(
                         dep_path, tracked_files, tracked_trie, store.cache_dir
                     )
                     if tracked_hash is not None and types.is_dir_hash(tracked_hash):
