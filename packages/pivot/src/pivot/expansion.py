@@ -30,7 +30,13 @@ from pivot.storage import listing, lock, ownership
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping
+    from collections.abc import Callable, Collection, Iterable, Mapping
+
+# Why a template cannot add the instance of each (key, file key), or None (``expand_current``'s
+# ``refuse``)
+type InstanceRefusal = Callable[
+    [registry.MapTemplate, list[tuple[str, str]]], exceptions.PivotError | None
+]
 
 
 class Expansion(TypedDict):
@@ -79,30 +85,101 @@ def refusal_reason(source: types.ArtifactIdentity, error: exceptions.PivotError)
 
 
 def tracked_output_refusal(
-    planned: Mapping[str, registry.RegistryStageInfo],
+    stages: Mapping[str, registry.RegistryStageInfo],
     missing_tracked: Collection[str],
     project_root: pathlib.Path,
     *,
     checkout_attempted: bool,
 ) -> exceptions.TrackedFileMissingError | None:
-    """Why a template cannot add its planned instances ``planned`` (by name, as
-    ``registry.instantiate`` builds them), or None: an instance output that is, lies inside or
+    """Why stages ``stages`` (by name) cannot run, or None: an output that is, lies inside or
     contains a missing tracked file of ``missing_tracked`` (the absolute normalized paths
-    discovery gives), which that instance's write would delete with its sidecar. The error names
-    each such file and the output it overlaps (``ownership.tracked_output_overlaps``), worded as
-    the run start's check of the loaded stages' outputs (``executor.core.verify_tracked_files``);
+    discovery gives), which that stage's write would delete with its sidecar. The stages are a
+    template's planned instances, as ``registry.instantiate`` builds them, or the loaded stages a
+    dry run checks before it expands (``pivot repro --dry-run``). The error names each such file
+    and the output it overlaps (``ownership.tracked_output_overlaps``), worded as the run start's
+    check of the loaded stages' outputs (``executor.core.verify_tracked_files``);
     ``checkout_attempted`` says whether a restore (``--checkout-missing``) tried those files
     first. With no missing file it reads nothing."""
     if not missing_tracked:
         return None
     overlaps = ownership.tracked_output_overlaps(
-        missing_tracked, ownership.stage_output_paths(project_root, planned), project_root
+        missing_tracked, ownership.stage_output_paths(project_root, stages), project_root
     )
     if not overlaps:
         return None
     return exceptions.TrackedFileMissingError(
         list(overlaps), checkout_attempted=checkout_attempted, overlaps=overlaps
     )
+
+
+def mapped_targets(
+    stages: list[str], templates: Mapping[str, registry.MapTemplate]
+) -> tuple[list[str], dict[str, dict[str, set[str]]]]:
+    """Run targets ``stages`` with each instance name (``<template>@<key>``) replaced by its
+    template, and the keys each template expands so the run adds the named instances alone,
+    each with its chain: an instance's key for its template and for every template that one is
+    mapped over, each key with the targets that need it. A template named itself, or upstream
+    of one named itself, expands every key and has no entry; so does every template when no
+    target names an instance.
+
+    The instances of a run's expansions are gone when this is called (``reset_expansions``), so
+    a watch run's affected instance and a name the user gave are both reached this way. The run
+    (``Engine``) and its dry run (``pivot repro --dry-run``) both take the keys from here.
+    """
+    # Each template's keys, each with the targets that need it; None for every key
+    wanted = dict[str, dict[str, set[str]] | None]()
+    targets = list[str]()
+    for stage in stages:
+        target = registry.run_target(stage, templates)
+        targets.append(target)
+        if target not in templates:
+            continue
+        if target == stage:
+            wanted[target] = None
+            continue
+        keys = wanted.setdefault(target, dict[str, set[str]]())
+        if keys is not None:
+            keys.setdefault(stage.removeprefix(f"{target}@"), set[str]()).add(stage)
+    pending = list(wanted)
+    while pending:
+        name = pending.pop()
+        keys = wanted[name]
+        for upstream in {dep for dep in templates[name]["mapped_deps"].values() if dep is not None}:
+            before = wanted.get(upstream, dict[str, set[str]]())
+            if upstream in wanted and before is None:
+                continue
+            if keys is None:
+                wanted[upstream] = None
+                pending.append(upstream)
+                continue
+            merged = {key: set(needing) for key, needing in (before or {}).items()}
+            for key, needing in keys.items():
+                merged.setdefault(key, set[str]()).update(needing)
+            if upstream in wanted and merged == before:
+                continue
+            wanted[upstream] = merged
+            pending.append(upstream)
+    filtered = {name: keys for name, keys in wanted.items() if keys is not None}
+    return list(dict.fromkeys(targets)), filtered
+
+
+def left_out_targets(
+    targets: Iterable[str],
+    templates: Collection[str],
+    left_out: Mapping[str, exceptions.DependencyNotFoundError],
+) -> dict[str, exceptions.DependencyNotFoundError]:
+    """Each of run targets ``targets``, as given, whose stage a run leaves out, with that stage's
+    cause. ``left_out`` holds the stages a run across all pipelines that keeps going past
+    failures leaves out for a missing input (``engine.graph.get_runnable_stages``); an instance
+    target (``<template>@<key>``) stands for its template (``registry.run_target``). The run
+    (``Engine``) and its dry run (``pivot repro --dry-run``) both call this, so they leave out
+    the same targets."""
+    found = dict[str, exceptions.DependencyNotFoundError]()
+    for target in targets:
+        stage = registry.run_target(target, templates)
+        if stage in left_out:
+            found[target] = left_out[stage]
+    return found
 
 
 def stage_lock(
@@ -168,6 +245,7 @@ def expand_current(
     default_state_dir: pathlib.Path,
     cache_dir: pathlib.Path | None,
     fetched: Mapping[str, listing.DirListing] | None = None,
+    refuse: InstanceRefusal | None = None,
 ) -> Expansion:
     """Expand afresh each template of ``pipeline`` whose source's producer is current.
 
@@ -180,7 +258,11 @@ def expand_current(
     ``fetched`` holds listings read from the remote, by directory hash, already checked against
     their records: a listing neither committed nor cached is taken from it (a dry run's read,
     which writes nothing to the cache). A listing neither holds is named in ``listings`` for
-    every template mapped over that source, the ones that reuse its read included.
+    every template mapped over that source, the ones that reuse its read included. ``refuse``,
+    when given, may refuse a template before its instances are added: given the template and
+    the (key, file key) of each instance, it returns why the template cannot expand, or None. Its
+    refusal is recorded as any other (a dry run of ``pivot repro`` passes the run's check of the
+    instances' outputs over missing tracked files, ``tracked_output_refusal``).
     """
     pipeline.reset_expansions()
     result = Expansion(expanded={}, not_expanded={}, listings={})
@@ -233,6 +315,10 @@ def expand_current(
             result["listings"][name] = missing_by_source[source]
         if isinstance(keys, str):
             result["not_expanded"][name] = keys
+            continue
+        refusal = None if refuse is None else refuse(template, keys)
+        if refusal is not None:
+            result["not_expanded"][name] = refusal_reason(source, refusal)
             continue
         try:
             result["expanded"][name] = pipeline.expand_template(name, keys)

@@ -478,6 +478,233 @@ def test_repro_all_left_out_target_rule_still_refuses_a_target_naming_no_stage(
         assert not (cwd / "data" / "alpha" / "stage_a.txt").exists()
 
 
+# =============================================================================
+# The dry run and --explain under --all --keep-going (R5)
+# =============================================================================
+
+_DRY_RUN_KEEP_GOING = ["repro", "--all", "--keep-going", "--dry-run", "--jsonl"]
+
+_LEFT_OUT_AFTER = (
+    "The run left out 1 target for a missing input:\n"
+    + "  - broken/after: Stage 'broken/read_0' depends on input 'missing.txt' "
+    + "(path data/raw/missing.txt), which does not exist"
+)
+
+
+def _helper_completed(stdout: str) -> dict[str, dict[str, object]]:
+    """The `stage_complete` event of each stage a `--jsonl` run reports, by stage."""
+    events = [json.loads(line) for line in stdout.splitlines()]
+    return {event["stage"]: event for event in events if event["type"] == "stage_complete"}
+
+
+def test_repro_all_dry_run_keep_going_lists_the_stages_the_run_runs(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A5 on A1: the dry run's stages are those the run on the same tree runs or skips; the
+    reader of the missing tracked file and the stage downstream of it are absent, and one
+    `Skipping:` line on stderr names the reader."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+
+        dry_run = runner.invoke(cli.cli, _DRY_RUN_KEEP_GOING)
+        ran = runner.invoke(cli.cli, ["repro", "--all", "--keep-going", "--jsonl"])
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
+        }, dry_run.output
+        assert _helper_skipping_lines(dry_run.stderr) == [_READER_SKIPPED], dry_run.output
+        assert ran.exit_code == 0, ran.output
+        completed = _helper_completed(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "ran"
+        }, ran.output
+        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
+
+
+def test_repro_all_dry_run_keep_going_checkout_missing_counts_a_cached_file_as_present(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A5, D7: with --checkout-missing, the reader of a missing tracked file whose object the
+    cache holds is listed, with the reason the run gives after it restores the file (its .pvt
+    names other bytes than the reader last read); without the flag it is left out. The reader
+    of a tracked file with no object is left out either way, and the dry run restores nothing."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+        _helper_write_pipeline(
+            cwd, "kept", _helper_broken_pipeline_code(1, name="kept", input_name="cached.txt")
+        )
+        cached = cwd / "data" / "raw" / "cached.txt"
+        cached.write_text("first bytes")
+        tracked = runner.invoke(cli.cli, ["track", "data/raw/cached.txt"])
+        assert tracked.exit_code == 0, tracked.output
+        first = runner.invoke(cli.cli, ["repro", "--all", "--keep-going"])
+        assert first.exit_code == 0, first.output
+        cached.unlink()
+        cached.write_text("cached bytes")
+        retracked = runner.invoke(cli.cli, ["track", "--force", "data/raw/cached.txt"])
+        assert retracked.exit_code == 0, retracked.output
+        cached.unlink()
+
+        dry_run = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "--checkout-missing"])
+        restored = cached.exists()
+        without = runner.invoke(cli.cli, _DRY_RUN_KEEP_GOING)
+        ran = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+        )
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert not restored, "a dry run restores nothing"
+        assert json.loads(dry_run.stdout) == {
+            "stages": {
+                "alpha/stage_a": {"would_run": False, "reason": "unchanged"},
+                "kept/read_0": {"would_run": True, "reason": "Input dependencies changed"},
+            }
+        }, dry_run.output
+        assert _helper_skipping_lines(dry_run.stderr) == [_READER_SKIPPED], dry_run.output
+        assert without.exit_code == 0, without.output
+        assert json.loads(without.stdout)["stages"].keys() == {"alpha/stage_a"}, without.output
+        assert ran.exit_code == 0, ran.output
+        completed = _helper_completed(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "cached",
+            "kept/read_0": "ran",
+        }, ran.output
+        assert completed["kept/read_0"]["reason"] == "Input dependencies changed", ran.output
+        assert cached.read_text() == "cached bytes"
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "run"])
+def test_repro_all_dry_run_keep_going_refuses_allow_missing(
+    runner: CliRunner, tmp_path: pathlib.Path, dry_run: bool
+) -> None:
+    """R5, D8: --allow-missing with --all --keep-going is a usage error, with or without
+    --dry-run, before anything runs."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+
+        result = runner.invoke(
+            cli.cli,
+            [
+                "repro",
+                "--all",
+                "--keep-going",
+                "--allow-missing",
+                *(["--dry-run"] if dry_run else []),
+            ],
+        )
+
+        assert result.exit_code == 2, result.output
+        assert (
+            "--allow-missing cannot be used with --all --keep-going, which leaves out each stage "
+            + "with a missing input"
+        ) in result.stderr, result.output
+        assert "Skipping:" not in result.output, result.output
+        assert not (cwd / "data" / "alpha" / "stage_a.txt").exists()
+
+
+def test_repro_all_dry_run_keep_going_explain_leaves_out_the_reader(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R5: --explain on A1 explains alpha/stage_a alone; the reader and its downstream stage are
+    not in its stage list, and one `Skipping:` line names the reader."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+
+        result = runner.invoke(cli.cli, ["repro", "--all", "--keep-going", "--explain"])
+
+        assert result.exit_code == 0, result.output
+        assert [line for line in result.output.splitlines() if line.startswith("Stage: ")] == [
+            "Stage: alpha/stage_a"
+        ], result.output
+        assert "Summary: 1 will run, 0 unchanged" in result.output, result.output
+        assert _helper_skipping_lines(result.output) == [_READER_SKIPPED], result.output
+
+
+@pytest.mark.parametrize(
+    ("quiet", "targets", "document"),
+    [
+        pytest.param(
+            False,
+            ["broken/after", "alpha/stage_a"],
+            {"stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}},
+            id="other-target",
+        ),
+        pytest.param(False, ["broken/after"], {"stages": {}}, id="every-target"),
+        pytest.param(True, ["broken/after", "alpha/stage_a"], None, id="quiet"),
+    ],
+)
+def test_repro_all_dry_run_keep_going_left_out_target_fails_after_the_output(
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    quiet: bool,
+    targets: list[str],
+    document: dict[str, object] | None,
+) -> None:
+    """R4 in the dry run: the document for the targets left is printed on stdout (an empty one
+    when none is left), then the command exits 1 naming the left-out target and the missing
+    file, as the run does; under --quiet without --jsonl, which prints nothing, it still exits
+    1."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+        command = ["repro", "--all", "--keep-going", "--dry-run", *targets]
+
+        result = runner.invoke(cli.cli, ["--quiet", *command] if quiet else [*command, "--jsonl"])
+
+        assert result.exit_code == 1, result.output
+        assert _LEFT_OUT_AFTER in result.stderr, result.output
+        assert "Unknown stage" not in result.output, result.output
+        if document is None:
+            assert result.stdout == "", result.output
+        else:
+            assert json.loads(result.stdout) == document, result.output
+
+
+def test_repro_all_dry_run_keep_going_stops_on_a_missing_file_tracked_inside_an_output(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R3 in the dry run: a missing tracked file inside a loaded stage's directory output stops
+    it as it stops the run, naming that file alone; no document is printed and no stage is left
+    out."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+        _helper_write_pipeline(cwd, "m", _MAPPED_SHARED_INPUT_CODE)
+        _helper_track_without_data(cwd / "data" / "m" / "plan" / "c.txt")
+
+        result = runner.invoke(cli.cli, _DRY_RUN_KEEP_GOING)
+        ran = runner.invoke(cli.cli, ["repro", "--all", "--keep-going"])
+
+        overlap = "data/m/plan/c.txt: it is inside output 'data/m/plan' of stage 'm/plan'\n"
+        assert result.exit_code == 1, result.output
+        assert "The following tracked files are missing:\n" in result.stderr, result.output
+        assert overlap in result.stderr, result.output
+        assert "data/raw/missing.txt" not in result.output, result.output
+        assert "Skipping:" not in result.output, result.output
+        assert result.stdout == "", result.output
+        assert ran.exit_code == 1, ran.output
+        assert overlap in ran.stderr, ran.output
+        assert not (cwd / "data" / "alpha" / "stage_a.txt").exists(), "the run runs no stage"
+
+
+def test_dry_run_keep_going_negative_control_without_keep_going_still_raises(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """c4's negative control: the A1 dry run across all pipelines without --keep-going still
+    raises DependencyNotFoundError for the reader, as in 0.10.4, and prints no document."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+
+        result = runner.invoke(cli.cli, ["repro", "--all", "--dry-run", "--jsonl"])
+
+        assert result.exit_code == 1, result.output
+        assert (
+            "Error: Stage 'broken/read_0' depends on input 'missing.txt' "
+            + "(path data/raw/missing.txt), which does not exist"
+        ) in result.stderr, result.output
+        assert "Skipping:" not in result.output, result.output
+        assert result.stdout == "", result.output
+
+
 def test_keep_going_without_all_still_raises(runner: CliRunner, tmp_path: pathlib.Path) -> None:
     """A6 (R6): `repro --keep-going` without --all, from broken/ where discovery finds the
     pipeline, still stops on the missing tracked file before any stage runs."""

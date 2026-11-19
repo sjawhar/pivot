@@ -1341,3 +1341,37 @@ def test_get_stage_explanation_allow_missing_uses_lock_file_hash(
 
     assert "missing" not in result["reason"].lower()
     assert result["will_run"] is False
+
+
+def test_get_stage_explanation_restorable_of_dry_run_keep_going_has_no_lock_fallback(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A dry run that counts restorable tracked files as present (`--all --keep-going
+    --checkout-missing`) takes a missing dependency's hash from a restorable file's .pvt alone:
+    one no restorable file tracks stays missing, though the lock records its hash."""
+    dep = _input_ref("data.csv")
+    state_dir = tmp_path / ".pivot"
+    _write_lock(
+        state_dir,
+        "restorable_stage",
+        {"self:restorable_stage": "abc"},
+        dep_hashes={dep.identity: {"hash": "4321432143214321"}},
+    )
+
+    result = explain.get_stage_explanation(
+        stage_name="restorable_stage",
+        fingerprint={"self:restorable_stage": "abc"},
+        deps={"data": dep},
+        outs=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=state_dir,
+        store=_store(tmp_path),
+        lock_data=_lock(state_dir, "restorable_stage"),
+        restorable=True,
+        tracked_files={},
+        tracked_trie=pygtrie.Trie(),
+    )
+
+    assert result["will_run"] is True
+    assert result["reason"] == "Missing deps: data.csv", result

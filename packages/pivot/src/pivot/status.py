@@ -112,11 +112,16 @@ ORPHANED_REASON_PREFIX = "Orphaned"
 
 
 def _discover_tracked_files(
-    allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
+    allow_missing: bool,
+    all_stages: dict[str, RegistryStageInfo],
+    *,
+    restorable: Collection[str] | None = None,
 ) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
-    """Discover tracked files for .pvt hash lookup when allow_missing is set. A stage's own
-    ``*.pvt`` member of its output is none (``member_skip.own_member_skip``)."""
-    if not allow_missing:
+    """Discover tracked files for .pvt hash lookup when allow_missing is set; else, given
+    ``restorable`` (missing tracked files the cache can restore, as absolute normalized paths),
+    those files alone. A stage's own ``*.pvt`` member of its output is none
+    (``member_skip.own_member_skip``)."""
+    if not allow_missing and not restorable:
         return None, None
 
     project_root = project.get_project_root()
@@ -129,6 +134,9 @@ def _discover_tracked_files(
             config.locate_cache_dir() / "files",
         ),
     )
+    if not allow_missing and restorable:
+        kept = set(restorable)
+        tracked_files = {path: data for path, data in tracked_files.items() if path in kept}
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     for path in tracked_files:
         tracked_trie[pathlib.Path(path).parts] = path
@@ -146,10 +154,12 @@ def _get_explanations_in_parallel(
     tracked_trie: pygtrie.Trie[str] | None = None,
     *,
     known: Collection[str] = (),
+    restorable: bool = False,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing), for each
     stage of ``execution_order`` but ``known``. A known stage's lock is still read: a stage that
-    reads one file of its directory output finds that file's hash in it."""
+    reads one file of its directory output finds that file's hash in it. ``restorable``: as
+    ``explain.get_stage_explanation`` takes it."""
     default_state_dir = config.locate_state_dir()
     pending = [name for name in execution_order if name not in known]
     max_workers = min(8, len(pending))
@@ -187,6 +197,7 @@ def _get_explanations_in_parallel(
                 lock_data=locks[stage_name],
                 force=force,
                 allow_missing=allow_missing,
+                restorable=restorable,
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
                 producer_hashes=producer_hashes,
@@ -238,11 +249,16 @@ def _explanations_for(
     force: bool,
     allow_missing: bool,
     known: Mapping[str, StageExplanation] | None,
+    restorable: Collection[str] | None = None,
 ) -> dict[str, StageExplanation]:
     """Each stage of ``execution_order``'s own explanation, before its upstream is counted
     (``_compute_explanations_with_upstream``): ``known``'s where it holds one, computed with the
-    same ``force`` and ``allow_missing``, else read now."""
-    tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
+    same ``force``, ``allow_missing`` and ``restorable``, else read now. ``restorable`` holds the
+    missing tracked files the cache can restore, which the explanations count as present (a dry
+    run with ``--checkout-missing``); None or empty counts none."""
+    tracked_files, tracked_trie = _discover_tracked_files(
+        allow_missing, all_stages, restorable=restorable
+    )
     with fingerprint_mod.fingerprint_pass():
         for stage_name in execution_order:
             pipeline.ensure_fingerprint(stage_name)
@@ -263,6 +279,7 @@ def _explanations_for(
             tracked_trie=tracked_trie,
             store=_make_workspace_store(pipeline),
             known=reused.keys(),
+            restorable=bool(restorable),
         ),
     }
 
@@ -277,9 +294,11 @@ def get_pipeline_explanations(
     graph: nx.DiGraph[str] | None = None,
     *,
     known: Mapping[str, StageExplanation] | None = None,
+    restorable: Collection[str] | None = None,
 ) -> list[StageExplanation]:
     """Explain each stage of ``stages``' execution order. ``known`` holds explanations already
-    computed with the same ``force`` and ``allow_missing`` (``expand_current``'s)."""
+    computed with the same ``force``, ``allow_missing`` and ``restorable``
+    (``expand_current``'s). ``restorable``: as ``_explanations_for`` takes it."""
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
@@ -300,6 +319,7 @@ def get_pipeline_explanations(
                 force=force,
                 allow_missing=allow_missing,
                 known=known,
+                restorable=restorable,
             )
             explanations = [explanations_by_name[name] for name in execution_order]
             return _compute_explanations_with_upstream(explanations, stage_graph)
@@ -330,19 +350,24 @@ def expand_current(
     force: bool = False,
     allow_missing: bool = False,
     fetched: Mapping[str, listing.DirListing] | None = None,
+    restorable: Collection[str] | None = None,
+    refuse: expansion.InstanceRefusal | None = None,
 ) -> tuple[expansion.Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage (``Pipeline.map``) of ``pipeline`` whose producer is current,
     as a run would before running its instances (``expansion.expand_current``, which takes a
-    listing the cache lacks from ``fetched``).
+    listing the cache lacks from ``fetched``, and refuses a template ``refuse`` refuses).
 
     Whether a producer is current is the explain path's decision (``get_pipeline_explanations``
     over the producers and their upstream stages): its explanation, its upstream counted, says it
     would not run; or, with a remote configured, only that it and its stale upstream stages are
     pullable (``pullable_stages``, by each explanation's ``recovery``): its lock matches, and pull
     restores what it lacks. Every other template stays unexpanded, naming what it waits for.
+    ``restorable`` holds the missing tracked files the cache can restore, which the explanations
+    count as present (``_explanations_for``).
 
     Returns the expansion and the explanations it computed, before their upstream is counted,
-    for the caller to pass on as ``known`` (computed with ``force`` and ``allow_missing``).
+    for the caller to pass on as ``known`` (computed with ``force``, ``allow_missing`` and
+    ``restorable``).
     """
     pipeline.reset_expansions()
     templates = pipeline.list_templates()
@@ -365,6 +390,7 @@ def expand_current(
                     force=force,
                     allow_missing=allow_missing,
                     known=None,
+                    restorable=restorable,
                 )
                 if order
                 else {}
@@ -399,6 +425,7 @@ def expand_current(
                 default_state_dir=default_state_dir,
                 cache_dir=files_dir,
                 fetched=fetched,
+                refuse=refuse,
             )
             return result, raw
     finally:

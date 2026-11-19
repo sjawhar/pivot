@@ -197,8 +197,9 @@ class _MapRun:
     # expand over the same keys; the engine's own record, kept after the run
     # (``Engine.expansion_keys``)
     keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
-    # The keys a template expands when the run's targets name instances (``_mapped_targets``),
-    # each with the targets that need it; a template it does not hold expands every key
+    # The keys a template expands when the run's targets name instances
+    # (``expansion.mapped_targets``), each with the targets that need it; a template it does not
+    # hold expands every key
     wanted: dict[str, dict[str, set[str]]]
     stage_order: list[str]
     all_stages: dict[str, RegistryStageInfo]
@@ -362,56 +363,6 @@ def _refuse_single_stage_templates(
     for name in stages:
         if name in templates:
             raise expansion.single_stage_refusal(name, templates[name])
-
-
-def _mapped_targets(
-    stages: list[str], templates: dict[str, registry.MapTemplate]
-) -> tuple[list[str], dict[str, dict[str, set[str]]]]:
-    """Run targets ``stages`` with each instance name (``<template>@<key>``) replaced by its
-    template, and the keys each template expands so the run adds the named instances alone,
-    each with its chain: an instance's key for its template and for every template that one is
-    mapped over, each key with the targets that need it. A template named itself, or upstream
-    of one named itself, expands every key and has no entry; so does every template when no
-    target names an instance.
-
-    The instances of a run's expansions are gone when this is called (``reset_expansions``), so
-    a watch run's affected instance and a name the user gave are both reached this way.
-    """
-    # Each template's keys, each with the targets that need it; None for every key
-    wanted = dict[str, dict[str, set[str]] | None]()
-    targets = list[str]()
-    for stage in stages:
-        target = registry.run_target(stage, templates)
-        targets.append(target)
-        if target not in templates:
-            continue
-        if target == stage:
-            wanted[target] = None
-            continue
-        keys = wanted.setdefault(target, dict[str, set[str]]())
-        if keys is not None:
-            keys.setdefault(stage.removeprefix(f"{target}@"), set[str]()).add(stage)
-    pending = list(wanted)
-    while pending:
-        name = pending.pop()
-        keys = wanted[name]
-        for upstream in {dep for dep in templates[name]["mapped_deps"].values() if dep is not None}:
-            before = wanted.get(upstream, dict[str, set[str]]())
-            if upstream in wanted and before is None:
-                continue
-            if keys is None:
-                wanted[upstream] = None
-                pending.append(upstream)
-                continue
-            merged = {key: set(needing) for key, needing in (before or {}).items()}
-            for key, needing in keys.items():
-                merged.setdefault(key, set[str]()).update(needing)
-            if upstream in wanted and merged == before:
-                continue
-            wanted[upstream] = merged
-            pending.append(upstream)
-    filtered = {name: keys for name, keys in wanted.items() if keys is not None}
-    return list(dict.fromkeys(targets)), filtered
 
 
 def _unknown_keys_reason(template: str, missing: list[str], wanted: dict[str, set[str]]) -> str:
@@ -1704,7 +1655,7 @@ class Engine:
         # reached through its template, which then adds that instance alone, with its chain
         wanted = dict[str, dict[str, set[str]]]()
         if stages:
-            stages, wanted = _mapped_targets(stages, templates)
+            stages, wanted = expansion.mapped_targets(stages, templates)
         # A run across all pipelines that keeps going past failures, outside a watch or serve
         # session, leaves out only the stages that read a tracked file still missing after the
         # restore, as it leaves out those with any other missing input (leave-out mode). It
@@ -1791,16 +1742,13 @@ class Engine:
             # A target left out for a missing input, its stage's or one upstream of it, is no
             # unknown stage: the run runs the other targets, and the command then fails naming
             # it (``left_out_targets``)
-            for target in targets:
-                run_target = registry.run_target(target, templates)
-                if run_target in left_out:
-                    self._left_out_targets[target] = left_out[run_target]
+            self._left_out_targets = expansion.left_out_targets(targets, templates, left_out)
             if self._left_out_targets:
                 targets = [t for t in targets if t not in self._left_out_targets]
                 if not targets:
                     # No target is left; get_execution_order would take no target as every stage
                     return {}
-                stages, wanted = _mapped_targets(targets, templates)
+                stages, wanted = expansion.mapped_targets(targets, templates)
         if dep_errors:
             graph = engine_graph.build_graph(runnable)
         all_stages = {name: info for name, info in runnable.items() if name not in templates}
