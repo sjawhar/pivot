@@ -588,12 +588,17 @@ def prepare_worker_info(
     # The workers started with other digests: the coordinator loaded user code since then.
     if (digests := loaded_source.digests_for_stage()) is not None:
         info["loaded_sources"] = digests
-    # How the worker gets each submodule the stage reads through its package: `read_submodules`.
-    delivery = loaded_source.submodule_delivery(stage_info.get("read_submodules", {}))
-    if delivery.sent:
-        info["sent_submodules"] = delivery.sent
-    if delivery.imported:
-        info["imported_submodules"] = delivery.imported
+    # How the worker gets each submodule the stage reads through its package (`read_submodules`):
+    # by what cloudpickle carries of it by value in the call built so far, which holds the stage;
+    # the call's other arguments hold none of its code. A stage that reads none pays nothing.
+    if names := stage_info.get("read_submodules"):
+        delivery = loaded_source.submodule_delivery(
+            names, loaded_source.carried_submodules(info, names)
+        )
+        if delivery.sent:
+            info["sent_submodules"] = delivery.sent
+        if delivery.imported:
+            info["imported_submodules"] = delivery.imported
     return info
 
 

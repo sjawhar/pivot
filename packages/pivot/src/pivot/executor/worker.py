@@ -961,15 +961,23 @@ def _bind_sent_submodules(modules: Sequence[ModuleType]) -> None:
 
 
 def _import_read_submodules(names: Sequence[str]) -> None:
-    """Import each of `names` (`WorkerStageInfo.imported_submodules`) by name, as the import of
-    the code sent by reference that reads it through its package would, which binds it there. The
-    import goes through this process's import machinery, as every import this worker makes by
-    name does (the import hooks, and discovery's loader while an import session lasts), so the
-    source it loads is recorded and the check of the code the stage used sees it
-    (`_untrusted_modules`); a module this process holds already is not loaded again, as no second
-    import loads it."""
+    """Import each of `names` (`WorkerStageInfo.imported_submodules`) by name, as a plain run
+    imports it, which binds it on its package: nothing the stage's pickle holds belongs to it
+    (`loaded_source.submodule_delivery`). The import goes through this process's import
+    machinery, as every import this worker makes by name does (the import hooks, and discovery's
+    loader while an import session lasts), so the source it loads is recorded and the check of the
+    code the stage used sees it (`_untrusted_modules`); a module this process holds already is not
+    loaded again, as no second import loads it. An import that raises gets a note that names the
+    module, which the stage's failure shows after the error (`_execute_stage`)."""
     for name in names:
-        importlib.import_module(name)
+        try:
+            importlib.import_module(name)
+        except Exception as exc:
+            exc.add_note(
+                f"Pivot imported {name} by name before the stage ran: the stage reads it through "
+                + "its package."
+            )
+            raise
 
 
 def _make_result(
@@ -1009,8 +1017,6 @@ def _execute_stage(
     # and its output writers may read such a module through its package.
     if "sent_submodules" in stage_info:
         _bind_sent_submodules(stage_info["sent_submodules"])
-    if "imported_submodules" in stage_info:
-        _import_read_submodules(stage_info["imported_submodules"])
     # ``cache_dir`` is the cache root the engine resolved from config (the directory holding
     # ``files/``), as spelled there: the naming lock lives in it, the same file `pivot gc`
     # locks. The store's object root is resolved, so a ``files`` symlink would move its parent.
@@ -1040,6 +1046,14 @@ def _execute_stage(
     # may have stale cwd from previous execution in different project).
     # _queue_logging captures log messages to the output queue (for TUI display).
     with contextlib.chdir(project_root), _queue_logging(stage_name, output_queue):
+        # The submodules this worker imports by name, after the binding above and before anything
+        # of the stage runs. A failure fails the stage as a failure of its code does: its reason
+        # is the traceback, which ends with a note that names the module.
+        if "imported_submodules" in stage_info:
+            try:
+                _import_read_submodules(stage_info["imported_submodules"])
+            except Exception:
+                return _make_result(StageStatus.FAILED, traceback.format_exc(), ring_buffer)
         no_commit = stage_info["no_commit"]
 
         production_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_info["state_dir"]))

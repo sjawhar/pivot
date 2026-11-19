@@ -182,7 +182,7 @@ and a thread native code starts outside `_thread`:
   dynamically. Upgrading from 0.10.4, a stage that reaches a library installed
   from git, a local directory or a local wheel or sdist gains that library's
   `dist:` key, so it reruns once as Code changed, and a stage that reaches none
-  keeps its lock; the fingerprint caches' schema goes from 43 to 44, so Pivot
+  keeps its lock; the fingerprint caches' schema goes from 43 to 45, so Pivot
   computes each stage's manifest once more, which reruns nothing. Upgrading
   from 0.5.6 or earlier, every stage with outputs reruns
   once as Code changed, because each output's tag (`out:<key>:tag`) joined the

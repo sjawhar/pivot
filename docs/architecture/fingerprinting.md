@@ -40,7 +40,7 @@ Pivot's fingerprinting system:
 | Default arguments | Yes (value) | `__defaults__`/`__kwdefaults__` checked like module-level values; a literal default is covered by the AST hash |
 | `functools.partial` | Yes | Bound args + underlying function; functions and classes in bound args walked like stage helpers |
 | Library functions and classes | Yes (name) | A global, closure cell, default or partial holding `np.mean` records `ext:<binding>` → `numpy.mean`, so rebinding it to `np.median` reruns the stage; the walk does not hash the callable's code (when it comes from a library installed from git, a local path or a local archive, the library's installed files are hashed: see the `dist:` row below) |
-| Library modules | Yes (name, not in the lock) | A library module read as a global (`np` in `np.mean(x)`) or imported in a function body, and the module that defines each library callable, is recorded by the walk as `byname:<module>`, which the worker-import check and the manifest cache read. So is the module of the library code a stage reaches where no other entry names it (`fingerprint._reached_library_module`): a library base class of a user class, a library class in a type hint or a class-body annotation, a library class, instance, enum member or exception inside a value (a partial, a default, a loader's config), each library class on a pivot loader class's MRO, a stage function that is library code, and a library callable whose `__module__` is not a string (recorded as the library module that binds it under its own name). At those places a standard-library module (`builtins` included) and a module in one of pivot's own packages are not recorded. The worker-import check covers these entries too, so a project file that shadows such a module is refused as one that shadows a module read as a global is. The stage fingerprint a lock records leaves these entries out (`fingerprint.as_locked`), so locks written before they existed stay current. Its attributes and code are not read, but for a submodule bound on it through which user code is reached (`fingerprint.bound_submodule`: a plain module, not a module subclass such as six's lazy `six.moves`, that `sys.modules` holds under its name; user code there is a user module with a source file, or a package that holds one): the project's part of a package it shares with an installed library, read through the package's name (`company.local.f()` after `import company.local`, where `company` is a namespace package with a directory in `site-packages`, or a library package whose `__init__` extends its `__path__`), is walked as a user module read as a global is (`module:company.local`, `func:company.local.f`), and a library submodule on the way (`company.sub` in `company.sub.local.f()`) is recorded by name and followed in turn (`fingerprint._process_user_submodules`). Each submodule read so gets a `submodule:<name>:<module>` key for each module whose code reads it so (the module left empty for code cloudpickle sends by value whatever its module), which a lock leaves out as it leaves out the `byname:` entries, and by which the stage's worker gets it the way that code reaches the worker (see [Imports a Stage Makes While It Runs](#imports-a-stage-makes-while-it-runs)); a manifest cache hit re-reads which such submodules each package holds, so one bound on it since is walked |
+| Library modules | Yes (name, not in the lock) | A library module read as a global (`np` in `np.mean(x)`) or imported in a function body, and the module that defines each library callable, is recorded by the walk as `byname:<module>`, which the worker-import check and the manifest cache read. So is the module of the library code a stage reaches where no other entry names it (`fingerprint._reached_library_module`): a library base class of a user class, a library class in a type hint or a class-body annotation, a library class, instance, enum member or exception inside a value (a partial, a default, a loader's config), each library class on a pivot loader class's MRO, a stage function that is library code, and a library callable whose `__module__` is not a string (recorded as the library module that binds it under its own name). At those places a standard-library module (`builtins` included) and a module in one of pivot's own packages are not recorded. The worker-import check covers these entries too, so a project file that shadows such a module is refused as one that shadows a module read as a global is. The stage fingerprint a lock records leaves these entries out (`fingerprint.as_locked`), so locks written before they existed stay current. Its attributes and code are not read, but for a submodule bound on it through which user code is reached (`fingerprint.bound_submodule`: a plain module, not a module subclass such as six's lazy `six.moves`, that `sys.modules` holds under its name; user code there is a user module with a source file, or a package that holds one): the project's part of a package it shares with an installed library, read through the package's name (`company.local.f()` after `import company.local`, where `company` is a namespace package with a directory in `site-packages`, or a library package whose `__init__` extends its `__path__`), is walked as a user module read as a global is (`module:company.local`, `func:company.local.f`), and a library submodule on the way (`company.sub` in `company.sub.local.f()`) is recorded by name and followed in turn (`fingerprint._process_user_submodules`). Each submodule read so gets a `submodule:<name>` key, which a lock leaves out as it leaves out the `byname:` entries, and the stage's worker gets each as what cloudpickle carries of it with the stage decides (see [Imports a Stage Makes While It Runs](#imports-a-stage-makes-while-it-runs)); a manifest cache hit re-reads which such submodules each package holds, so one bound on it since is walked |
 | Libraries installed from git, a local path or a local archive | Yes (installed files, `dist:<name>`) | Each distribution that owns the module of one of the stage's `byname:` entries (a loader's included) and whose `direct_url.json` (PEP 610) has `vcs_info`, `dir_info` without `editable: true`, or `archive_info` with a `file:` URL (a local wheel or sdist), and each such distribution a reached one requires, directly or through others, gives the stage's manifest a `dist:<name>` key: a hash of the distribution's own installed files, read from disk. The lock records it, so a change to those files reruns the stage, and a reinstall of the same files from another commit, path, installer or virtual environment reruns nothing. See [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path) |
 | Libraries from a package index or a remote archive; editable installs; pivot | No key | A distribution with no `direct_url.json` (a package-index or `--find-links` install), with `archive_info` and a URL whose scheme is not `file`, or with `dir_info` and `editable: true` gets no `dist:` key, so a version bump of a package-index library reruns what it reran before this key existed: only a change to an entry the walk records for it (an `ext:` definition name, the `self:` hash of a stage function it defines, a loader's `load`, `save` and `empty`). Nor does pivot's own distribution (one with a RECORD file in one of pivot's package directories) get a key, and its requirements are not followed. An editable install whose source lies outside the interpreter's prefix and outside every `site-packages` or `dist-packages` directory is user code, walked like the project's own |
 | Secrets outside a stage's params | Yes (digest) | A `SecretStr`, `SecretBytes` or `Secret[T]` in a `StageParams` default on a helper, a loader config field or a partial argument hashes as its keyed `hmac:` digest, the one the lock file records (`parameters.secret_digest`), so changing it reruns the stage without its value in any manifest |
@@ -204,10 +204,13 @@ before the stage ran (the covered thread rule, `_StageImports`):
   other time is counted, even when a covered import later imports it. The comparison cannot tell
   which thread registered a key, so this part is by time.
 
-A covered module is never imported ahead of the stage, but in one case: a submodule that only code
-sent by reference reads through its package, which the worker imports by name as that code's own
-import would (below). Discovery pickles `pipeline.py` and other modules under the project root by
-value, and importing one of them in the worker would run it again there.
+Discovery pickles `pipeline.py` and other modules under the project root by value, and importing
+one of them in the worker would run it again there, so a covered module is not imported ahead of
+the stage. There is one exception: a submodule the stage reads through its package of which
+cloudpickle carries nothing with the stage, which the worker imports by name before the stage
+runs (below). A plain run makes that import too, in the module of the code that reads the
+submodule, which reaches the worker by reference, or in `pipeline.py`, so it runs nothing a plain
+run does not.
 
 The worker imports by name each package cloudpickle sends by reference: a namespace package the
 project shares with an installed library (`company`, with a directory in `site-packages` and one in
@@ -219,54 +222,66 @@ what its import bound. In the worker, code that cloudpickle sends by value runs 
 module's imports, and cloudpickle builds a module it sends by value as a new module object, which
 no package holds.
 
-So the walk records each submodule a stage reads through a library package, once for each module
-whose code reads it so (`submodule:` keys, outside the lock, see
-[Manifest Key Prefixes](#manifest-key-prefixes)). For a `@no_fingerprint` stage, whose code the
-walk does not read, a scan of the stage function's own code and its nested code finds them by the
-same rules (`fingerprint.submodule_entries`); its loaders are walked as any stage's are. The
-registry keeps them beside the stage's fingerprint (`RegistryStageInfo.read_submodules`).
+So the walk records each submodule a stage reads through a library package (`submodule:` keys,
+outside the lock, see [Manifest Key Prefixes](#manifest-key-prefixes)). For a `@no_fingerprint`
+stage, whose code the walk does not read, a scan of the stage function's own code and its nested
+code finds them by the same rules (`fingerprint.submodule_entries`); its loaders are walked as any
+stage's are. The registry keeps their names beside the stage's fingerprint
+(`RegistryStageInfo.read_submodules`).
 
-A submodule reaches the worker the way the code that reads it does
-(`loaded_source.submodule_delivery`), for each one bound on its package in the coordinator
-(`fingerprint.bound_submodule`):
+How each one bound on its package in the coordinator (`fingerprint.bound_submodule`) reaches the
+worker is decided by what cloudpickle carries of it with the stage. For a stage that reads at
+least one, the coordinator pickles the worker's call once more, before any submodule is added to
+it, with a pickler that records, for each such submodule, whether cloudpickle pickles something
+of it by value (`loaded_source.carried_submodules`): the module object itself (cloudpickle adds
+to a function it pickles by value each submodule of a package the function reads as a global,
+where the function's code names the submodule), or a function or class whose `__module__` names
+it. A stage that reads none pays nothing.
 
-- **Read by code cloudpickle sends by value.** That is the code of a module it sends by value,
-  and, wherever its module is, a lambda, a function defined in another (`<locals>` in its
-  qualified name), a function of `__main__` and a function with no module name. The module object
-  is sent with the stage (`WorkerStageInfo.sent_submodules`). It travels in the stage's pickle,
-  so it is the object the stage's functions hold (`from company import local`). The worker binds
-  it on its package before anything of the stage runs (parameter overrides, input loaders, the
-  stage, output writers), as an import binds a submodule (`worker._bind_sent_submodules`). The
-  binding imports nothing and adds nothing to `sys.modules`. A sent module that cloudpickle
-  pickles by reference (`company/local.py` in a `PYTHONPATH` entry) is imported by name as the
-  worker unpickles the stage, which binds it.
-- **Read only by other code.** That is the functions, methods and property getters of modules the
-  worker imports by name (a helper module in a `PYTHONPATH` entry). The worker imports the
-  submodule by name, as that code's own import would (`WorkerStageInfo.imported_submodules`,
-  `worker._import_read_submodules`). The import runs after the binding and before the parameter
-  overrides and input loaders, before the stage's import window opens. It goes through the
-  worker's import machinery, as every import the worker makes by name does, so the worker records
-  the source it loads and the check of the modules the stage used compares it with the
-  coordinator's record (below). Nothing of its values is pickled.
+- **Carried by value.** The module object is sent with the stage
+  (`WorkerStageInfo.sent_submodules`). It travels in the stage's pickle, so pickle's memo makes
+  it the module that the carried values belong to: a stage that holds `Mode`
+  (`from company.local import Mode`) and calls `company.local.run(Mode.FAST)` passes the class
+  that `run` compares with. The worker binds it on its package before anything of the stage runs
+  (parameter overrides, input loaders, the stage, output writers), as an import binds a submodule
+  (`worker._bind_sent_submodules`). The binding imports nothing and adds nothing to
+  `sys.modules`. A sent module that cloudpickle pickles by reference (`company/local.py` in a
+  `PYTHONPATH` entry, of which the stage holds a lambda) is imported by name as the worker
+  unpickles the stage, which binds it.
+- **Nothing carried.** Nothing the stage's pickle holds belongs to the module: the code that reads
+  it reaches the worker by reference (a helper module in a `PYTHONPATH` entry, whatever its
+  function's form: a lambda, a method, a function under a decorator), or reads it only in nested
+  code (a lambda in the stage), whose names cloudpickle does not follow. The worker imports the
+  submodule by name, as a plain run's import does (`WorkerStageInfo.imported_submodules`,
+  `worker._import_read_submodules`). The import runs
+  after the binding and before the parameter overrides and input loaders, before the stage's
+  import window opens. It goes through the worker's import machinery, as every import the worker
+  makes by name does, so the worker records the source it loads and the check of the modules the
+  stage used compares it with the coordinator's record (below). Nothing of its values is pickled,
+  so a module-level value that cloudpickle cannot pickle (a `threading.Lock`) does not stop the
+  stage. An import that raises fails the stage before anything of it runs, as a failure of the
+  stage's code does: the failure's reason is the import's traceback, which ends with a note that
+  names the module.
 
-A reader counts as code sent by value only in the certain cases above. One taken for code sent by
-reference by mistake is harmless: its submodule is imported by name instead. One taken for code
-sent by value by mistake would pickle the submodule's module-level values with the stage, and
-cloudpickle may not be able to pickle them (a `threading.Lock`). A module the stage reaches by
+When that extra pickling raises, the worker imports each such submodule by name, and the
+pickling of the call raises the same error, which fails the stage. A module the stage reaches by
 other names only (`from company.local import f`) is neither sent nor imported. The binding leaves
 alone a package the worker does not hold when the stage starts: nothing the stage's pickle holds
 refers to it.
 
-Two stated limits. A stage body that imports such a library package itself (`import company`
+Three stated limits. A stage body that imports such a library package itself (`import company`
 inside the stage, which no function the stage's pickle holds reads as a global) gets it without
 the module. Only a library's regular package whose `__init__` extends its `__path__`
 (`pkgutil.extend_path`) reaches this, since Pivot refuses such a body import of a namespace
-package with a directory in the project. And the scan of a `@no_fingerprint` stage does not read
-a helper module the stage calls. A module that only a helper under the project root reads
-through its package reaches the worker neither way, and the stage fails there with
+package with a directory in the project. The scan of a `@no_fingerprint` stage does not read a
+helper module the stage calls. A module that only a helper under the project root reads through
+its package reaches the worker neither way, and the stage fails there with
 `AttributeError: module 'company' has no attribute 'local'`. A helper the worker imports by name
 (one in a `PYTHONPATH` entry) works when it imports the module itself, as its own import binds
-it.
+it. And a module of which cloudpickle carries only a function or class by value (the stage holds
+`Mode`, and only a helper in a `PYTHONPATH` entry reads the module through its package) is sent
+whole, so a module-level value of it that cloudpickle cannot pickle fails the stage, as it does
+where the stage's own code reads the module through its package.
 
 A recorded module outside the covered set makes the result not reusable: the stage succeeds and
 logs one warning naming the modules; its lock carries an `uncovered-import:<modules>` key no
@@ -313,7 +328,7 @@ a thread native code starts outside `_thread`. Each has a remedy:
 | A package resource read through `importlib.resources` (`files(helpers).joinpath("table.txt")`) | It is data, not code: declare it with `pipeline.input` |
 | A module created without a source file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) | It has no source to fingerprint; a change to it is a change to the library or interpreter that created it |
 | `pivot repro --no-commit`, then `pivot commit` of outputs edited by hand since that run | `pivot commit` records them against the static fingerprint, the "trust me" path. Outputs the run wrote, unchanged since, are recorded with the manifest the run kept in StateDB (`nocommit:<stage>`), its mark included, so the stage still reruns |
-| A result cached by an earlier Pivot version | If its static fingerprint is unchanged, it may be reused, from its lock, which Pivot reads as it is, or from its run-cache entry, which Pivot finds under the key that version filed it under (unmarked, with each directory the stage reads whole hashed from its listing the way that version hashed it: `worker.older_pivot_input_hash`, `listing.legacy_digest`). `_CACHE_SCHEMA_VERSION` keys only the fingerprint caches in state.lmdb, not the lock or run cache. A stage whose static walk reaches a user class method or a user module gains entries in its manifest, so it reruns once as Code changed after the upgrade. That accepted one-time rerun writes the current manifest; later runs reuse it until code or inputs change. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically. Upgrading from 0.10.4, a stage that reaches a library installed from git, a local path or a local archive gains that library's `dist:` key, so it reruns once as Code changed; so does a stage that reads the project's module through a library package (`company.local.f()` after `import company.local`, where `company` is a namespace package shared with an installed library), which gains that module's `module:` and `func:` entries (0.10.4 ran such a stage without them where its worker imported the module by name, from a `PYTHONPATH` entry or a `src` layout, and failed it in the worker where discovery sent the module by value); a stage that reaches neither keeps its lock. The same upgrade moves `_CACHE_SCHEMA_VERSION` from 43 to 44, so each stage's manifest is computed once more instead of read from the manifest cache; that alone reruns nothing, because the `byname:` and `submodule:` entries the new version records never reach a lock. Upgrading from 0.5.6 or earlier, every stage with outputs reruns once as Code changed, because each output's tag (`out:<key>:tag`) joined the manifest; that run is checked, so it marks a stage that imports dynamically |
+| A result cached by an earlier Pivot version | If its static fingerprint is unchanged, it may be reused, from its lock, which Pivot reads as it is, or from its run-cache entry, which Pivot finds under the key that version filed it under (unmarked, with each directory the stage reads whole hashed from its listing the way that version hashed it: `worker.older_pivot_input_hash`, `listing.legacy_digest`). `_CACHE_SCHEMA_VERSION` keys only the fingerprint caches in state.lmdb, not the lock or run cache. A stage whose static walk reaches a user class method or a user module gains entries in its manifest, so it reruns once as Code changed after the upgrade. That accepted one-time rerun writes the current manifest; later runs reuse it until code or inputs change. Run `pivot repro --force <stage>` once to re-check a stage you know imports dynamically. Upgrading from 0.10.4, a stage that reaches a library installed from git, a local path or a local archive gains that library's `dist:` key, so it reruns once as Code changed; so does a stage that reads the project's module through a library package (`company.local.f()` after `import company.local`, where `company` is a namespace package shared with an installed library), which gains that module's `module:` and `func:` entries (0.10.4 ran such a stage without them where its worker imported the module by name, from a `PYTHONPATH` entry or a `src` layout, and failed it in the worker where discovery sent the module by value); a stage that reaches neither keeps its lock. The same upgrade moves `_CACHE_SCHEMA_VERSION` from 43 to 45, so each stage's manifest is computed once more instead of read from the manifest cache; that alone reruns nothing, because the `byname:` and `submodule:` entries the new version records never reach a lock. Upgrading from 0.5.6 or earlier, every stage with outputs reruns once as Code changed, because each output's tag (`out:<key>:tag`) joined the manifest; that run is checked, so it marks a stage that imports dynamically |
 
 ### Code Edited After Discovery
 
@@ -536,10 +551,11 @@ Limits of the comparison:
 A worker imports some user modules itself, from their files: a stage's module discovery does not
 send by value (outside the root, or under it in a `src` layout), a module outside the root that
 one sent by value refers to, a submodule the stage reads through its package that the
-coordinator sends by reference with the stage or that only code sent by reference reads, which
-the worker imports by name before the stage runs (`loaded_source.submodule_delivery`, above), and
-any module a stage body imports. Such a module holds the file as
-the worker read it, which may be before or after an edit. Each worker gets the coordinator's
+coordinator sends with the stage while cloudpickle pickles it by reference, or of which
+cloudpickle carries nothing with the stage, which the worker imports by name before the stage
+runs (`loaded_source.submodule_delivery`, above), and any module a stage body imports. Such a
+module holds the file as the worker read it, which may be before or after an edit. Each worker
+gets the coordinator's
 records (`loaded_source.digests()`: each module's name, resolved path and digest) once, in its
 initializer arguments (`core._init_worker`), and each stage carries only their token
 (`WorkerStageInfo.loaded_sources_token`), plus the records themselves when the coordinator loaded
@@ -990,7 +1006,7 @@ The fingerprint manifest uses prefixed keys to distinguish different types of tr
 | `wire:` | Call-site artifact wiring: parameter bindings, collection kind/order, input paths | `wire:left` → `raw-a`, `wire:items` → `{"kind":"list","identities":["a","b"]}`, `wire:file:path` → `old.txt` |
 | `partial:` | `functools.partial` bound arguments | `partial:myproject.stage.bound.args` |
 | `ext:` | A library function or class a stage reads, named by its definition (the walk does not hash its code) | `ext:myproject.stages.agg` → `numpy.mean` |
-| `submodule:` | `submodule:<name>:<module>`, with an empty value: submodule `<name>`, which a stage reads through the library package that holds it (`company.local` in `company.local.f()`), and the module of one function whose code reads it so, empty for a function cloudpickle sends by value whatever its module. A loader's `submodule:` keys join the stage's own without the `dep:`/`out:` prefix. A lock leaves them out (`fingerprint.as_locked`). What they decide: [Imports a Stage Makes While It Runs](#imports-a-stage-makes-while-it-runs) | `submodule:company.local:helper`, `submodule:company.local:` |
+| `submodule:` | `submodule:<name>`, with an empty value: submodule `<name>`, which a stage reads through the library package that holds it (`company.local` in `company.local.f()`). A loader's `submodule:` keys join the stage's own without the `dep:`/`out:` prefix. A lock leaves them out (`fingerprint.as_locked`). What they decide: [Imports a Stage Makes While It Runs](#imports-a-stage-makes-while-it-runs) | `submodule:company.local` |
 | `byname:` | A module a stage's worker imports by name to run code the walk does not hash: a library module read as a global or imported in a function body, the module that defines each `ext:` callable, and the module of the library code a stage reaches through a base class, a type hint or class-body annotation, a value, a pivot loader class, its own stage function, or a callable whose `__module__` is not a string (see [What Gets Tracked](#what-gets-tracked)). Compared with the module the worker would import (`loaded_source.check_worker_imports`), and re-resolved on a manifest cache hit. A loader's `byname:` entries join the stage's own without the `dep:`/`out:` prefix (`fingerprint.merge_loader_fingerprint`), so only a key that starts with `byname:` is one, and a dependency or output named `byname` keeps its entries. Its modules are the ones `dist:` keys come from. Recorded by the walk and the manifest cache only: a lock leaves it out (`fingerprint.as_locked`) | `byname:numpy` |
 | `dist:` | `dist:<name>`: the installed files of a distribution installed from git, a local path or a local archive, not editable, that owns the module of a `byname:` entry, or that such a distribution requires, directly or through others. `<name>` is the PEP 503 name (lower case, each run of `-`, `_` and `.` made one `-`) read from its `.dist-info` directory's name. The value is the xxh64 hex of the compact JSON array, sorted, of the content digest of each install of that name that gives the stage this key; a content digest is the xxh64 hex of the compact JSON array, in path order, of `[path, digest]` for each hashed file, `digest` being the xxh64 hex of the file's bytes read from disk, or `null` for a file that is missing or cannot be read, and the distribution's own `entry_points.txt` being named `.dist-info/entry_points.txt` (`installed_distributions.content_digest`, `key_value`). Added after the manifest cache and recorded in the lock: see [Libraries Installed from Git or a Local Path](#libraries-installed-from-git-or-a-local-path) | `dist:fix-lib` |
 | `loader:` | Loader class methods and config | `loader:pivot.loaders.CSV:load` |

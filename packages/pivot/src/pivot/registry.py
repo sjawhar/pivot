@@ -56,12 +56,12 @@ class RegistryStageInfo(TypedDict):
         input_paths: Project-relative paths by input artifact identity, for the wiring manifest.
         unsafe_fingerprint: The fingerprint was computed with a refusal downgraded to a
             warning (unsafe fingerprinting), so the run cache neither files nor reuses results.
-        read_submodules: The submodules the stage reads through the library packages that hold
-            them, each with its readers (`fingerprint.read_submodules`), set with the fingerprint
-            (`ensure_fingerprint`), for a `@no_fingerprint` stage too: the fingerprint, as a lock
-            records it, leaves out the entries that name them, and the coordinator decides from
-            them how the stage's worker gets each (`executor.core.prepare_worker_info`). Absent
-            while the fingerprint is not computed.
+        read_submodules: The names of the submodules the stage reads through the library
+            packages that hold them, sorted (`fingerprint.read_submodules`), set with the
+            fingerprint (`ensure_fingerprint`), for a `@no_fingerprint` stage too: the fingerprint,
+            as a lock records it, leaves out the entries that name them, and the coordinator
+            decides from them how the stage's worker gets each
+            (`executor.core.prepare_worker_info`). Absent while the fingerprint is not computed.
     """
 
     func: Callable[..., Any]
@@ -81,7 +81,7 @@ class RegistryStageInfo(TypedDict):
     code_deps: list[str]
     input_paths: dict[str, str]
     unsafe_fingerprint: bool
-    read_submodules: NotRequired[dict[str, fingerprint.SubmoduleReaders]]
+    read_submodules: NotRequired[tuple[str, ...]]
 
 
 class MapTemplate(TypedDict):
@@ -560,10 +560,10 @@ class ComputedFingerprint(NamedTuple):
     manifest: dict[str, str]
     # A refusal in it was downgraded to a warning (unsafe fingerprinting).
     unsafe: bool
-    # The submodules the stage reads through the library packages that hold them, with their
-    # readers (`fingerprint.read_submodules`), read from the whole manifest before the lock
-    # leaves out the entries that name them.
-    read_submodules: dict[str, fingerprint.SubmoduleReaders]
+    # The names of the submodules the stage reads through the library packages that hold them
+    # (`fingerprint.read_submodules`), read from the whole manifest before the lock leaves out
+    # the entries that name them.
+    read_submodules: tuple[str, ...]
 
 
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> ComputedFingerprint:

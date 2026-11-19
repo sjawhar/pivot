@@ -9,8 +9,9 @@ other one, and an edit to the project's file would read `cached`. Fingerprinting
 started as a worker starts before it raises.
 
 A submodule the program holds bound on a library package, which a stage reads through the
-package's name, is what the walk follows and records with each module whose code reads it so, so
-that its worker finds it bound there (`fingerprint.bound_submodule`, `fingerprint.read_submodules`,
+package's name, is what the walk follows and records, so that its worker finds it bound there,
+sent with the stage or imported by name as what cloudpickle carries of it with the stage decides
+(`fingerprint.bound_submodule`, `fingerprint.read_submodules`, `loaded_source.carried_submodules`,
 `loaded_source.submodule_delivery`): a plain module with a source file, or a namespace package of
 the project's, that `sys.modules` holds under its name, re-read on a manifest cache hit, and, for a
 `@no_fingerprint` stage, found by a scan of the stage's own code.
@@ -855,12 +856,9 @@ with Pipeline("p") as pipeline:
 """
 # Functions that read `wi_scan.local` through its package's name in their own code, only in a
 # lambda, as a lambda, through a closure cell that holds the package, also beside a cell its
-# factory left empty, as a function of `__main__`, as one with no module name, through
-# `wi_scan.sub`, or only in the project module `scanned_helper` they call; the stage calls the
-# first.
+# factory left empty, through `wi_scan.sub`, or only in the project module `scanned_helper` they
+# call; the stage calls the first.
 _SCANNED_PIPELINE = """\
-import types
-
 import scanned_helper
 import wi_scan.local
 
@@ -902,10 +900,6 @@ def _with_an_empty_cell(bound: bool):
 
 
 with_an_empty_cell = _with_an_empty_cell(False)
-in_main = types.FunctionType(own_code.__code__, {**globals(), "__name__": "__main__"})
-with_no_module_name = types.FunctionType(
-    own_code.__code__, {name: value for name, value in globals().items() if name != "__name__"}
-)
 
 
 def through_a_deeper_package() -> str:
@@ -1022,16 +1016,16 @@ def test_a_refusal_reached_through_a_submodule_of_a_library_package_names_the_su
     ) in message, message
 
 
-def test_the_readers_of_a_submodule_read_through_its_package_are_joined_from_every_part_of_a_walk(
+def test_a_submodule_read_in_several_parts_of_a_walk_is_one_name_sent_with_the_stage(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`wi_joined` is a namespace package the program holds with a directory in `site-packages`
     and one in the project root, whose `local.py` `pipeline.py` imports. The stage calls
     `ra.plain()` and `rz.plain()`, two project modules that each read `wi_joined.local` through
-    the package's name, and its output writer's `save` reads it so too. The submodule the registry
-    keeps beside the stage's fingerprint names all three modules as its readers, the writer's
-    `pipeline` and `ra` and `rz`, each read in its own part of the walk, and discovery sends each
-    by value, so the coordinator sends the module with the stage."""
+    the package's name, and its output writer's `save` reads it so too. The registry keeps its
+    name once beside the stage's fingerprint, whatever part of the walk read it. Discovery sends
+    `ra` and `rz` by value, and cloudpickle sends with each the module it reads through the
+    package, so the coordinator sends the module itself with the stage."""
     package = _helper_shared_namespace("wi_joined", tmp_path, monkeypatch)
     pipeline = helpers.discover_project(
         tmp_path,
@@ -1046,13 +1040,11 @@ def test_the_readers_of_a_submodule_read_through_its_package_are_joined_from_eve
 
     pipeline.ensure_fingerprint("p/use")
 
-    read = pipeline.get_stage("p/use").get("read_submodules", {})
-    assert read == {
-        "wi_joined.local": fingerprint.SubmoduleReaders(
-            always_sent=False, modules=frozenset({"pipeline", "ra", "rz"})
-        )
-    }, read
-    assert loaded_source.submodule_delivery(read) == loaded_source.SubmoduleDelivery(
+    stage = pipeline.get_stage("p/use")
+    names = stage.get("read_submodules", ())
+    assert names == ("wi_joined.local",), names
+    carried = loaded_source.carried_submodules(stage["func"], names)
+    assert loaded_source.submodule_delivery(names, carried) == loaded_source.SubmoduleDelivery(
         sent=(vars(package)["local"],), imported=()
     )
 
@@ -1085,9 +1077,12 @@ def test_a_submodule_a_later_import_session_removed_is_neither_walked_nor_sent(
     walked = _walk(pipeline)
 
     assert [key for key in walked if "wi_gone.local" in key] == [], walked
-    assert loaded_source.submodule_delivery(
-        fingerprint.read_submodules(first)
-    ) == loaded_source.SubmoduleDelivery(sent=(), imported=())
+    names = fingerprint.read_submodules(first)
+    assert names == ("wi_gone.local",), first
+    carried = loaded_source.carried_submodules(pipeline.get_stage("p/use")["func"], names)
+    assert loaded_source.submodule_delivery(names, carried) == loaded_source.SubmoduleDelivery(
+        sent=(), imported=()
+    )
 
 
 def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_walk(
@@ -1100,8 +1095,7 @@ def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_w
     `other`. The program then loads `other.py` as `wi_bound.other` bound on the package, which
     changes no file the cache checks. The next fingerprint of the stage walks it, as a cache hit
     re-reads which submodules the package holds; a hit that kept the cached manifest would leave
-    an edit to `other.py` unseen and the module unsent. Each is read by the stage function, whose
-    module `pipeline` is its one reader."""
+    an edit to `other.py` unseen and the module neither sent nor imported by name."""
     package = _helper_shared_namespace("wi_bound", tmp_path, monkeypatch)
     pipeline = helpers.discover_project(
         tmp_path,
@@ -1120,32 +1114,92 @@ def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_w
 
     assert "func:wi_bound.other.plain" not in first, first
     assert "func:wi_bound.other.plain" in second, second
-    by_pipeline = fingerprint.SubmoduleReaders(always_sent=False, modules=frozenset({"pipeline"}))
-    assert fingerprint.read_submodules(second) == {
-        "wi_bound.local": by_pipeline,
-        "wi_bound.other": by_pipeline,
-    }, second
+    assert fingerprint.read_submodules(second) == ("wi_bound.local", "wi_bound.other"), second
 
 
-# What the scan records of a function whose reader is `pipeline`, and of one cloudpickle sends by
-# value whatever its module, which names no module.
-_SCANNED_BY_PIPELINE = {"submodule:wi_scan.local:pipeline": ""}
-_SCANNED_ALWAYS_SENT = {"submodule:wi_scan.local:": ""}
+@pytest.mark.parametrize(
+    ("name", "place", "local", "imports", "call", "expected"),
+    [
+        pytest.param(
+            "wi_cv",
+            "project",
+            'VALUE = "v"\n',
+            "import wi_cv.local",
+            "wi_cv.local.VALUE",
+            (["wi_cv.local"], list[str]()),
+            id="data-sent-by-value",
+        ),
+        pytest.param(
+            "wi_cr",
+            "outside",
+            _PLAIN,
+            "import wi_cr.local\nfrom wi_cr.local import plain",
+            "plain() + wi_cr.local.plain()",
+            (list[str](), ["wi_cr.local"]),
+            id="sent-by-reference",
+        ),
+        pytest.param(
+            "wi_cl",
+            "project",
+            'import threading\n\nLOCK = threading.Lock()\nVALUE = "v"\n',
+            "import wi_cl.local",
+            "wi_cl.local.VALUE",
+            (list[str](), ["wi_cl.local"]),
+            id="cannot-be-pickled",
+        ),
+    ],
+)
+def test_what_cloudpickle_carries_of_a_submodule_decides_whether_it_is_sent_or_imported(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    place: str,
+    local: str,
+    imports: str,
+    call: str,
+    expected: tuple[list[str], list[str]],
+) -> None:
+    """`name` is a namespace package the program holds with a directory in `site-packages`, one in
+    the project root and one outside it, and its `local.py` (`local`) lies in the project root,
+    which discovery sends by value, or outside it, which cloudpickle sends by reference. The stage
+    reads it through the package's name. The coordinator sends the module with the stage where
+    pickling the stage carries the module itself by value: a module of data alone, with no
+    function or class of its own that the pickling could carry instead. It has the worker import
+    the module by name where that pickling carries nothing of it by value: a module sent by
+    reference, the stage holding one of its functions too (`from wi_cr.local import plain`), also
+    sent by reference; and where that pickling raises (a lock in the module), as the worker call's
+    own pickling then fails the stage."""
+    site = tmp_path / "lib" / "site-packages"
+    monkeypatch.syspath_prepend(str(site))
+    directories = [tmp_path / "project" / name, site / name, tmp_path / "outside" / name]
+    package = _held_namespace(name, directories, monkeypatch)
+    (tmp_path / place / name / "local.py").write_text(local)
+    pipeline = helpers.discover_project(tmp_path, monkeypatch, {}, _pipeline(imports, call))
+    names = fingerprint.read_submodules(_walk(pipeline))
+    assert names == (f"{name}.local",), names
+
+    carried = loaded_source.carried_submodules(pipeline.get_stage("p/use")["func"], names)
+    delivery = loaded_source.submodule_delivery(names, carried)
+
+    assert ([module.__name__ for module in delivery.sent], list(delivery.imported)) == expected
+    assert all(module is vars(package)["local"] for module in delivery.sent), delivery
+
+
+# What the scan records of a function that reads `wi_scan.local` through its package.
+_SCANNED_LOCAL = {"submodule:wi_scan.local": ""}
 
 
 @pytest.mark.parametrize(
     ("function", "expected"),
     [
-        pytest.param("own_code", _SCANNED_BY_PIPELINE, id="own-code"),
-        pytest.param("in_a_lambda", _SCANNED_BY_PIPELINE, id="lambda"),
-        pytest.param("as_a_lambda", _SCANNED_ALWAYS_SENT, id="as-a-lambda"),
-        pytest.param("with_a_cell", _SCANNED_ALWAYS_SENT, id="closure-cell"),
-        pytest.param("with_an_empty_cell", _SCANNED_ALWAYS_SENT, id="empty-cell"),
-        pytest.param("in_main", _SCANNED_ALWAYS_SENT, id="main-module"),
-        pytest.param("with_no_module_name", _SCANNED_ALWAYS_SENT, id="no-module-name"),
+        pytest.param("own_code", _SCANNED_LOCAL, id="own-code"),
+        pytest.param("in_a_lambda", _SCANNED_LOCAL, id="lambda"),
+        pytest.param("as_a_lambda", _SCANNED_LOCAL, id="as-a-lambda"),
+        pytest.param("with_a_cell", _SCANNED_LOCAL, id="closure-cell"),
+        pytest.param("with_an_empty_cell", _SCANNED_LOCAL, id="empty-cell"),
         pytest.param(
             "through_a_deeper_package",
-            {"submodule:wi_scan.sub:pipeline": "", "submodule:wi_scan.sub.local:pipeline": ""},
+            {"submodule:wi_scan.sub": "", "submodule:wi_scan.sub.local": ""},
             id="deeper-chain",
         ),
         pytest.param("in_a_helper", {}, id="helper-not-read"),
@@ -1158,13 +1212,11 @@ def test_the_scan_of_a_no_fingerprint_stage_finds_what_its_own_code_reads_throug
     in `site-packages` and one in the project root, whose `local.py` and `sub/local.py`
     `pipeline.py` imports. The scan of a function's code for a `@no_fingerprint` stage, which the
     walk does not read (`fingerprint.submodule_entries`), finds each submodule the function reads
-    through a package's name, one key for each reader: in its own code, only in a lambda, through
-    `wi_scan.sub` (both, as the walk records them), each with its module `pipeline` as reader. A
-    function cloudpickle sends by value whatever its module has a key that names no module: a
-    lambda, a function defined in another, which reads the package through a closure cell, also
-    beside a cell its factory left empty, which the scan skips, a function of `__main__` and one
-    with no module name. It does not read the project module `scanned_helper` a function calls,
-    which reads `wi_scan.local` so: a stated limit."""
+    through a package's name, one key for each: in its own code, only in a lambda, as a lambda,
+    through a closure cell of a function defined in another, also beside a cell its factory left
+    empty, which the scan skips, and through `wi_scan.sub` (both, as the walk records them). It
+    does not read the project module `scanned_helper` a function calls, which reads
+    `wi_scan.local` so: a stated limit."""
     package = _helper_shared_namespace("wi_scan", tmp_path, monkeypatch)
     site = tmp_path / "lib" / "site-packages"
     sub = _held_namespace(

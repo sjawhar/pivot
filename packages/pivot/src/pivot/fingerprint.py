@@ -115,19 +115,19 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
 # Version 42 rechecks classes whose DynamicClassAttribute/enum.property members were omitted.
 # Version 43 records a held classmethod's function and its original receiver class.
-# Version 44 records by name (`byname:` entries) the library module a stage reaches through a
-# library base class, a class in a type hint or a class-body annotation, a library class, instance,
-# enum member or exception inside a value, a library loader class, a library stage function, and a
-# library callable whose `__module__` is not a string; not builtins, the standard library or pivot.
-# It also takes a file linked into site-packages that no editable distribution's RECORD lists, as
-# uv's symlink link mode links each file into its cache, and a link to such a file, as library
-# code (`is_library_file`), where version 43 walked it as user code. And it walks a user submodule
-# a stage reads through a library package (`company.local.f()`, where `company` is a namespace
-# package shared with an installed library), which version 43 recorded by the package's name alone,
-# records each submodule read so, once for each module that reads it (`submodule:<name>:<module>`
-# entries, which a lock leaves out), and records which submodules each such package holds (`us`),
-# which a hit re-reads.
-_CACHE_SCHEMA_VERSION = 44
+# Version 45 (version 44 was never released) records by name (`byname:` entries) the library
+# module a stage reaches through a library base class, a class in a type hint or a class-body
+# annotation, a library class, instance, enum member or exception inside a value, a library loader
+# class, a library stage function, and a library callable whose `__module__` is not a string; not
+# builtins, the standard library or pivot. It also takes a file linked into site-packages that no
+# editable distribution's RECORD lists, as uv's symlink link mode links each file into its cache,
+# and a link to such a file, as library code (`is_library_file`), where version 43 walked it as
+# user code. And it walks a user submodule a stage reads through a library package
+# (`company.local.f()`, where `company` is a namespace package shared with an installed library),
+# which version 43 recorded by the package's name alone, records each submodule read so
+# (`submodule:<name>` entries, which a lock leaves out), and records which submodules each such
+# package holds (`us`), which a hit re-reads.
+_CACHE_SCHEMA_VERSION = 45
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
 
@@ -2395,63 +2395,23 @@ def covered_user_modules(manifest: Mapping[str, str], outputs: Collection[str]) 
     }
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class SubmoduleReaders:
-    """The readers of one submodule a stage reads through the library package that holds it
-    (`read_submodules`): whether one of them is a function cloudpickle sends by value whatever its
-    module (`always_sent`: a key naming no module, `_reader_module`), and the modules of the
-    others (`modules`)."""
-
-    always_sent: bool
-    modules: frozenset[str]
-
-
-def read_submodules(manifest: Mapping[str, str]) -> dict[str, SubmoduleReaders]:
-    """The submodules a stage reads through the library packages that hold them (`company.local`
-    in `company.local.f()`, `_process_user_submodules`), by name in sorted order, each with its
-    readers: its `submodule:<name>:<module>` keys (`_add_submodule_read`), the stage's own and
-    its loaders', which join the stage's without a prefix (`merge_loader_fingerprint`). How the
-    worker gets each: `loaded_source.submodule_delivery`. A lock does not record these keys
-    (`as_locked`), so the registry keeps them beside the stage's fingerprint
-    (`registry.RegistryStageInfo`). A key splits at its first `:` after the prefix: a reader's
-    `__module__` can be any string."""
-    readers = dict[str, set[str]]()
-    for key in sorted(manifest):
-        if key.startswith("submodule:"):
-            name, _, reader = key.removeprefix("submodule:").partition(":")
-            readers.setdefault(name, set[str]()).add(reader)
-    return {
-        name: SubmoduleReaders(always_sent="" in found, modules=frozenset(found - {""}))
-        for name, found in readers.items()
-    }
+def read_submodules(manifest: Mapping[str, str]) -> tuple[str, ...]:
+    """The names of the submodules a stage reads through the library packages that hold them
+    (`company.local` in `company.local.f()`, `_process_user_submodules`), sorted, so a package
+    comes before its submodules: its `submodule:<name>` keys (`_add_submodule_read`), the stage's
+    own and its loaders', which join the stage's without a prefix (`merge_loader_fingerprint`).
+    How the worker gets each: `loaded_source.submodule_delivery`. A lock does not record these
+    keys (`as_locked`), so the registry keeps the names beside the stage's fingerprint
+    (`registry.RegistryStageInfo`)."""
+    return tuple(
+        sorted(key.removeprefix("submodule:") for key in manifest if key.startswith("submodule:"))
+    )
 
 
-def _add_submodule_read(entries: dict[str, str], name: str, reader: object) -> None:
-    """Record in a walk's `entries` that the code of function `reader` reads submodule `name`
-    through the library package that holds it: the key `submodule:<name>:<module>`, with an empty
-    value, `<module>` naming `reader`'s module (`_reader_module`)."""
-    entries.setdefault(f"submodule:{name}:{_reader_module(reader)}", "")
-
-
-def _reader_module(reader: object) -> str:
-    """The module a `submodule:` key names for function `reader`, which reads the submodule
-    (`_add_submodule_read`): its `__module__`, or the empty string when cloudpickle sends `reader`
-    by value whatever its module, where it sends it at all. That is a lambda or a function defined
-    in another (a `<lambda>` or `<locals>` part in its `__qualname__`), a function of `__main__`,
-    and one with no module name: a `__module__` that is no string, or the empty string, which no
-    import gives a module. Only these: a reader taken for code sent by value pickles its
-    submodule's values with the stage, while one taken for code sent by reference has the
-    submodule imported by name, which is harmless (`loaded_source.submodule_delivery`)."""
-    module_name = getattr(reader, "__module__", None)
-    parts = getattr(reader, "__qualname__", "").split(".")
-    if (
-        not isinstance(module_name, str)
-        or module_name == "__main__"
-        or "<lambda>" in parts
-        or "<locals>" in parts
-    ):
-        return ""
-    return module_name
+def _add_submodule_read(entries: dict[str, str], name: str) -> None:
+    """Record in a walk's `entries` that the stage reads submodule `name` through the library
+    package that holds it: the key `submodule:<name>`, with an empty value."""
+    entries.setdefault(f"submodule:{name}", "")
 
 
 def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
@@ -6227,20 +6187,20 @@ def _process_user_submodules(
     """Walk each submodule `func` reads on library package `package`, reached as `chain`, through
     which user code is reached (`_user_submodules_read`), as the value of a global is walked
     (`_process_captured_value`), with the binding `<package>.<NAME>`, and record it, outside the
-    lock, with `func` as a reader of it (`_add_submodule_read`): a user module is walked as one
-    read as a global is, and a library package on the way is recorded by name and followed in
-    turn. The package's other attributes are library code and are not read. What this reaches
-    and why: `docs/architecture/fingerprinting.md`, "Library modules" in What Gets Tracked. A
-    cache hit re-reads which submodules the package holds (`us`), so one bound on it since (an
-    `import company.other` added) is walked, and each submodule from the package's namespace
-    (`sub:NAME`), so no `__getattr__` of the package runs."""
+    lock (`_add_submodule_read`): a user module is walked as one read as a global is, and a
+    library package on the way is recorded by name and followed in turn. The package's other
+    attributes are library code and are not read. What this reaches and why:
+    `docs/architecture/fingerprinting.md`, "Library modules" in What Gets Tracked. A cache hit
+    re-reads which submodules the package holds (`us`), so one bound on it since (an `import
+    company.other` added) is walked, and each submodule from the package's namespace (`sub:NAME`),
+    so no `__getattr__` of the package runs."""
     _record_read(package, "us")
     entries = _entries()
     for attribute, submodule in _user_submodules_read(func, chain, package):
         step = f"sub:{attribute}"
         _record_read(package, step)
         binding_ref = f"{package.__name__}.{attribute}"
-        _add_submodule_read(entries, binding_ref, func)
+        _add_submodule_read(entries, binding_ref)
         with _walking(step):
             _process_captured_value(
                 binding_ref,
@@ -6301,15 +6261,14 @@ def submodule_entries(func: Callable[..., Any]) -> dict[str, str]:
     not read, found without walking or hashing any code: each submodule that `func`'s own code and
     its nested code (a lambda, a nested function) read through a library package a global or a
     closure cell of `func` holds, through which user code is reached, and each library package on
-    the way, found as the walk finds them (`_user_submodules_read`), with `func` as their reader
-    (`_add_submodule_read`). `func` is read at the end of its `__wrapped__` chain (`unwrap`), the
-    function whose file the stage's fingerprint hashes. Its globals are the names its own code
-    holds that its module binds (`co_names`, which hold the attributes it reads too, through
-    which `_attributes_read` finds no read) and those of its nested code (`_nested_globals`). Its
-    cells are read as the walk reads them (`c:NAME`), so an empty one (a variable its factory
-    binds on one branch only) is skipped, where `inspect.getclosurevars` raises. A helper `func`
-    calls is not read: a submodule only a helper reads so does not reach the worker with the
-    stage (a stated limit)."""
+    the way, found as the walk finds them (`_user_submodules_read`, `_add_submodule_read`). `func`
+    is read at the end of its `__wrapped__` chain (`unwrap`), the function whose file the stage's
+    fingerprint hashes. Its globals are the names its own code holds that its module binds
+    (`co_names`, which hold the attributes it reads too, through which `_attributes_read` finds no
+    read) and those of its nested code (`_nested_globals`). Its cells are read as the walk reads
+    them (`c:NAME`), so an empty one (a variable its factory binds on one branch only) is skipped,
+    where `inspect.getclosurevars` raises. A helper `func` calls is not read: a submodule only a
+    helper reads so does not reach the worker with the stage (a stated limit)."""
     target = unwrap(func)
     code = target.__code__
     namespace = cast("dict[str, Any]", target.__globals__)
@@ -6333,11 +6292,11 @@ def _scan_user_submodules(
     chain: str, package: types.ModuleType, func: Callable[..., Any], entries: dict[str, str]
 ) -> None:
     """Record in `entries` each submodule `func` reads on library package `package`, reached as
-    `chain`, through which user code is reached (`_user_submodules_read`), with `func` as a reader
-    of it (`_add_submodule_read`), and follow each library package among them in turn, as the walk
-    follows them (`_process_user_submodules`), without walking any code."""
+    `chain`, through which user code is reached (`_user_submodules_read`, `_add_submodule_read`),
+    and follow each library package among them in turn, as the walk follows them
+    (`_process_user_submodules`), without walking any code."""
     for attribute, submodule in _user_submodules_read(func, chain, package):
-        _add_submodule_read(entries, f"{package.__name__}.{attribute}", func)
+        _add_submodule_read(entries, f"{package.__name__}.{attribute}")
         if not is_user_code(submodule):
             _scan_user_submodules(f"{chain}.{attribute}", submodule, func, entries)
 
