@@ -377,9 +377,13 @@ def _record_hooked_import(names: list[str], *, for_stage: bool) -> None:
         state.queued.append(batch)
         return
     queued = collections.deque([batch])
-    state.queued = queued
     recorded = set[tuple[tuple[str, ...], bool]]()
     try:
+        # First inside the `try`: CPython runs a pending signal handler at the end of a call, and
+        # the worker's SIGINT handler raises (`_interrupt_stage`). Set before a call outside the
+        # `try`, the queue could stay set on this thread for the worker's life, and every later
+        # hooked import would only join it.
+        state.queued = queued
         while queued:
             batch_names, batch_for_stage = queued.popleft()
             key = (tuple(batch_names), batch_for_stage)

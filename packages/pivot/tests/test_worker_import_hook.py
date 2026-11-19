@@ -1,5 +1,5 @@
-"""The worker's import hooks' recording never runs inside itself, and records what it imports,
-under the covered thread rule, after it.
+"""The worker's import hooks' recording never runs inside itself, records what it imports, under
+the covered thread rule, after it, and leaves no queue behind when a stage is interrupted in it.
 
 On Debian's CPython 3.13.5 (`/usr/bin/python3.13`, `libpython3.13-stdlib` 3.13.5-2+deb13u5),
 `pathlib/_local.py:117` imports `ntpath` in every `PurePath.__init__`; uv's CPython 3.13.17 imports
@@ -96,14 +96,8 @@ def _lazy(name):
 lazysub = _lazy(__name__ + ".lazysub")
 """
 
-# The files of each child's project, none of them imported when it starts: the stage modules;
-# `helper`, a project module; `importer`, whose body imports `helper`; `reloader`, whose body
-# imports and then reloads `hookwork_statement`; the project package `projpkg`, whose submodule
-# `sub` imports `helper`; the project package `lazyproj`, whose lazy submodule's body imports its
-# sibling `sub` by a relative import, and `sub` imports `helper`; and four libraries in a
-# `site-packages` directory, each with a lazy submodule whose body imports project modules:
-# `helper` (`libpkg`), `importer` (`libimporter`), `importer` and then `helper` (`libboth`), and
-# `projpkg.sub` by a `from` import (`libfrom`).
+# The files of each child's project; the child starts with none of them imported. The packages
+# under `site-packages` are library code to Pivot (`installed_distributions.in_site_packages`).
 _PROJECT_FILES = {
     **{f"{name}.py": "VALUE = 1\n" for name in _STAGE_MODULES},
     "helper.py": "VALUE = 1\n",
@@ -248,16 +242,50 @@ with worker._track_stage_imports(frozenset()) as stage:
 print(json.dumps({"imported": sorted(stage.imported)}))
 """
 
-# A stage first imports `importer`, whose body imports `helper`, which the child imported before
-# the stage started.
-_STAGE_IMPORTS_AN_IMPORTER = """\
+# A stage is interrupted as the worker's SIGINT handler interrupts one, by
+# `worker.WorkerTerminated`, which a trace function raises at the first line the hooks' recording
+# of the stage's import of the resident `hookwork_statement` runs once it has set its queue;
+# `interrupted` holds the names that recording was for. The same worker then runs a second stage,
+# which imports `helper`, resident and not covered.
+_STAGE_INTERRUPTED_IN_THE_RECORDING = """\
+import sys
+
 import helper
+import hookwork_statement
 
 from pivot.executor import worker
 
+worker.install_import_hooks()
+interrupted = []
+
+
+def _interrupt_once_queued(frame, event, arg):
+    if not interrupted and worker._hook_recording_state.queued is not None:
+        interrupted.append(list(frame.f_locals["names"]))
+        raise worker.WorkerTerminated
+    return _interrupt_once_queued
+
+
+def _trace_the_recording(frame, event, arg):
+    if frame.f_code is worker._record_hooked_import.__code__:
+        return _interrupt_once_queued
+    return None
+
+
+sys.settrace(_trace_the_recording)
+try:
+    with worker._track_stage_imports(frozenset()):
+        import hookwork_statement
+except worker.WorkerTerminated:
+    pass
+sys.settrace(None)
 with worker._track_stage_imports(frozenset()) as stage:
-    import importer
-print(json.dumps({"imported": sorted(stage.imported), "uncovered": sorted(stage.uncovered())}))
+    import helper
+print(json.dumps({
+    "interrupted": interrupted,
+    "imported": sorted(stage.imported),
+    "uncovered": sorted(stage.uncovered()),
+}))
 """
 
 # A stage imports `libpkg.lazysub`, whose body imports `helper`, which the child imported before
@@ -448,19 +476,20 @@ def test_the_hooks_recording_ends_where_each_recording_imports_a_module_again(
     assert json.loads(done.stdout)["imported"] == ["hookwork_dynamic", "hookwork_statement"]
 
 
-def test_a_resident_project_module_the_body_of_a_stage_import_imports_is_uncovered(
+def test_an_interrupt_as_the_hooks_recording_begins_leaves_a_later_stages_import_recorded(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A module the stage imports for the first time imports a project module that is resident
-    and that the stage's manifest does not cover: the stage imported both, and neither is
-    covered. The hooks' recording queues the imports it makes itself, not those of the import it
-    records."""
-    done = _helper_run_child(tmp_path, _STAGE_IMPORTS_AN_IMPORTER, "import ntpath")
+    """A stage interrupted by `worker.WorkerTerminated`, which the worker's SIGINT handler raises
+    wherever the stage is running, as soon as the hooks' recording of its import has set its queue,
+    leaves no queue behind: in the same worker, a later stage's import of a resident project
+    module its manifest does not cover is recorded, and is uncovered."""
+    done = _helper_run_child(tmp_path, _STAGE_INTERRUPTED_IN_THE_RECORDING, "import ntpath")
 
     assert done.returncode == 0, done.stderr
     result = json.loads(done.stdout)
-    assert result["uncovered"] == ["helper", "importer"]
-    assert result["imported"] == ["helper", "importer"]
+    assert result["interrupted"] == [["hookwork_statement"]], "the recording was not interrupted"
+    assert result["imported"] == ["helper"]
+    assert result["uncovered"] == ["helper"]
 
 
 def test_a_project_module_a_lazy_library_module_imports_while_the_hook_records_it_is_uncovered(
@@ -480,50 +509,37 @@ def test_a_project_module_a_lazy_library_module_imports_while_the_hook_records_i
 
 
 @pytest.mark.parametrize(
-    "stage_import",
-    [
-        pytest.param("from libimporter import lazysub", id="in-a-lazy-body"),
-        pytest.param("import importer", id="by-the-stage"),
-    ],
-)
-def test_a_covered_module_first_imported_in_the_hooks_recording_excuses_what_it_imports(
-    tmp_path: pathlib.Path, stage_import: str
-) -> None:
-    """The stage's manifest covers `importer`, whose body imports the resident project module
-    `helper`. Whether the body of a library's lazy submodule first-imports `importer` inside the
-    hooks' recording of the stage's import, or the stage imports `importer` itself, `helper` is
-    excused as an import of `importer`'s first import: the stage imported `importer` alone, and
-    nothing it imported is uncovered."""
-    script = _helper_stage_script(["importer"], stage_import, "importer")
-    done = _helper_run_child(tmp_path, script, "import ntpath")
-
-    assert done.returncode == 0, done.stderr
-    result = json.loads(done.stdout)
-    assert result["loaded_in_import"], "`importer` was not imported when the import returned"
-    assert result["uncovered"] == []
-    assert result["imported"] == ["importer"]
-
-
-def test_a_module_a_lazy_body_imports_itself_is_counted_though_a_covered_import_imported_it(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The body of a lazy submodule the stage imports first-imports the covered `importer`, whose
-    body imports the resident `helper`, and then imports `helper` itself, inside the hooks'
-    recording of the stage's import: `importer`'s import of `helper` is excused, the body's own
-    is the stage's, so the stage imported `helper` and it is uncovered."""
-    script = _helper_stage_script(["importer"], "from libboth import lazysub", "importer")
-    done = _helper_run_child(tmp_path, script, "import ntpath")
-
-    assert done.returncode == 0, done.stderr
-    result = json.loads(done.stdout)
-    assert result["loaded_in_import"], "`importer` was not imported when the import returned"
-    assert result["uncovered"] == ["helper"]
-    assert result["imported"] == ["helper", "importer"]
-
-
-@pytest.mark.parametrize(
     ("covered", "stage_import", "loaded", "imported", "uncovered"),
     [
+        # The stage first-imports the covered `importer`, whose body imports `helper`: `helper` is
+        # excused as an import of `importer`'s first import.
+        pytest.param(
+            ["importer"], "import importer", "importer", ["importer"], [], id="by-the-stage"
+        ),
+        # The body of `libimporter`'s lazy submodule first-imports the covered `importer` inside
+        # the hooks' recording of the stage's import: `helper` is excused as in `by-the-stage`.
+        pytest.param(
+            ["importer"],
+            "from libimporter import lazysub",
+            "importer",
+            ["importer"],
+            [],
+            id="in-a-lazy-body",
+        ),
+        # The body of `libboth`'s lazy submodule first-imports the covered `importer`, then
+        # imports `helper` itself: `importer`'s import of `helper` is excused, the body's own is
+        # the stage's.
+        pytest.param(
+            ["importer"],
+            "from libboth import lazysub",
+            "importer",
+            ["helper", "importer"],
+            ["helper"],
+            id="libboth",
+        ),
+        # The body of `libfrom`'s lazy submodule runs `from projpkg import sub`, which
+        # first-imports the covered `projpkg.sub`: the stage imported the package and the
+        # submodule that import requested, and `helper`, which `sub` imports, is excused.
         pytest.param(
             ["projpkg", "projpkg.sub"],
             "from libfrom import lazysub",
@@ -532,6 +548,9 @@ def test_a_module_a_lazy_body_imports_itself_is_counted_though_a_covered_import_
             [],
             id="from-import",
         ),
+        # The body of the project's lazy submodule `lazyproj.lazysub` runs the relative
+        # `from . import sub`, which first-imports the covered `lazyproj.sub`: the stage imported
+        # it by the name the import resolves to, and `helper`, which `sub` imports, is excused.
         pytest.param(
             ["lazyproj.sub"],
             "from lazyproj import lazysub",
@@ -540,9 +559,25 @@ def test_a_module_a_lazy_body_imports_itself_is_counted_though_a_covered_import_
             ["lazyproj", "lazyproj.lazysub"],
             id="relative-import",
         ),
+        # The stage first-imports the covered `reloader`, whose body imports and then reloads
+        # `hookwork_statement`: the reload, made on a covered thread, is excused as the import
+        # before it is.
+        pytest.param(
+            ["reloader"], "import reloader", "hookwork_statement", ["reloader"], [], id="reloader"
+        ),
+        # The stage first-imports `importer`, which the manifest does not cover: the stage
+        # imported it and `helper`, which its body imports, and neither is covered.
+        pytest.param(
+            [],
+            "import importer",
+            "importer",
+            ["helper", "importer"],
+            ["helper", "importer"],
+            id="uncovered-importer",
+        ),
     ],
 )
-def test_an_import_a_lazy_body_makes_in_the_hooks_recording_records_the_modules_it_requests(
+def test_a_stage_records_the_modules_it_imported_under_the_covered_thread_rule(
     tmp_path: pathlib.Path,
     covered: list[str],
     stage_import: str,
@@ -550,20 +585,18 @@ def test_an_import_a_lazy_body_makes_in_the_hooks_recording_records_the_modules_
     imported: list[str],
     uncovered: list[str],
 ) -> None:
-    """The body of a lazy submodule the stage imports runs inside the hooks' recording of that
-    import and first-imports a covered project submodule whose body imports the resident
-    `helper`: `libfrom.lazysub` by `from projpkg import sub`, `lazyproj.lazysub` by the relative
-    `from . import sub`. The stage imported that submodule and its package, the modules the
-    body's import requested, and `helper` is excused as an import of the submodule's first
-    import."""
+    """Under a manifest that covers `covered`, the stage runs `stage_import`, which has imported
+    `loaded` when it returns: the stage-import check records `imported`, and `uncovered` is not
+    covered. What a covered module's first import imports belongs to that import, and a lazy
+    submodule's body runs inside the hooks' recording of the stage's import of it."""
     script = _helper_stage_script(covered, stage_import, loaded)
     done = _helper_run_child(tmp_path, script, "import ntpath")
 
     assert done.returncode == 0, done.stderr
     result = json.loads(done.stdout)
+    assert result["loaded_in_import"], f"`{loaded}` was not imported when the import returned"
     assert result["imported"] == imported
     assert result["uncovered"] == uncovered
-    assert result["loaded_in_import"], f"`{loaded}` was not imported when the import returned"
 
 
 def test_a_covered_module_a_reloads_recording_first_imports_excuses_what_it_imports(
@@ -579,20 +612,6 @@ def test_a_covered_module_a_reloads_recording_first_imports_excuses_what_it_impo
     result = json.loads(done.stdout)
     assert result["imported"] == ["hookwork_statement", "importer"]
     assert result["uncovered"] == ["hookwork_statement"]
-
-
-def test_a_reload_a_covered_modules_first_import_makes_is_excused(tmp_path: pathlib.Path) -> None:
-    """The stage's manifest covers `reloader`, whose body imports and then reloads
-    `hookwork_statement`: the reload, made on a covered thread, is excused as the import before
-    it is, so the stage imported `reloader` alone, and nothing it imported is uncovered."""
-    script = _helper_stage_script(["reloader"], "import reloader", "hookwork_statement")
-    done = _helper_run_child(tmp_path, script, "import ntpath")
-
-    assert done.returncode == 0, done.stderr
-    result = json.loads(done.stdout)
-    assert result["loaded_in_import"], "`hookwork_statement` was not imported by `reloader`"
-    assert result["uncovered"] == []
-    assert result["imported"] == ["reloader"]
 
 
 # Installed as `sitecustomize` for every process of the run, the coordinator and each loky worker.
