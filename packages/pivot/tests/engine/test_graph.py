@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pickle
 import random
 from typing import TYPE_CHECKING
 
@@ -11,11 +12,14 @@ import pytest
 
 from pivot import exceptions, loaders
 from pivot.engine import graph, types
+from pivot.executor import core as executor_core
 from pivot.registry import RegistryStageInfo
 from pivot.storage import store as store_mod
+from pivot.storage import track
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, OnError
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
     from pathlib import Path
 
 
@@ -481,12 +485,327 @@ def test_get_runnable_stages_leaves_out_stages_downstream_of_a_missing_dependenc
         project_root=set_project_root, pipeline_name="bad", input_bindings={}
     )
 
-    result, errors = graph.get_runnable_stages(
-        stages, store, all_pipelines=all_pipelines, on_error=on_error
+    found = graph.get_runnable_stages(stages, store, all_pipelines=all_pipelines, on_error=on_error)
+
+    assert (None if found.stages is None else set(found.stages)) == runnable
+    assert [error.stage for error in found.errors] == ["bad/b"]
+    [error] = found.errors
+    assert error.input_path == set_project_root / "data" / "missing.csv.dat"
+    assert str(error) == (
+        "Stage 'bad/b' depends on input 'missing.csv' (path data/missing.csv.dat), "
+        + "which does not exist"
+    )
+    assert found.left_out == ({} if runnable is None else {"bad/b": error, "bad/c": error})
+
+
+def _helper_input_stage(name: str, inputs: list[str]) -> RegistryStageInfo:
+    """A stage that reads the pipeline inputs named ``inputs``, in that order, and writes one
+    output."""
+    info = _create_stage(
+        name, [ArtifactIdentity(input_name, None) for input_name in inputs], [_output(name)]
+    )
+    for dep in info["deps"].values():
+        dep.tag = ArtifactTag.INPUT
+    return info
+
+
+def _output(stage_name: str) -> ArtifactIdentity:
+    """The one output of stage ``stage_name``."""
+    return ArtifactIdentity(stage_name, None)
+
+
+def _helper_store(root: Path, input_bindings: dict[str, str]) -> store_mod.WorkspaceStore:
+    return store_mod.WorkspaceStore(
+        project_root=root, pipeline_name="p", input_bindings=input_bindings
     )
 
-    assert (None if result is None else set(result)) == runnable
-    assert [error.stage for error in errors] == ["bad/b"]
+
+def _helper_missing_tracked(root: Path, *paths: str) -> list[str]:
+    """Track each of ``paths`` (relative to ``root``) by its .pvt alone, with no data and no
+    cache object, and return the tracked files the pre-flight finds missing, as it gives them.
+    The directory holding each path exists, since it holds the .pvt."""
+    for path in paths:
+        data_path = root / path
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        track.write_pvt_file(
+            track.get_pvt_path(data_path),
+            track.PvtData(path=data_path.name, hash="0123456789abcdef", size=10),
+        )
+    return executor_core.find_missing_tracked_files(root).missing
+
+
+def _helper_runnable(
+    stages: dict[str, RegistryStageInfo],
+    store: store_mod.WorkspaceStore,
+    missing_tracked: list[str],
+    restorable_tracked: Collection[str] = (),
+) -> graph.RunnableStages:
+    """``get_runnable_stages`` of a keep-going run across all pipelines."""
+    return graph.get_runnable_stages(
+        stages,
+        store,
+        all_pipelines=True,
+        on_error=OnError.KEEP_GOING,
+        missing_tracked=missing_tracked,
+        restorable_tracked=restorable_tracked,
+    )
+
+
+def test_get_runnable_stages_leaves_out_a_stage_reading_a_directory_holding_a_missing_tracked_file(
+    set_project_root: Path,
+) -> None:
+    """A dependency on an existing directory that holds a missing tracked file leaves its stage
+    out, with one error naming the stage, the directory and the file."""
+    missing = _helper_missing_tracked(set_project_root, "data/dir/x.csv")
+    stages = {
+        "ok/a": _create_stage("ok/a", [], [_output("ok/a")]),
+        "p/read": _helper_input_stage("p/read", ["dir"]),
+    }
+
+    found = _helper_runnable(stages, _helper_store(set_project_root, {"dir": "data/dir"}), missing)
+
+    assert found.stages is not None
+    assert set(found.stages) == {"ok/a"}
+    [error] = found.errors
+    assert error.stage == "p/read"
+    assert error.input_path == set_project_root / "data" / "dir" / "x.csv"
+    assert error.directory == set_project_root / "data" / "dir"
+    assert str(error) == (
+        "Stage 'p/read' depends on directory 'dir', which holds tracked file 'data/dir/x.csv' "
+        + "that does not exist"
+    )
+    assert found.left_out == {"p/read": error}
+
+
+def test_get_runnable_stages_reports_each_missing_tracked_file_a_directory_holds(
+    set_project_root: Path,
+) -> None:
+    """A directory holding two missing tracked files gives its stage one error per file."""
+    missing = _helper_missing_tracked(set_project_root, "data/dir/y.csv", "data/dir/x.csv")
+    stages = {"p/read": _helper_input_stage("p/read", ["dir"])}
+
+    found = _helper_runnable(stages, _helper_store(set_project_root, {"dir": "data/dir"}), missing)
+
+    assert found.stages == {}
+    assert [error.stage for error in found.errors] == ["p/read", "p/read"]
+    assert [error.input_path for error in found.errors] == [
+        set_project_root / "data" / "dir" / "x.csv",
+        set_project_root / "data" / "dir" / "y.csv",
+    ]
+    assert [error.directory for error in found.errors] == [set_project_root / "data" / "dir"] * 2
+    assert [str(error) for error in found.errors] == [
+        f"Stage 'p/read' depends on directory 'dir', which holds tracked file 'data/dir/{name}' "
+        + "that does not exist"
+        for name in ("x.csv", "y.csv")
+    ]
+    assert found.left_out == {"p/read": found.errors[0]}
+
+
+def test_get_runnable_stages_reports_a_missing_tracked_file_read_directly_and_by_its_directory_once(
+    set_project_root: Path,
+) -> None:
+    """A stage that reads a missing tracked file and the directory holding it gets the error of
+    the file's own dependency alone, though it lists the directory first."""
+    missing = _helper_missing_tracked(set_project_root, "data/dir/x.csv")
+    stages = {"p/read": _helper_input_stage("p/read", ["dir", "x"])}
+    store = _helper_store(set_project_root, {"dir": "data/dir", "x": "data/dir/x.csv"})
+
+    found = _helper_runnable(stages, store, missing)
+
+    assert found.stages == {}
+    [error] = found.errors
+    assert error.stage == "p/read"
+    assert error.input_path == set_project_root / "data" / "dir" / "x.csv"
+    assert error.directory is None
+    assert str(error) == (
+        "Stage 'p/read' depends on input 'x' (path data/dir/x.csv), which does not exist"
+    )
+    assert found.left_out == {"p/read": error}
+
+
+def test_get_runnable_stages_reports_dependencies_inside_one_missing_tracked_file_once_per_stage(
+    set_project_root: Path,
+) -> None:
+    """Two dependencies of one stage inside one missing tracked directory give that stage one
+    error, the first; another stage reading inside it gets its own."""
+    missing = _helper_missing_tracked(set_project_root, "data/tracked")
+    stages = {
+        "p/read": _helper_input_stage("p/read", ["a", "b"]),
+        "p/other": _helper_input_stage("p/other", ["b"]),
+    }
+    store = _helper_store(set_project_root, {"a": "data/tracked/a.csv", "b": "data/tracked/b.csv"})
+
+    found = _helper_runnable(stages, store, missing)
+
+    assert found.stages == {}
+    assert [error.stage for error in found.errors] == ["p/read", "p/other"]
+    assert [error.input_path for error in found.errors] == [
+        set_project_root / "data" / "tracked" / "a.csv",
+        set_project_root / "data" / "tracked" / "b.csv",
+    ]
+    assert [str(error) for error in found.errors] == [
+        "Stage 'p/read' depends on input 'a' (path data/tracked/a.csv), which does not exist",
+        "Stage 'p/other' depends on input 'b' (path data/tracked/b.csv), which does not exist",
+    ]
+    assert found.left_out == {"p/read": found.errors[0], "p/other": found.errors[1]}
+
+
+def test_get_runnable_stages_reports_missing_untracked_inputs_beside_a_missing_tracked_file(
+    set_project_root: Path,
+) -> None:
+    """Missing untracked inputs keep one error each, beside the error of a directory that holds
+    a missing tracked file."""
+    missing = _helper_missing_tracked(set_project_root, "data/dir/x.csv")
+    stages = {"p/read": _helper_input_stage("p/read", ["gone", "lost", "dir"])}
+    store = _helper_store(
+        set_project_root, {"gone": "data/gone.csv", "lost": "data/lost.csv", "dir": "data/dir"}
+    )
+
+    found = _helper_runnable(stages, store, missing)
+
+    assert found.stages == {}
+    assert [error.stage for error in found.errors] == ["p/read"] * 3
+    assert [error.input_path for error in found.errors] == [
+        set_project_root / "data" / "gone.csv",
+        set_project_root / "data" / "lost.csv",
+        set_project_root / "data" / "dir" / "x.csv",
+    ]
+    assert [str(error) for error in found.errors] == [
+        "Stage 'p/read' depends on input 'gone' (path data/gone.csv), which does not exist",
+        "Stage 'p/read' depends on input 'lost' (path data/lost.csv), which does not exist",
+        "Stage 'p/read' depends on directory 'dir', which holds tracked file 'data/dir/x.csv' "
+        + "that does not exist",
+    ]
+    assert found.left_out == {"p/read": found.errors[0]}
+
+
+def test_get_runnable_stages_finds_no_missing_tracked_file_in_a_directory_a_stage_produces(
+    set_project_root: Path,
+) -> None:
+    """A dependency on a directory another stage produces is that stage's output, not a
+    directory on disk: a missing tracked file inside it leaves its reader in."""
+    made = ArtifactIdentity("p/make", None)
+    missing = _helper_missing_tracked(set_project_root, "data/p/make/x.csv")
+    stages = {
+        "p/make": _create_stage("p/make", [], [made]),
+        "p/use": _create_stage("p/use", [made], [_output("p/use")]),
+    }
+    stages["p/make"]["outs"][0].tag = ArtifactTag.DIRECTORY
+    stages["p/use"]["deps"]["_0"].tag = ArtifactTag.DIRECTORY
+    store = _helper_store(set_project_root, {})
+    assert store.exists(stages["p/use"]["deps"]["_0"])
+
+    found = _helper_runnable(stages, store, missing)
+
+    assert found.stages is not None
+    assert set(found.stages) == {"p/make", "p/use"}
+    assert found.errors == []
+    assert found.left_out == {}
+
+
+def test_get_runnable_stages_decides_containment_by_path_parts(set_project_root: Path) -> None:
+    """A missing tracked file ``data-backup/x.csv`` is not inside a dependency on ``data``."""
+    missing = _helper_missing_tracked(set_project_root, "data-backup/x.csv")
+    (set_project_root / "data").mkdir()
+    stages = {"p/read": _helper_input_stage("p/read", ["data"])}
+
+    found = _helper_runnable(stages, _helper_store(set_project_root, {"data": "data"}), missing)
+
+    assert found.stages is not None
+    assert set(found.stages) == {"p/read"}
+    assert found.errors == []
+    assert found.left_out == {}
+
+
+@pytest.mark.parametrize(
+    ("tracked", "binding"),
+    [
+        pytest.param("data/x.csv", "data/x.csv", id="equal"),
+        pytest.param("data/tracked", "data/tracked/x.csv", id="inside"),
+    ],
+)
+def test_get_runnable_stages_counts_a_restorable_tracked_file_as_present(
+    set_project_root: Path, tracked: str, binding: str
+) -> None:
+    """A dependency that is or lies inside a restorable tracked file has no error; a stage
+    reading a missing tracked file the cache cannot restore is still left out."""
+    restorable, gone = _helper_missing_tracked(set_project_root, tracked, "data/z.csv")
+    assert gone == str(set_project_root / "data" / "z.csv")
+    stages = {
+        "p/read": _helper_input_stage("p/read", ["x"]),
+        "p/other": _helper_input_stage("p/other", ["z"]),
+    }
+    store = _helper_store(set_project_root, {"x": binding, "z": "data/z.csv"})
+
+    found = _helper_runnable(stages, store, [gone], restorable_tracked=[restorable])
+
+    assert found.stages is not None
+    assert set(found.stages) == {"p/read"}
+    [error] = found.errors
+    assert error.stage == "p/other"
+    assert error.input_path == set_project_root / "data" / "z.csv"
+    assert str(error) == (
+        "Stage 'p/other' depends on input 'z' (path data/z.csv), which does not exist"
+    )
+    assert found.left_out == {"p/other": error}
+
+
+def test_get_runnable_stages_leaves_out_downstream_stages_with_their_first_upstream_error(
+    set_project_root: Path,
+) -> None:
+    """Each stage downstream of broken stages is left out with the first error, in error order,
+    of a stage upstream of it; two levels down too."""
+    missing = _helper_missing_tracked(set_project_root, "data/dir/x.csv")
+    stages = {
+        "ok/a": _create_stage("ok/a", [], [_output("ok/a")]),
+        "p/read": _helper_input_stage("p/read", ["gone"]),
+        "p/scan": _helper_input_stage("p/scan", ["dir"]),
+        "p/mid": _create_stage("p/mid", [_output("p/scan"), _output("p/read")], [_output("p/mid")]),
+        "p/end": _create_stage("p/end", [_output("p/mid")], [_output("p/end")]),
+    }
+    store = _helper_store(set_project_root, {"gone": "data/gone.csv", "dir": "data/dir"})
+
+    found = _helper_runnable(stages, store, missing)
+
+    assert found.stages is not None
+    assert set(found.stages) == {"ok/a"}
+    assert [error.stage for error in found.errors] == ["p/read", "p/scan"]
+    read_error, scan_error = found.errors
+    assert read_error.input_path == set_project_root / "data" / "gone.csv"
+    assert scan_error.input_path == set_project_root / "data" / "dir" / "x.csv"
+    assert found.left_out == {
+        "p/read": read_error,
+        "p/scan": scan_error,
+        "p/mid": read_error,
+        "p/end": read_error,
+    }
+
+
+def test_dependency_not_found_error_on_a_directory_survives_pickling(
+    set_project_root: Path,
+) -> None:
+    """The error of a directory holding a missing tracked file keeps its directory, its file
+    and its message across a pickle round trip."""
+    missing = _helper_missing_tracked(set_project_root, "data/dir/x.csv")
+    stages = {"p/read": _helper_input_stage("p/read", ["dir"])}
+    [original] = _helper_runnable(
+        stages, _helper_store(set_project_root, {"dir": "data/dir"}), missing
+    ).errors
+
+    restored = pickle.loads(pickle.dumps(original))
+
+    assert isinstance(restored, exceptions.DependencyNotFoundError)
+    assert restored.stage == "p/read"
+    assert restored.directory == set_project_root / "data" / "dir"
+    assert restored.input_path == set_project_root / "data" / "dir" / "x.csv"
+    assert (
+        str(restored)
+        == str(original)
+        == (
+            "Stage 'p/read' depends on directory 'dir', which holds tracked file 'data/dir/x.csv' "
+            + "that does not exist"
+        )
+    )
 
 
 def test_build_graph_allows_missing_when_validate_false(tmp_path: Path) -> None:

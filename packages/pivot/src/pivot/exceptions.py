@@ -78,13 +78,17 @@ class CyclicGraphError(DAGError):
 
 
 class DependencyNotFoundError(DAGError):
-    """Raised when a dependency doesn't exist."""
+    """Raised when a dependency doesn't exist.
+
+    With ``directory``, the dependency is an existing directory that holds the missing tracked
+    file ``input_path``."""
 
     _stage: str
     _dep: str
     _available: list[str]
     _input_path: pathlib.Path | None
     _input_path_display: str | None
+    _directory: pathlib.Path | None
 
     def __init__(
         self,
@@ -93,12 +97,14 @@ class DependencyNotFoundError(DAGError):
         available_outputs: list[str] | None = None,
         input_path: pathlib.Path | None = None,
         input_path_display: str | None = None,
+        directory: pathlib.Path | None = None,
     ) -> None:
         self._stage = stage
         self._dep = dep
         self._available = available_outputs or []
         self._input_path = input_path
         self._input_path_display = input_path_display
+        self._directory = directory
         if input_path is None:
             message = (
                 f"Stage '{stage}' depends on '{dep}' which is not produced by any stage "
@@ -106,10 +112,16 @@ class DependencyNotFoundError(DAGError):
             )
         else:
             display_path = input_path_display or str(input_path)
-            message = (
-                f"Stage '{stage}' depends on input '{dep}' (path {display_path}), "
-                + "which does not exist"
-            )
+            if directory is None:
+                message = (
+                    f"Stage '{stage}' depends on input '{dep}' (path {display_path}), "
+                    + "which does not exist"
+                )
+            else:
+                message = (
+                    f"Stage '{stage}' depends on directory '{dep}', which holds tracked file "
+                    + f"'{display_path}' that does not exist"
+                )
         super().__init__(message)
 
     @property
@@ -118,8 +130,15 @@ class DependencyNotFoundError(DAGError):
 
     @property
     def input_path(self) -> pathlib.Path | None:
-        """The missing input's filesystem path; None for a missing stage output."""
+        """The missing input's filesystem path; None for a missing stage output. For a
+        dependency on a directory that holds a missing tracked file, that file's path."""
         return self._input_path
+
+    @property
+    def directory(self) -> pathlib.Path | None:
+        """The path of the directory dependency that holds the missing tracked file
+        ``input_path``; None for a dependency that is missing itself."""
+        return self._directory
 
     @override
     def format_user_message(self) -> str:
@@ -135,10 +154,20 @@ class DependencyNotFoundError(DAGError):
     @override
     def __reduce__(
         self,
-    ) -> tuple[type, tuple[str, str, list[str], pathlib.Path | None, str | None]]:
+    ) -> tuple[
+        type,
+        tuple[str, str, list[str], pathlib.Path | None, str | None, pathlib.Path | None],
+    ]:
         return (
             self.__class__,
-            (self._stage, self._dep, self._available, self._input_path, self._input_path_display),
+            (
+                self._stage,
+                self._dep,
+                self._available,
+                self._input_path,
+                self._input_path_display,
+                self._directory,
+            ),
         )
 
 

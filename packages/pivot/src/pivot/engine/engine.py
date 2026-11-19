@@ -1706,7 +1706,7 @@ class Engine:
             project_root, all_stages, store, config.get_state_dir(), cache_dir / "files"
         ):
             _logger.warning(warning)
-        runnable, dep_errors = engine_graph.get_runnable_stages(
+        runnable, dep_errors, _ = engine_graph.get_runnable_stages(
             graph_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
         )
         if runnable is not None:
@@ -3648,9 +3648,9 @@ class Engine:
                 pipeline_name=pipeline.name,
                 input_bindings=pipeline.input_bindings,
             )
-            runnable, _ = engine_graph.get_runnable_stages(
+            runnable = engine_graph.get_runnable_stages(
                 all_stages, store, all_pipelines=True, on_error=self._stored_on_error
-            )
+            ).stages
             stages = list(runnable or all_stages)
 
         if stages:
