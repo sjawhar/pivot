@@ -30,6 +30,7 @@ import stat
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
 
 import lmdb
+import pygtrie
 
 from pivot import config, exceptions, project, types
 from pivot import state_dir as state_dir_mod
@@ -984,6 +985,40 @@ def find_declared_overlap(
             text += f" (the path resolves to '{resolved}'; the output resolves to '{out_resolved}')"
         return text
     return None
+
+
+def tracked_output_overlaps(
+    missing: Iterable[str], outputs: Mapping[pathlib.Path, str], project_root: pathlib.Path
+) -> dict[str, str]:
+    """Say how each missing tracked path overlaps a stage output, for each one that overlaps one.
+
+    ``missing`` holds absolute normalized paths, as ``track.discover_pvt_files`` gives them.
+    ``outputs`` maps the ``normalized`` path of each output to the stage that writes it. A path
+    overlaps an output when it is that output, lies inside it or contains it. Path parts decide
+    this (a ``pygtrie.Trie`` keyed by ``Path.parts``), never a string prefix: ``data-backup/x``
+    is not inside ``data``. When a path overlaps more than one output, its description names the
+    first of them in sorted path order: the outermost output that is or holds the path, else the
+    first output inside the path. Every check of missing tracked files against stage outputs
+    calls this one function (``executor.core.verify_tracked_files``), so all of them agree.
+    """
+    trie: pygtrie.Trie[pathlib.Path] = pygtrie.Trie()
+    for output in outputs:
+        trie[output.parts] = output
+    overlaps = dict[str, str]()
+    for missing_path in missing:
+        path = pathlib.Path(missing_path)
+        enclosing = trie.shortest_prefix(path.parts)
+        if enclosing is not None and enclosing.is_set:
+            output = trie[enclosing.key]
+        elif trie.has_subtrie(path.parts):
+            output = min(trie.values(prefix=path.parts))
+        else:
+            continue
+        overlaps[missing_path] = (
+            f"it {_relation(path, output)} output '{display_path(output, project_root)}' "
+            + f"of stage '{outputs[output]}'"
+        )
+    return overlaps
 
 
 def _warning(overlap: OutputOverlap, project_root: pathlib.Path) -> str:

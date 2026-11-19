@@ -344,27 +344,44 @@ class PlotsError(PivotError):
 
 
 class TrackedFileMissingError(CacheError):
-    """Raised when .pvt tracked files are missing (user should run pivot checkout)."""
+    """Raised when .pvt tracked files are missing (user should run pivot checkout).
+
+    ``overlaps`` maps a missing file to how it overlaps a stage output
+    (``ownership.tracked_output_overlaps``). Such a file stops a run even when the run tolerates
+    missing files (``executor.core.verify_tracked_files``'s ``tolerate_missing``)."""
 
     _missing: list[str]
     _checkout_attempted: bool
+    _overlaps: dict[str, str]
 
-    def __init__(self, missing_files: list[str], checkout_attempted: bool = False) -> None:
+    def __init__(
+        self,
+        missing_files: list[str],
+        checkout_attempted: bool = False,
+        overlaps: dict[str, str] | None = None,
+    ) -> None:
         self._missing = missing_files
         self._checkout_attempted = checkout_attempted
+        # None: no listed file overlaps a stage output
+        self._overlaps = {} if overlaps is None else overlaps
         super().__init__(self._format_message())
 
     def _format_message(self) -> str:
-        missing_list = "\n".join(f"  - {p}" for p in self._missing)
-        if self._checkout_attempted:
-            return (
-                f"The following tracked files are missing:\n{missing_list}\n\n"
-                + "These files are not in local cache."
-            )
-        return (
-            f"The following tracked files are missing:\n{missing_list}\n\n"
-            + "These files are tracked by Pivot but don't exist on disk."
+        missing_list = "\n".join(
+            f"  - {p}: {self._overlaps[p]}" if p in self._overlaps else f"  - {p}"
+            for p in self._missing
         )
+        if self._checkout_attempted:
+            reason = "These files are not in local cache."
+        else:
+            reason = "These files are tracked by Pivot but don't exist on disk."
+        message = f"The following tracked files are missing:\n{missing_list}\n\n{reason}"
+        if self._overlaps:
+            message += (
+                "\nPivot stops the run because a file above overlaps a stage output. "
+                + "That stage replaces its output when it runs."
+            )
+        return message
 
     @override
     def get_suggestion(self) -> str:
@@ -375,8 +392,8 @@ class TrackedFileMissingError(CacheError):
         return "Run 'pivot checkout --only-missing' to restore missing files, or 'pivot run --checkout-missing' to restore and run"
 
     @override
-    def __reduce__(self) -> tuple[type, tuple[list[str], bool]]:
-        return (self.__class__, (self._missing, self._checkout_attempted))
+    def __reduce__(self) -> tuple[type, tuple[list[str], bool, dict[str, str]]]:
+        return (self.__class__, (self._missing, self._checkout_attempted, self._overlaps))
 
 
 class GetError(PivotError):

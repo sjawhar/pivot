@@ -12,7 +12,7 @@ import signal
 import threading
 import typing
 from multiprocessing import managers
-from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple, TypedDict, cast
 
 import loky
 import loky.backend.resource_tracker
@@ -645,12 +645,56 @@ def _restore_tracked_file(
     )
 
 
+def _restorable(path: pathlib.Path, track_data: track.PvtData, cache_dir: pathlib.Path) -> bool:
+    """Whether the restore of missing tracked path ``path`` (``_restore_tracked_file``) finds
+    what it links in ``cache_dir``: ``cache.missing_cache_objects``, the rule a forced checkout
+    uses, finds no object absent for the configured checkout modes. A directory whose listing
+    neither its committed file nor the cache holds is not restorable, as the restore says. A
+    corrupt listing raises ``CorruptListingError``, as the restore does."""
+    output_hash = track.pvt_to_hash_info(track_data)
+    members = None
+    if types.is_dir_hash(output_hash):
+        try:
+            members = track.tracked_members(path, track_data, cache_dir)
+        except exceptions.ListingMissingError:
+            return False
+    return not cache.missing_cache_objects(
+        output_hash, members, cache_dir, config.get_checkout_mode_order()
+    )
+
+
+def _tracked_path_kind(path: pathlib.Path) -> Literal["file", "directory"] | None:
+    """The pre-flight's existence rule: what is at a tracked path (symlinks followed), or None
+    when neither a file nor a directory is, and the path is missing. The run
+    (``verify_tracked_files``) and the dry run (``find_missing_tracked_files``) both apply it,
+    so they find the same files missing."""
+    if path.is_file():
+        return "file"
+    if path.is_dir():
+        return "directory"
+    return None
+
+
+def _refuse_control_restores(
+    project_root: pathlib.Path, tracked_files: Mapping[str, track.PvtData]
+) -> None:
+    """Refuse ``--checkout-missing`` before it restores anything when a tracked path overlaps a
+    Git or Pivot control path (``ownership.control_path_refusal``)."""
+    refusal = ownership.control_path_refusal(
+        project_root, (ownership.tracked_restore(pathlib.Path(path)) for path in tracked_files)
+    )
+    if refusal is not None:
+        raise refusal
+
+
 def verify_tracked_files(
     project_root: pathlib.Path,
     checkout_missing: bool = False,
     *,
     skip: track.PvtSkip | None = None,
-) -> None:
+    tolerate_missing: bool = False,
+    outputs: Mapping[pathlib.Path, str] | None = None,
+) -> list[str]:
     """Verify all .pvt tracked files exist and warn on hash mismatches.
 
     Args:
@@ -659,18 +703,28 @@ def verify_tracked_files(
             Only restores files that don't exist - never overwrites existing files.
         skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
             own member of its output (``member_skip.own_member_skip``).
+        tolerate_missing: If True, return the tracked files that are still missing after the
+            restore, unless one of them overlaps a path of ``outputs``.
+        outputs: The ``ownership.normalized`` path of each output of the loaded stages, with
+            the stage that writes it. None or empty means no outputs. Used only with
+            ``tolerate_missing``.
+
+    Returns:
+        With ``tolerate_missing``, the tracked files still missing (the absolute normalized
+        paths discovery gives), sorted. Else an empty list.
+
+    Raises:
+        TrackedFileMissingError: Without ``tolerate_missing``, for every tracked file still
+            missing. With it, for each one that is, lies inside or contains a path of
+            ``outputs`` (``ownership.tracked_output_overlaps``), and for no other file.
     """
     from pivot import metrics
 
     tracked_files = track.discover_pvt_files_and_update_memo(project_root, skip=skip)
     if not tracked_files:
-        return
+        return []
     if checkout_missing:
-        refusal = ownership.control_path_refusal(
-            project_root, (ownership.tracked_restore(pathlib.Path(path)) for path in tracked_files)
-        )
-        if refusal is not None:
-            raise refusal
+        _refuse_control_restores(project_root, tracked_files)
 
     _t = metrics.start()
     missing = list[str]()
@@ -689,15 +743,15 @@ def verify_tracked_files(
 
             # Try to hash the file - handles race conditions where file disappears
             try:
-                if path.is_file():
-                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
-                elif path.is_dir():
+                kind = _tracked_path_kind(path)
+                if kind is None:
+                    raise FileNotFoundError(data_path)
+                if kind == "directory":
                     current_hash = cache.hash_directory(
                         path, state_db, cache_dir=cache_dir, pending=pending
                     )["record"]["hash"]
                 else:
-                    # Path doesn't exist
-                    raise FileNotFoundError(data_path)
+                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
             except FileNotFoundError:
                 if checkout_missing:
                     if not registered:
@@ -724,8 +778,60 @@ def verify_tracked_files(
     state_mod.save_file_hashes(state_dir, pending, create=True)
 
     metrics.end("core.verify_tracked_files", _t)
-    if missing:
+    if not missing:
+        return []
+    if not tolerate_missing:
         raise exceptions.TrackedFileMissingError(missing, checkout_attempted=checkout_missing)
+    still_missing = sorted(missing)
+    # None: the caller gives no outputs, so no missing file can overlap one
+    overlaps = ownership.tracked_output_overlaps(still_missing, outputs or {}, project_root)
+    if overlaps:
+        raise exceptions.TrackedFileMissingError(
+            list(overlaps), checkout_attempted=checkout_missing, overlaps=overlaps
+        )
+    return still_missing
+
+
+class MissingTrackedFiles(NamedTuple):
+    """The tracked files the pre-flight finds missing, and those its ``--checkout-missing``
+    restore can bring back (``find_missing_tracked_files``)."""
+
+    missing: list[str]
+    """Each missing tracked path (the absolute normalized path discovery gives), sorted."""
+    restorable: list[str]
+    """The paths of ``missing`` the local cache can restore, sorted. Empty without
+    ``checkout_missing``."""
+
+
+def find_missing_tracked_files(
+    project_root: pathlib.Path,
+    *,
+    skip: track.PvtSkip | None = None,
+    checkout_missing: bool = False,
+) -> MissingTrackedFiles:
+    """The dry run's view of the pre-flight (``verify_tracked_files``), reading only.
+
+    Finds the tracked files the pre-flight finds missing, with its existence rule
+    (``_tracked_path_kind``), and with ``checkout_missing`` those of them the local cache can
+    restore (``_restorable``). It discovers with ``track.discover_pvt_files``, which never writes
+    the memo. It restores nothing, registers in no cache and writes no state database or
+    workspace file. With ``checkout_missing`` it raises where the pre-flight raises: the refusal
+    of a control path, and ``CorruptListingError`` for a missing directory whose listing is
+    corrupt. ``skip`` is as for ``verify_tracked_files``.
+    """
+    tracked_files = track.discover_pvt_files(project_root, skip=skip)
+    if checkout_missing and tracked_files:
+        _refuse_control_restores(project_root, tracked_files)
+    missing = sorted(
+        path for path in tracked_files if _tracked_path_kind(pathlib.Path(path)) is None
+    )
+    if not checkout_missing or not missing:
+        return MissingTrackedFiles(missing=missing, restorable=[])
+    cache_dir = config.locate_cache_dir() / "files"
+    restorable = [
+        path for path in missing if _restorable(pathlib.Path(path), tracked_files[path], cache_dir)
+    ]
+    return MissingTrackedFiles(missing=missing, restorable=restorable)
 
 
 def check_uncached_incremental_outputs(
