@@ -240,6 +240,30 @@ class StageNotFoundError(DAGError):
         return (self.__class__, (self._unknown, self._available))
 
 
+class TargetsLeftOutError(DAGError):
+    """Raised after a run across all pipelines that keeps going past failures
+    (``repro --all --keep-going``) left out named targets: each one's stage, or a stage upstream
+    of it, has a missing input. ``causes`` maps each target, as given, to that input's error. The
+    run ran every other target first."""
+
+    _causes: dict[str, DependencyNotFoundError]
+
+    def __init__(self, causes: dict[str, DependencyNotFoundError]) -> None:
+        self._causes = causes
+        noun = "target" if len(causes) == 1 else "targets"
+        lines = [f"The run left out {len(causes)} {noun} for a missing input:"]
+        lines.extend(f"  - {target}: {cause}" for target, cause in causes.items())
+        super().__init__("\n".join(lines))
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Ensure each missing file exists or is produced by another stage, then run again"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[dict[str, DependencyNotFoundError]]]:
+        return (self.__class__, (self._causes,))
+
+
 class PivotDBWriteTimeoutError(PivotError):
     """Raised when a StateDB write lock cannot be acquired in time."""
 
@@ -407,7 +431,7 @@ class TrackedFileMissingError(CacheError):
         message = f"The following tracked files are missing:\n{missing_list}\n\n{reason}"
         if self._overlaps:
             message += (
-                "\nPivot stops the run because a file above overlaps a stage output. "
+                "\nPivot does not run a stage whose output overlaps a file above. "
                 + "That stage replaces its output when it runs."
             )
         return message

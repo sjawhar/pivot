@@ -188,7 +188,8 @@ class _MapRun:
     have finished, its producer among them, the engine reads the producer's recorded listing of
     the directory and adds one instance per file, or, for a template in ``wanted``, the instance
     of each key it names. ``stage_order``, ``all_stages`` and ``committed_before`` are the run's
-    own records, which each expansion extends.
+    own records, which each expansion extends. No instance is added whose output is, lies inside
+    or contains a file of ``missing_tracked``.
     """
 
     templates: set[str]
@@ -213,6 +214,12 @@ class _MapRun:
     # Whether the run starts no stage after its first failure, a template's included
     # (``OnError.FAIL``)
     fail_fast: bool
+    # The tracked files the run start found missing and left to the stages that read them
+    # (``executor.core.verify_tracked_files``' ``tolerate_missing``), absolute and normalized;
+    # empty in any other run, which stops on a missing tracked file
+    missing_tracked: list[str]
+    # Whether the run start restored the missing tracked files it could (``--checkout-missing``)
+    checkout_missing: bool
 
 
 def _file_identity(path: pathlib.Path) -> tuple[int, int, int] | None:
@@ -772,6 +779,9 @@ class Engine:
     # Why the running or latest run failed each template it could not expand; emptied when a
     # run starts
     _expansion_failures: dict[str, str]
+    # Each target, as given, that the running or latest run left out for a missing input, with
+    # that input's error (``left_out_targets``); emptied when a run starts
+    _left_out_targets: dict[str, exceptions.DependencyNotFoundError]
     # RPC calls reading the registry in a worker thread (``reading_registry``), and an event set
     # while none does: no run start or expansion changes the registry under them
     _registry_readers: int
@@ -844,6 +854,7 @@ class Engine:
         self._map_run = None
         self._expansion_keys = dict[types.ArtifactIdentity, list[tuple[str, str]]]()
         self._expansion_failures = dict[str, str]()
+        self._left_out_targets = dict[str, exceptions.DependencyNotFoundError]()
         self._registry_readers = 0
         self._registry_unread = anyio.Event()
         self._registry_unread.set()
@@ -880,6 +891,15 @@ class Engine:
         """Why the running or latest run failed template ``template`` (``Pipeline.map``) when it
         could not add its instances; None when no run has failed it since that run started."""
         return self._expansion_failures.get(template)
+
+    @property
+    def left_out_targets(self) -> dict[str, exceptions.DependencyNotFoundError]:
+        """Each target, as given, that the running or latest run left out for a missing input
+        of its stage or of a stage upstream of it, with that input's error: a run across all
+        pipelines that keeps going past failures, outside a watch or serve session, runs its
+        other targets instead of stopping (``repro --all --keep-going``). Emptied when a run
+        starts (returns a copy)."""
+        return dict(self._left_out_targets)
 
     @contextlib.asynccontextmanager
     async def reading_registry(self) -> AsyncIterator[None]:
@@ -1624,6 +1644,8 @@ class Engine:
         from pivot import discovery, run_history
         from pivot import exceptions as pivot_exceptions
 
+        self._left_out_targets = dict[str, exceptions.DependencyNotFoundError]()
+
         # Its stages record their locks in the state directory the pipeline loaded with, and
         # `pivot gc` reads the one `core.state_dir` names now: a run after the value, or a link
         # it names, changed would write locks naming objects no collection keeps. A watch or
@@ -1683,12 +1705,25 @@ class Engine:
         wanted = dict[str, dict[str, set[str]]]()
         if stages:
             stages, wanted = _mapped_targets(stages, templates)
-        executor_core.verify_tracked_files(
+        # A run across all pipelines that keeps going past failures, outside a watch or serve
+        # session, leaves out only the stages that read a tracked file still missing after the
+        # restore, as it leaves out those with any other missing input (leave-out mode). It
+        # still stops on one that is, lies inside or contains an output of a loaded stage, whose
+        # write would delete its sidecar. Any other run stops on every missing tracked file.
+        leave_out = (
+            engine_graph.skips_missing_dependencies(
+                all_pipelines=self._all_pipelines, on_error=on_error
+            )
+            and not self._watches_filesystem()
+        )
+        missing_tracked = executor_core.verify_tracked_files(
             project_root,
             checkout_missing=checkout_missing,
             skip=member_skip.own_member_skip(
                 project_root, all_stages, config.get_state_dir(), cache_dir / "files"
             ),
+            tolerate_missing=leave_out,
+            outputs=ownership.stage_output_paths(project_root, all_stages) if leave_out else None,
         )
 
         # Build bipartite graph (single source of truth). A template is a node of it, reading
@@ -1706,8 +1741,12 @@ class Engine:
             project_root, all_stages, store, config.get_state_dir(), cache_dir / "files"
         ):
             _logger.warning(warning)
-        runnable, dep_errors, _ = engine_graph.get_runnable_stages(
-            graph_stages, store, all_pipelines=self._all_pipelines, on_error=on_error
+        runnable, dep_errors, left_out = engine_graph.get_runnable_stages(
+            graph_stages,
+            store,
+            all_pipelines=self._all_pipelines,
+            on_error=on_error,
+            missing_tracked=missing_tracked,
         )
         if runnable is not None:
             # Skip broken stages but continue with healthy pipelines
@@ -1748,6 +1787,20 @@ class Engine:
                 targets = [t for t in targets if registry.run_target(t, templates) in runnable]
                 if not stages:
                     return {}
+        if leave_out and targets:
+            # A target left out for a missing input, its stage's or one upstream of it, is no
+            # unknown stage: the run runs the other targets, and the command then fails naming
+            # it (``left_out_targets``)
+            for target in targets:
+                run_target = registry.run_target(target, templates)
+                if run_target in left_out:
+                    self._left_out_targets[target] = left_out[run_target]
+            if self._left_out_targets:
+                targets = [t for t in targets if t not in self._left_out_targets]
+                if not targets:
+                    # No target is left; get_execution_order would take no target as every stage
+                    return {}
+                stages, wanted = _mapped_targets(targets, templates)
         if dep_errors:
             graph = engine_graph.build_graph(runnable)
         all_stages = {name: info for name, info in runnable.items() if name not in templates}
@@ -1883,6 +1936,8 @@ class Engine:
                 no_commit=no_commit,
                 allow_uncached_incremental=allow_uncached_incremental,
                 fail_fast=on_error == OnError.FAIL,
+                missing_tracked=missing_tracked,
+                checkout_missing=checkout_missing,
             )
             if run_templates
             else None
@@ -2540,11 +2595,12 @@ class Engine:
         a key they name (``_MapRun.wanted``); each is added to the registry, the run's graph and
         its schedule. The template then completes, so a template mapped over its instances can
         expand next. A refusal (a file whose key cannot name a stage, a named key no file has,
-        an instance whose name or output path another stage holds, an instance's incremental
-        output the run would lose) fails the template with the reason and adds none of its
-        instances. When the expansion succeeds, each instance whose key left the producer's
-        listing is removed (``_remove_orphans``) before the new instances are scheduled, unless
-        the run commits nothing; a refused expansion removes nothing.
+        an instance whose name or output path another stage holds, an instance's output that is,
+        lies inside or contains a missing tracked file, an instance's incremental output the run
+        would lose) fails the template with the reason and adds none of its instances. When the
+        expansion succeeds, each instance whose key left the producer's listing is removed
+        (``_remove_orphans``) before the new instances are scheduled, unless the run commits
+        nothing; a refused expansion removes nothing.
         """
         pipeline = self._require_pipeline()
         template = pipeline.get_template(name)
@@ -2569,6 +2625,17 @@ class Engine:
                     info["name"]: info
                     for info in (registry.instantiate(template, key, file) for key, file in keys)
                 }
+                # An instance output that is, lies inside or contains a missing tracked file
+                # refuses the expansion, as the run start refuses a loaded stage's: the
+                # instance's write would delete that file's sidecar
+                overlap = expansion.tracked_output_refusal(
+                    planned,
+                    map_run.missing_tracked,
+                    map_run.project_root,
+                    checkout_attempted=map_run.checkout_missing,
+                )
+                if overlap is not None:
+                    raise overlap
                 problem = await anyio.to_thread.run_sync(
                     lambda: executor_core.incremental_refusal(
                         list(planned),

@@ -354,7 +354,7 @@ def test_checkout_missing_reports_tracked_input_absent_from_cache(
 
 _NOT_ON_DISK = "These files are tracked by Pivot but don't exist on disk."
 _OVERLAP_STOPS = (
-    "Pivot stops the run because a file above overlaps a stage output. "
+    "Pivot does not run a stage whose output overlaps a file above. "
     + "That stage replaces its output when it runs."
 )
 

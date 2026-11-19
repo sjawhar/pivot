@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import anyio
 import click
 
-from pivot import config, display, project, registry
+from pivot import config, display, exceptions, project, registry
 from pivot import state_dir as state_dir_mod
 from pivot.cli import _run_common, completion, is_standalone_invocation
 from pivot.cli import decorators as cli_decorators
@@ -710,7 +710,12 @@ def _run_oneshot_mode(
     jsonl_callback: Callable[[dict[str, object]], None] | None,
     cancel_event: threading.Event | None,
 ) -> dict[str, ExecutionSummary]:
-    """Run non-watch (one-shot) mode with unified event-driven execution."""
+    """Run non-watch (one-shot) mode with unified event-driven execution.
+
+    Raises:
+        TargetsLeftOutError: The run left out named targets for a missing input
+            (``Engine.left_out_targets``), after it ran the others and reported its results.
+    """
     from pivot.executor import core as executor_core
 
     # Sort for display
@@ -718,6 +723,8 @@ def _run_oneshot_mode(
 
     pipeline = cli_decorators.get_pipeline_from_context()
     use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
+    # The targets the engine left out, copied from it once its run returns
+    left_out = dict[str, exceptions.DependencyNotFoundError]()
 
     # TUI mode for oneshot via RPC
     if tui and run_id:
@@ -778,6 +785,7 @@ def _run_oneshot_mode(
                     checkout_missing=checkout_missing,
                 )
                 await eng.run(exit_on_completion=True)
+                left_out.update(eng.left_out_targets)
                 stage_results = await result_sink.get_results()
                 return _run_common.convert_results(stage_results)
 
@@ -789,9 +797,10 @@ def _run_oneshot_mode(
         )
 
         # Return results (re-raises if engine raised an exception)
-        if result_future.done():
-            return result_future.result()
-        return {}
+        results = result_future.result() if result_future.done() else {}
+        if left_out:
+            raise exceptions.TargetsLeftOutError(left_out)
+        return results
 
     # Non-TUI async mode
     start_time = time.perf_counter()
@@ -818,6 +827,7 @@ def _run_oneshot_mode(
                 checkout_missing=checkout_missing,
             )
             await eng.run(exit_on_completion=True)
+            left_out.update(eng.left_out_targets)
             stage_results = await result_sink.get_results()
             return _run_common.convert_results(stage_results)
 
@@ -861,6 +871,8 @@ def _run_oneshot_mode(
         )
         console.failed_stages(failed_stage_names)
 
+    if left_out:
+        raise exceptions.TargetsLeftOutError(left_out)
     return results
 
 

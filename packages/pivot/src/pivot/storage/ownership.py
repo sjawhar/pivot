@@ -987,6 +987,22 @@ def find_declared_overlap(
     return None
 
 
+def stage_output_paths(
+    project_root: pathlib.Path, stages: Mapping[str, RegistryStageInfo]
+) -> dict[pathlib.Path, str]:
+    """The ``normalized`` path of each output of ``stages``, with the stage that writes it: the
+    ``outputs`` that ``tracked_output_overlaps`` takes. ``store.relative_output_path`` places each
+    output in the project, as ``member_skip.own_member_skip`` places it."""
+    # store imports this module
+    from pivot.storage import store as store_mod
+
+    return {
+        normalized(project_root / store_mod.relative_output_path(out)): stage_name
+        for stage_name, info in stages.items()
+        for out in info["outs"]
+    }
+
+
 def tracked_output_overlaps(
     missing: Iterable[str], outputs: Mapping[pathlib.Path, str], project_root: pathlib.Path
 ) -> dict[str, str]:
@@ -999,7 +1015,8 @@ def tracked_output_overlaps(
     is not inside ``data``. When a path overlaps more than one output, its description names the
     first of them in sorted path order: the outermost output that is or holds the path, else the
     first output inside the path. Every check of missing tracked files against stage outputs
-    calls this one function (``executor.core.verify_tracked_files``), so all of them agree.
+    calls this one function (``executor.core.verify_tracked_files`` for the loaded stages,
+    ``expansion.tracked_output_refusal`` for a mapped stage's instances), so all of them agree.
     """
     trie: pygtrie.Trie[pathlib.Path] = pygtrie.Trie()
     for output in outputs:

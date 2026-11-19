@@ -26,7 +26,7 @@ import lmdb
 
 from pivot import exceptions, registry, types
 from pivot import state_dir as state_dir_mod
-from pivot.storage import listing, lock
+from pivot.storage import listing, lock, ownership
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
@@ -67,7 +67,8 @@ def refusal_reason(source: types.ArtifactIdentity, error: exceptions.PivotError)
     """Why a template cannot expand over the files of directory output ``source``, in the one
     wording a run and every command use: a listing that is missing names the commands that
     bring it back, and any other refusal (a file whose key cannot name a stage, an unusable
-    listing, an instance another stage's name or output path holds) is given as it is."""
+    listing, an instance another stage's name or output path holds, an instance output over a
+    missing tracked file) is given as it is."""
     shown = types.identity_key(source)
     if isinstance(error, exceptions.ListingMissingError):
         return (
@@ -75,6 +76,33 @@ def refusal_reason(source: types.ArtifactIdentity, error: exceptions.PivotError)
             + f"remote that holds it, and `pivot repro --force {source.producer}` writes it again"
         )
     return f"cannot expand over the files of '{shown}': {error}"
+
+
+def tracked_output_refusal(
+    planned: Mapping[str, registry.RegistryStageInfo],
+    missing_tracked: Collection[str],
+    project_root: pathlib.Path,
+    *,
+    checkout_attempted: bool,
+) -> exceptions.TrackedFileMissingError | None:
+    """Why a template cannot add its planned instances ``planned`` (by name, as
+    ``registry.instantiate`` builds them), or None: an instance output that is, lies inside or
+    contains a missing tracked file of ``missing_tracked`` (the absolute normalized paths
+    discovery gives), which that instance's write would delete with its sidecar. The error names
+    each such file and the output it overlaps (``ownership.tracked_output_overlaps``), worded as
+    the run start's check of the loaded stages' outputs (``executor.core.verify_tracked_files``);
+    ``checkout_attempted`` says whether a restore (``--checkout-missing``) tried those files
+    first. With no missing file it reads nothing."""
+    if not missing_tracked:
+        return None
+    overlaps = ownership.tracked_output_overlaps(
+        missing_tracked, ownership.stage_output_paths(project_root, planned), project_root
+    )
+    if not overlaps:
+        return None
+    return exceptions.TrackedFileMissingError(
+        list(overlaps), checkout_attempted=checkout_attempted, overlaps=overlaps
+    )
 
 
 def stage_lock(

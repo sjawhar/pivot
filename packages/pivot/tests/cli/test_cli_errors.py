@@ -1,3 +1,4 @@
+import pathlib
 import pickle
 
 import click
@@ -280,3 +281,32 @@ def test_fuzzy_error_pickling(original: exceptions.PivotError) -> None:
 
     assert str(unpickled) == str(original)
     assert "Did you mean" in unpickled.format_user_message()
+
+
+def test_targets_left_out_error_survives_pickling() -> None:
+    """TargetsLeftOutError keeps one line per target, with its cause's message, through
+    pickling, and names no unknown stage."""
+    original = exceptions.TargetsLeftOutError(
+        {
+            "broken/after": exceptions.DependencyNotFoundError(
+                stage="broken/read_0",
+                dep="missing.txt",
+                input_path=pathlib.Path("/project/data/raw/missing.txt"),
+                input_path_display="data/raw/missing.txt",
+            ),
+            "m/cut@a": exceptions.DependencyNotFoundError(stage="m/cut", dep="p/plan"),
+        }
+    )
+
+    restored = pickle.loads(pickle.dumps(original))
+
+    assert type(restored) is exceptions.TargetsLeftOutError
+    assert str(restored) == (
+        "The run left out 2 targets for a missing input:\n"
+        + "  - broken/after: Stage 'broken/read_0' depends on input 'missing.txt' "
+        + "(path data/raw/missing.txt), which does not exist\n"
+        + "  - m/cut@a: Stage 'm/cut' depends on 'p/plan' which is not produced by any stage "
+        + "and does not exist on disk"
+    )
+    assert "Unknown stage" not in cli_errors.format_pivot_error(restored)
+    assert restored.get_suggestion() == original.get_suggestion()
