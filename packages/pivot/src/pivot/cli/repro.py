@@ -1194,8 +1194,8 @@ def _run_oneshot_mode(
     "--checkout-missing",
     is_flag=True,
     help="Restore tracked files that don't exist on disk from cache before running. With "
-    + "--all --keep-going and without --watch, --dry-run and --explain count such a file the "
-    + "cache holds as present and restore nothing.",
+    + "--all --keep-going, and neither --watch nor --fail-fast, --dry-run and --explain count "
+    + "such a file the cache holds as present and restore nothing.",
 )
 @click.option(
     "--allow-missing",

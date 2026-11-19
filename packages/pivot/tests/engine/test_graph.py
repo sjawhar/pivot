@@ -19,7 +19,8 @@ from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, OnError
 from tests import helpers
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Mapping
+    from collections.abc import Mapping
+    from collections.abc import Set as AbstractSet
     from pathlib import Path
 
 
@@ -533,7 +534,7 @@ def _helper_runnable(
     stages: dict[str, RegistryStageInfo],
     store: store_mod.WorkspaceStore,
     missing_tracked: list[str],
-    restored_tracked: Mapping[str, Collection[tuple[str, ...]]] | None = None,
+    restored_tracked: Mapping[str, AbstractSet[tuple[str, ...]]] | None = None,
 ) -> graph.RunnableStages:
     """``get_runnable_stages`` of a keep-going run across all pipelines."""
     return graph.get_runnable_stages(

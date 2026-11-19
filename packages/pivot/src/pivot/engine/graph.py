@@ -16,6 +16,7 @@ from pivot.engine.types import NodeType
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
+    from collections.abc import Set as AbstractSet
 
     from pivot.exceptions import DependencyNotFoundError
     from pivot.registry import RegistryStageInfo
@@ -347,7 +348,7 @@ def get_runnable_stages(
     all_pipelines: bool,
     on_error: pivot_types.OnError,
     missing_tracked: Collection[str] = (),
-    restored_tracked: Mapping[str, Collection[tuple[str, ...]]] | None = None,
+    restored_tracked: Mapping[str, AbstractSet[tuple[str, ...]]] | None = None,
 ) -> RunnableStages:
     """Return the stages a run executes, with the missing dependencies found.
 
@@ -463,7 +464,7 @@ def _tracked_file_errors(
 
 
 def _restore_creates(
-    restored: Mapping[str, Collection[tuple[str, ...]]],
+    restored: Mapping[str, AbstractSet[tuple[str, ...]]],
 ) -> Callable[[pathlib.Path], bool]:
     """Whether the restore of the missing tracked paths of ``restored`` creates a path, or a
     path inside it. ``restored`` maps each such path to every path its restore creates inside
