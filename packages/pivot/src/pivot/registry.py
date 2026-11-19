@@ -49,10 +49,11 @@ class RegistryStageInfo(TypedDict):
         unsafe_fingerprint: The fingerprint was computed with a refusal downgraded to a
             warning (unsafe fingerprinting), so the run cache neither files nor reuses results.
         read_submodules: The submodules the stage reads through the library packages that hold
-            them (`fingerprint.read_submodules`), set with the fingerprint when the registry
-            computes it (`ensure_fingerprint`): the fingerprint, as a lock records it, leaves out
-            the entries that name them, and the coordinator sends each with the stage
-            (`executor.core.prepare_worker_info`). Absent while the fingerprint is not computed.
+            them, each with the modules whose code reads it so (`fingerprint.read_submodules`),
+            set with the fingerprint (`ensure_fingerprint`), for a `@no_fingerprint` stage too: the
+            fingerprint, as a lock records it, leaves out the entries that name them, and the
+            coordinator sends some with the stage (`executor.core.prepare_worker_info`). Absent
+            while the fingerprint is not computed.
     """
 
     func: Callable[..., Any]
@@ -72,7 +73,7 @@ class RegistryStageInfo(TypedDict):
     code_deps: list[str]
     input_paths: dict[str, str]
     unsafe_fingerprint: bool
-    read_submodules: NotRequired[tuple[str, ...]]
+    read_submodules: NotRequired[dict[str, tuple[str, ...]]]
 
 
 class MapTemplate(TypedDict):
@@ -284,7 +285,8 @@ class StageRegistry:
         """Ensure a stage fingerprint is computed and cached."""
         info = self._stages[stage_name]
         if info["fingerprint"] is None:
-            info["fingerprint"], info["unsafe_fingerprint"] = _compute_fingerprint(stage_name, info)
+            computed = _compute_fingerprint(stage_name, info)
+            info["fingerprint"], info["unsafe_fingerprint"], info["read_submodules"] = computed
         return info["fingerprint"]
 
     def build_dag(self) -> DiGraph[str]:
@@ -541,18 +543,22 @@ def _check_output_path_free(
         )
 
 
-def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict[str, str], bool]:
-    """Compute a stage fingerprint as a lock records it and whether a refusal in it was
-    downgraded, and set `info["read_submodules"]` to the submodules the stage reads through the
-    library packages that hold them (`fingerprint.read_submodules`), read from the whole manifest
-    on a manifest-cache hit or miss alike; wrap errors in one that names the stage once, first: a
-    refusal that starts with the stage's name is given without it
-    (`fingerprint.without_stage_prefix`)."""
+def _compute_fingerprint(
+    stage_name: str, info: RegistryStageInfo
+) -> tuple[dict[str, str], bool, dict[str, tuple[str, ...]]]:
+    """Compute a stage fingerprint as a lock records it, whether a refusal in it was downgraded,
+    and the submodules the stage reads through the library packages that hold them, with their
+    readers (`fingerprint.read_submodules`), read from the whole manifest on a manifest-cache hit
+    or miss alike; wrap errors in one that names the stage once, first: a refusal that starts
+    with the stage's name is given without it (`fingerprint.without_stage_prefix`)."""
     try:
         with fingerprint.stage_fingerprint_scope(stage_name) as scope:
             no_fp = info["no_fingerprint"]
             if no_fp:
                 result = _compute_file_fingerprint(info["func"], info["code_deps"])
+                # The walk does not read the stage's code, so a scan of it finds what it reads
+                # through a library package; its loaders are walked below.
+                result.update(fingerprint.submodule_entries(info["func"]))
             else:
                 result = fingerprint.get_stage_fingerprint_cached(stage_name, info["func"])
             result.update(_wiring_manifest(info))
@@ -570,8 +576,7 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict
             # After every loader's `byname:` entries joined the stage's, on a manifest-cache hit or
             # miss alike: a reinstall to the same path changes no file a hit re-checks.
             fingerprint.add_distribution_keys(result)
-        info["read_submodules"] = tuple(sorted(fingerprint.read_submodules(result)))
-        return fingerprint.without_by_name(result), scope["unsafe"]
+        return fingerprint.as_locked(result), scope["unsafe"], fingerprint.read_submodules(result)
     except Exception as exc:
         message = fingerprint.without_stage_prefix(str(exc), stage_name)
         raise exceptions.PivotError(

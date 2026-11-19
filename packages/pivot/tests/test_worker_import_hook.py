@@ -150,6 +150,37 @@ b.join(30)
 print(json.dumps({"received": received, "overlapped": b_imported_while_a_recorded}))
 """
 
+# A stage is running and reloads `hookwork_statement`, which the child imported before any hook
+# was installed, so nothing has judged it yet: the reload hook's recording judges it, and so
+# builds paths, each counted while the reload runs.
+_STAGE_RELOADS = """\
+import hookwork_statement
+
+from pivot.executor import worker
+
+_init_with_nested_import = pathlib.PurePath.__init__
+paths_built_while_reloading = 0
+reloading = False
+
+
+def _count_while_reloading(self, *args):
+    global paths_built_while_reloading
+    paths_built_while_reloading += reloading
+    _init_with_nested_import(self, *args)
+
+
+pathlib.PurePath.__init__ = _count_while_reloading
+with worker._track_stage_imports(frozenset()) as stage:
+    reloading = True
+    importlib.reload(hookwork_statement)
+    reloading = False
+print(json.dumps({
+    "received": received,
+    "imported": sorted(stage.imported),
+    "paths": paths_built_while_reloading,
+}))
+"""
+
 
 def _helper_run_child(
     tmp_path: pathlib.Path, script: str, nested: str
@@ -232,6 +263,23 @@ def test_one_threads_recording_does_not_swallow_another_threads_import(
     result = json.loads(done.stdout)
     assert result["overlapped"], "the other thread's import did not run during the recording"
     assert _helper_watched(result["received"]) == [["hookwork_statement"], ["hookwork_dynamic"]]
+
+
+def test_a_reload_while_a_stage_runs_is_recorded_and_the_import_its_recording_makes_passes_through(
+    tmp_path: pathlib.Path,
+) -> None:
+    """While a stage runs, `importlib.reload` of a user module nothing has judged yet returns,
+    the stage-import check records the module, and the import of `ntpath` that judging it makes
+    passes through: `record_modules` never receives `ntpath`, as for the other hooks' recording.
+    Were the reload hook's recording not the hooks' own work, that import would be recorded as
+    one the stage made."""
+    done = _helper_run_child(tmp_path, _STAGE_RELOADS, "import ntpath")
+
+    assert done.returncode == 0, done.stderr
+    result = json.loads(done.stdout)
+    assert result["paths"] > 0, "the reload's recording built no path, so it imported nothing"
+    assert result["imported"] == ["hookwork_statement"]
+    assert _helper_watched(result["received"]) == []
 
 
 # Installed as `sitecustomize` for every process of the run, the coordinator and each loky worker.

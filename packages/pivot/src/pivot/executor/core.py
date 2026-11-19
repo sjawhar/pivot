@@ -588,10 +588,12 @@ def prepare_worker_info(
     # The workers started with other digests: the coordinator loaded user code since then.
     if (digests := loaded_source.digests_for_stage()) is not None:
         info["loaded_sources"] = digests
-    # The submodules the stage reads through the library packages the worker imports by name,
-    # which the worker must find bound there: absent only for a stage whose fingerprint the
-    # registry did not compute.
-    if submodules := loaded_source.submodules_to_send(stage_info.get("read_submodules", ())):
+    # The submodules the stage reads through the library packages that hold them, with their
+    # readers, which `ensure_fingerprint` above set with the fingerprint, for a `@no_fingerprint`
+    # stage too (`fingerprint.submodule_entries`); absent only for a `pipeline` whose
+    # `ensure_fingerprint` is no registry's. The worker must find those code sent by value reads
+    # bound on their packages.
+    if submodules := loaded_source.submodules_to_send(stage_info.get("read_submodules", {})):
         info["sent_submodules"] = submodules
     return info
 

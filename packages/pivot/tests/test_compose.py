@@ -1516,8 +1516,8 @@ def test_output_loader_change_detected(
     merges loader keys by class name only, so two CSV outputs with different
     configs clobber each other's config hash.
     """
-    fp_before, _ = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=before_outs))
-    fp_after, _ = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=after_outs))
+    fp_before, _, _ = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=before_outs))
+    fp_after, _, _ = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=after_outs))
     assert fp_before != fp_after
 
 
@@ -1551,7 +1551,7 @@ def test_no_fingerprint_output_loader_collision(set_project_root: pathlib.Path) 
     def _nofp_stage() -> dict:
         return {}
 
-    fp_before, _ = _compute_fingerprint(
+    fp_before, _, _ = _compute_fingerprint(
         "s",
         _make_stage_info(
             _nofp_stage,
@@ -1561,7 +1561,7 @@ def test_no_fingerprint_output_loader_collision(set_project_root: pathlib.Path) 
             ],
         ),
     )
-    fp_after, _ = _compute_fingerprint(
+    fp_after, _, _ = _compute_fingerprint(
         "s",
         _make_stage_info(
             _nofp_stage,
@@ -1576,7 +1576,7 @@ def test_no_fingerprint_output_loader_collision(set_project_root: pathlib.Path) 
 
 def test_dep_loader_config_collision() -> None:
     """Two deps with same loader class but different configs must both be fingerprinted."""
-    fp_before, _ = _compute_fingerprint(
+    fp_before, _, _ = _compute_fingerprint(
         "s",
         _make_stage_info(
             _dummy_stage,
@@ -1586,7 +1586,7 @@ def test_dep_loader_config_collision() -> None:
             },
         ),
     )
-    fp_after, _ = _compute_fingerprint(
+    fp_after, _, _ = _compute_fingerprint(
         "s",
         _make_stage_info(
             _dummy_stage,

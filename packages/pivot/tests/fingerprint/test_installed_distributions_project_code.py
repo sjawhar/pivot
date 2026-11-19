@@ -101,21 +101,6 @@ _PROJECT_CODE = {"mymod/__init__.py": _MYMOD, "company/local.py": installed_dist
 _PROJECT_CODE_OUTPUT = "mine-1:h1:client-1:value-1"
 
 
-def _helper_install_libraries(venv: installed_dists.Venv, src: pathlib.Path) -> None:
-    """Install from their paths, under `src`, `Fix_Lib` (module `fixlib`,
-    `installed_dists.FIXLIB_ALONE`) and `company-client`, whose one package is the namespace
-    portion `company.client`."""
-    fixlib = installed_dists.write_library(src, "Fix_Lib", "fixlib", installed_dists.FIXLIB_ALONE)
-    client = installed_dists.write_setuptools_project(
-        src / "company-client",
-        "company-client",
-        "0.1",
-        packages=["company.client"],
-        files={"company/client/__init__.py": installed_dists.CLIENT},
-    )
-    installed_dists.install(venv, str(fixlib), str(client))
-
-
 def _helper_write_myproj(
     directory: pathlib.Path,
     scratch: pathlib.Path,
@@ -298,7 +283,7 @@ def test_a_flat_project_installed_editable_runs_as_with_its_egg_info_moved_out(
     nothing; with `myproj.egg-info` moved out of the root, `pivot repro --force` writes the same
     lock, its `dist:` keys included. Pivot 0.10.4 runs both projects so."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    _helper_install_libraries(venv, tmp_path / "src")
+    installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
     project = installed_dists.make_project_in(tmp_path, venv, pipeline_text)
     _helper_write_myproj(project.root, tmp_path / "myproj", packages, files)
     installed_dists.install_directory(venv, project.root, editable=True)
@@ -352,7 +337,7 @@ def test_project_code_beside_metadata_with_no_record_outside_site_packages_is_wa
     changes, the stage is stale on `func:mymod.value` alone, and `pivot repro` writes the new
     value: the project's code is walked as user code, and no distribution's RECORD decides it."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    _helper_install_libraries(venv, tmp_path / "src")
+    installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
     project = installed_dists.make_project_in(tmp_path, venv, _PROJECT_CODE_PIPELINE)
     directory = place(tmp_path, venv, project, monkeypatch)
 
@@ -434,7 +419,7 @@ def test_the_part_of_a_namespace_package_in_a_checkout_under_the_venv_is_refused
     `is_user_code` takes a namespace directory under the prefix alone, the directory would be left
     out, and the stage would run with it neither keyed nor refused."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    _helper_install_libraries(venv, tmp_path / "src")
+    installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
     checkout = tmp_path / "venv" / "src" / "checkout"
     refusal = place(tmp_path, venv, checkout)
     (venv.site_packages / "checkout.pth").write_text(f"{checkout}\n")

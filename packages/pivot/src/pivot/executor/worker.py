@@ -140,8 +140,8 @@ class _CoveredImportState(threading.local):
 
 
 class _HookRecordingState(threading.local):
-    """Whether this thread is running the import hooks' own recording work
-    (`_record_hooked_import`).
+    """Whether this thread is running the import hooks' own recording work (`_hook_recording`:
+    `_record_hooked_import`, and `_tracked_reload`'s recording of the reloaded module).
 
     That work can import: Debian's CPython 3.13.5 `pathlib` imports `ntpath` in every
     `PurePath.__init__`, and `fingerprint.is_user_code` builds paths. An import this thread makes
@@ -193,17 +193,6 @@ def _close_window(tracked: _StageImports) -> None:
             tracked.window_resident_before = frozenset()
 
 
-def _is_user_source_module(module: object) -> bool:
-    """Whether `module` is user code loaded from a source file.
-
-    A module created without a file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) has
-    no source to fingerprint, so the stage-import check ignores it.
-    """
-    if not isinstance(module, type(sys)):
-        return False
-    return isinstance(vars(module).get("__file__"), str) and fingerprint.is_user_code(module)
-
-
 def _package_chain(name: str) -> list[str]:
     """`name` and its packages: `a.b.c` gives `a`, `a.b`, `a.b.c`."""
     parts = name.split(".")
@@ -212,11 +201,13 @@ def _package_chain(name: str) -> list[str]:
 
 def _record_stage_import(names: Sequence[str]) -> None:
     """Record each of `names` that is resident user source for the running stage, whether or not
-    it was resident before. On a covered thread of that stage nothing is recorded."""
+    it was resident before; a module made without a source file is ignored
+    (`fingerprint.is_user_source_module`). On a covered thread of that stage nothing is
+    recorded."""
     tracked = _stage_imports
     if tracked is None or _on_covered_thread(tracked):
         return
-    found = [name for name in names if _is_user_source_module(sys.modules.get(name))]
+    found = [name for name in names if fingerprint.is_user_source_module(sys.modules.get(name))]
     if not found:
         return
     with _stage_imports_lock:
@@ -363,19 +354,28 @@ def _import_package(globals: Mapping[str, object] | None) -> str | None:
     return calc_package(globals)
 
 
+@contextlib.contextmanager
+def _hook_recording() -> Generator[None]:
+    """Run the block as the import hooks' own recording work: an import this thread makes
+    meanwhile passes through unrecorded (`_HookRecordingState`). The state it found is restored
+    after it."""
+    state = _hook_recording_state
+    previous = state.recording
+    state.recording = True
+    try:
+        yield
+    finally:
+        state.recording = previous
+
+
 def _record_hooked_import(names: list[str], *, for_stage: bool) -> None:
     """Record the modules `names` that a hooked import requested: in the record of loaded
     source (`loaded_source.record_modules`), and, when `for_stage`, for the running stage
-    (`_record_stage_import`). This thread's imports meanwhile pass through unrecorded
-    (`_HookRecordingState`)."""
-    state = _hook_recording_state
-    state.recording = True
-    try:
+    (`_record_stage_import`), as the hooks' own recording work (`_hook_recording`)."""
+    with _hook_recording():
         loaded_source.record_modules(names)
         if for_stage:
             _record_stage_import(names)
-    finally:
-        state.recording = False
 
 
 def _tracked_import(
@@ -434,11 +434,13 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
 
 
 def _tracked_reload(module: ModuleType) -> ModuleType:
-    """Reload `module`; the discovery recorder wraps the reload's loader and refreshes its record."""
+    """Reload `module`; the discovery recorder wraps the reload's loader and refreshes its record.
+    For the running stage, the reloaded module is recorded as the hooks' own recording work
+    (`_hook_recording`)."""
     result = _original_reload(module)
-    tracked = _stage_imports
-    if tracked is not None:
-        _record_stage_import([result.__name__])
+    if _stage_imports is not None:
+        with _hook_recording():
+            _record_stage_import([result.__name__])
     return result
 
 
@@ -525,7 +527,7 @@ def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
         tracked.new_outside_window.update(
             name
             for name in resident_after - resident_before - tracked.added_in_window
-            if _is_user_source_module(sys.modules.get(name))
+            if fingerprint.is_user_source_module(sys.modules.get(name))
         )
         if installed_here:
             _uninstall_import_hooks()
@@ -922,11 +924,9 @@ class WorkerStageInfo(TypedDict):
     # carries them again only when the coordinator loaded code after that.
     loaded_sources_token: str
     loaded_sources: NotRequired[dict[str, str]]
-    # The submodules the stage reads through the library packages that hold them
-    # (`loaded_source.submodules_to_send`), set when there is one. One cloudpickle sends by value
-    # arrives as a new module object that no package holds, so the worker binds each on its
-    # package before the stage runs (`_bind_sent_submodules`); one it sends by reference is
-    # imported by name as the stage is unpickled, which binds it.
+    # The submodules the worker binds on their packages before the stage runs
+    # (`loaded_source.submodules_to_send`, `_bind_sent_submodules`), set when there is one. Why:
+    # `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs".
     sent_submodules: NotRequired[tuple[ModuleType, ...]]
 
 
@@ -937,8 +937,10 @@ def _bind_sent_submodules(modules: Sequence[ModuleType]) -> None:
     code) then finds it, as a plain run of that code does. A module that unpickling imported by
     name is bound there already. Nothing is imported and `sys.modules` is left as it is, so the
     import checks see what they saw without it. A package this process does not hold is left
-    alone: nothing the stage's pickle holds refers to it, and a stage body that imports it imports
-    it without the module (a stated limit)."""
+    alone: nothing the stage's pickle holds refers to it. A stage body that imports such a package
+    itself gets it without the module, a stated limit that only a library's regular package whose
+    `__init__` extends its `__path__` (`pkgutil.extend_path`) reaches: Pivot refuses a body import
+    of a namespace package with a directory in the project."""
     for module in modules:
         package, _, attribute = module.__name__.rpartition(".")
         parent = sys.modules.get(package)

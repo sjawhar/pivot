@@ -535,6 +535,16 @@ that are part of the stage's code; editing one marks the stage "Code changed".
 **Use sparingly.** File-level hashing is less precise: any change anywhere
 in the file triggers a re-run.
 
+A `@no_fingerprint` stage whose own code reads your module through a package
+it shares with an installed library (`import company.local`, then
+`company.local.value()`, where `company` also has a directory in
+`site-packages`) finds the module there in its worker. A helper module under the
+project root that the stage calls is not read for this: a module that only the
+helper reads so is missing there, and the stage fails with `AttributeError:
+module 'company' has no attribute 'local'`. A helper outside the project root,
+which the worker imports by name, works
+([Imports a Stage Makes While It Runs](../architecture/fingerprinting.md#imports-a-stage-makes-while-it-runs)).
+
 
 ## @pivot.fingerprint_by_name
 

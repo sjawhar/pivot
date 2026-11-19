@@ -64,7 +64,7 @@ import xxhash
 from pivot import fingerprint, import_origin
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable, Mapping
+    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -609,34 +609,31 @@ def _held_suspects(
     return suspects
 
 
-def submodules_to_send(names: Iterable[str]) -> tuple[types.ModuleType, ...]:
+def submodules_to_send(read: Mapping[str, Sequence[str]]) -> tuple[types.ModuleType, ...]:
     """The modules a stage's worker must find bound on their packages before the stage runs, sent
-    with the stage: each of `names`, the submodules the stage reads through the library packages
-    that hold them (`fingerprint.read_submodules`, which the registry keeps beside the stage's
-    fingerprint), as this process's package holds it (read through the package's namespace, so no
-    `__getattr__` runs).
-
-    The worker imports such a package by name (a namespace package the project shares with an
-    installed library, or a library package whose `__init__` extends its `__path__` over the
-    project's directory), and code that reads the module through it (`import company.local`, then
-    `company.local.f()`) finds there only what something bound, where a plain run of the same code
-    finds the module its import bound. cloudpickle builds a module it sends by value (the
-    project's, under its root) as a new module object that no package holds, which the worker
-    binds (`worker._bind_sent_submodules`). A module it sends by reference (the project's in a
-    `PYTHONPATH` entry or a `src` layout, or a library's) the worker imports by name as it
-    unpickles the stage, which binds it, also where cloudpickle alone would not: a read only inside
-    a nested function or a lambda, whose names cloudpickle does not follow. The module objects
-    travel in the stage's pickle, so each one sent by value is the one the stage's own functions
-    hold (`from company import local`). A module the stage reaches by other names only
-    (`from company.local import f`) is not sent, so sending adds none of its module-level values,
-    which the stage may not read and cloudpickle may not be able to pickle, to the stage's pickle."""
+    with the stage: of the submodules the stage reads through the library packages that hold them
+    (`read`, from `fingerprint.read_submodules`: each name, in order, with the readers whose code
+    reads it so), each one bound on this process's package (`fingerprint.bound_submodule`) that a
+    reader cloudpickle sends by value reads: a function of a module it sends by value
+    (`_pickled_by_value`), or one it sends by value whatever its module, as a lambda
+    (`fingerprint.reader_sent_by_value`). Code sent by reference is imported by name in the
+    worker, whose own import binds the submodule; code sent by value does not run that import.
+    Why, and what the worker does with each sent module:
+    `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs"."""
+    by_value = cloudpickle.list_registry_pickle_by_value()
     sent = list[types.ModuleType]()
-    for name in sorted(names):
+    for name, readers in read.items():
+        if not any(
+            fingerprint.reader_sent_by_value(reader) or _pickled_by_value(reader, by_value)
+            for reader in readers
+        ):
+            continue
         package, _, attribute = name.rpartition(".")
         parent = sys.modules.get(package)
-        module = vars(parent).get(attribute) if isinstance(parent, types.ModuleType) else None
-        if isinstance(module, types.ModuleType) and vars(module).get("__name__") == name:
-            sent.append(module)
+        if isinstance(parent, types.ModuleType):
+            module = fingerprint.bound_submodule(parent, attribute)
+            if module is not None:
+                sent.append(module)
     return tuple(sent)
 
 

@@ -15,9 +15,10 @@ when `packages/pivot/src` is pivot 0.10.4's.
 
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
-(`pipeline`), the sources of the fixture libraries `Fix_Lib` and `fixdep`, the project's part
-`LOCAL` of the namespace package `company` and the module `CLIENT` of the library's part of it,
-the two refusals of an
+(`pipeline`, or `pipeline_text` for any imports and expression), the sources of the fixture
+libraries `Fix_Lib` and `fixdep`, the project's part `LOCAL` of the namespace package `company`
+and the module `CLIENT` of the library's part of it, installed with `Fix_Lib`
+(`install_client_and_fixlib`), the two refusals of an
 install Pivot cannot read, word for word, as templates (`DISTRIBUTION_REFUSAL`, and
 `UNLISTED_FILE_REFUSAL`, which `unlisted_refusal` fills; each ends with the fix `REFUSAL_FIX`
 starts) and as those of a broken install of the fixtures, with the start pivot gives each for
@@ -66,8 +67,8 @@ _PIVOT_MAIN = "from pivot.cli import _console_main; _console_main()"
 STAGE = "p/make"
 OUTPUT = pathlib.Path("data/p/make.txt")
 
-# The `pipeline.py` that `pipeline` writes: `{imports}` imports the modules whose `value()`s
-# `{expression}` joins.
+# The `pipeline.py` that `pipeline_text` writes: `{imports}` imports what `{expression}`, the
+# value the stage returns, reads.
 _PIPELINE = """\
 {imports}
 
@@ -84,12 +85,18 @@ with Pipeline("p") as pipeline:
 """
 
 
+def pipeline_text(imports: str, expression: str) -> str:
+    """The `pipeline.py` of a project whose stage `STAGE`, after the lines `imports`, writes the
+    value of `expression`."""
+    return _PIPELINE.format(imports=imports, expression=expression)
+
+
 def pipeline(*modules: str) -> str:
     """The `pipeline.py` of a project whose stage `STAGE` imports each of `modules` and writes
     their `value()`s joined, and names nothing else of them."""
-    return _PIPELINE.format(
-        imports="\n".join(f"import {module}" for module in modules),
-        expression=" + ".join(f"{module}.value()" for module in modules),
+    return pipeline_text(
+        "\n".join(f"import {module}" for module in modules),
+        " + ".join(f"{module}.value()" for module in modules),
     )
 
 
@@ -120,9 +127,11 @@ def main():
 # The project's part of the namespace package `company` it shares with `company-client`, the module
 # `company.local`, and the module of `company-client`'s namespace portion `company.client`, which
 # imports its package, as a library module that reads a sibling through it does, so
-# `company.client` holds `company`.
+# `company.client` holds `company`. `CLIENT_FILES` are the files of a `company-client` whose one
+# package is that portion, each path relative to its project (`install_client_and_fixlib`).
 LOCAL = 'def value():\n    return "local-1"\n'
 CLIENT = 'import company\n\n\ndef value():\n    return "client-1"\n'
+CLIENT_FILES: Mapping[str, str] = {"company/client/__init__.py": CLIENT}
 
 # The two refusals pivot gives of an install it cannot read, word for word, each a template for
 # `str.format`, so that a change to the words of either is made here alone: a distribution's
@@ -441,6 +450,21 @@ def install_directory(
         reinstall=reinstall,
         link_mode=link_mode,
     )
+
+
+def install_client_and_fixlib(venv: Venv, src: pathlib.Path, client: Mapping[str, str]) -> None:
+    """Install into the venv from their paths, under `src`, `Fix_Lib` (module `fixlib`,
+    `FIXLIB_ALONE`) and `company-client`, whose files are `client` (each path relative to its
+    project, with its text, as `CLIENT_FILES`), in the import packages of the directories that
+    hold them."""
+    fixlib = write_library(src, "Fix_Lib", "fixlib", FIXLIB_ALONE)
+    packages = sorted(
+        {str(pathlib.PurePosixPath(relative).parent).replace("/", ".") for relative in client}
+    )
+    source = write_setuptools_project(
+        src / "company-client", "company-client", "0.1", packages=packages, files=client
+    )
+    install(venv, str(fixlib), str(source))
 
 
 def build_wheel(venv: Venv, source: pathlib.Path, wheels: pathlib.Path) -> str:

@@ -370,7 +370,7 @@ def test_no_dependency_output_or_stage_name_is_read_as_a_module_or_by_name_entry
 
     assert fingerprint.covered_user_modules(manifest, outputs) == covered
     assert fingerprint.by_name_modules(manifest, outputs) == {"json", *covered}
-    lock = fingerprint.without_by_name(manifest)
+    lock = fingerprint.as_locked(manifest)
     assert lock["dist:json"] == "0123456789abcdef", "A lock should keep the stage's dist: key"
     assert lock == {key: value for key, value in manifest.items() if key != "byname:json"}
 
