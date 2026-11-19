@@ -2166,6 +2166,7 @@ def _helper_execute_compose_stage(
         project_root=tmp_path,
         default_state_dir=tmp_path / ".pivot",
         store_spec=store_spec,
+        pickle_trials={},
     )
     return worker.execute_stage(stage_name, stage_info, cache_dir, output_queue)
 

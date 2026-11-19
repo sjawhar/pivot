@@ -34,6 +34,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import threading
 import types
 import uuid
 from typing import TYPE_CHECKING
@@ -44,6 +45,8 @@ import yaml
 from tests import helpers
 
 from pivot import discovery, exceptions, executor, fingerprint, loaded_source, project
+from pivot.executor import core as executor_core
+from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
@@ -1104,6 +1107,105 @@ def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_w
     assert "func:wi_bound.other.plain" not in first, first
     assert "func:wi_bound.other.plain" in second, second
     assert fingerprint.read_submodules(second) == ("wi_bound.local", "wi_bound.other"), second
+
+
+# A project module that holds a lock, which cloudpickle cannot pickle, and `plain`, which returns
+# `sent`; the stage reads it through its package's name inside a lambda alone, whose names
+# cloudpickle does not follow, so the module reaches the worker only where the coordinator sends it.
+_SENT_WITH_LOCK = (
+    "import threading\n\n_LOCK = threading.Lock()\n\n\n"
+    + 'def plain() -> str:\n    return "sent"\n'
+)
+
+
+def _helper_sent_submodules(
+    pipeline: PipelineLike, root: pathlib.Path, pickle_trials: executor_core.PickleTrials
+) -> tuple[types.ModuleType | str, ...] | None:
+    """What the coordinator sends with stage `p/use` of the project at `root`
+    (`WorkerStageInfo.sent_submodules`, None for nothing) in the engine run whose trial pickles
+    `pickle_trials` records."""
+    info = executor_core.prepare_worker_info(
+        pipeline.get_stage("p/use"),
+        pipeline,
+        overrides={},
+        run_id="run",
+        force=False,
+        no_commit=False,
+        project_root=root,
+        default_state_dir=root / ".pivot",
+        store_spec=store_mod.StoreSpec(
+            kind="workspace",
+            cache_dir=str(root / ".pivot" / "cache" / "files"),
+            project_root=str(root),
+            pipeline_name=pipeline.name,
+            input_bindings=pipeline.input_bindings,
+            checkout_modes=[],
+        ),
+        pickle_trials=pickle_trials,
+    )
+    return info.get("sent_submodules")
+
+
+def test_a_module_sent_by_value_is_tried_once_in_an_engine_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wi_once` is a namespace package the program holds with a directory in `site-packages`
+    and one in the project root, whose `local.py` the stage reads through the package's name, and
+    which discovery pickles by value. The coordinator sends the module with the stage, as it pickles
+    alone, and records that in the engine run's trial pickles. Once the module holds a lock, which
+    cloudpickle cannot pickle, a later dispatch in the same run sends it again without trying it,
+    while a new run's record tries it and sends nothing (`executor.core.PickleTrials`)."""
+    package = _helper_shared_namespace("wi_once", tmp_path, monkeypatch)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {"wi_once/local.py": _PLAIN},
+        _pipeline("import wi_once.local", "(lambda: wi_once.local.plain())()"),
+    )
+    local = vars(package)["local"]
+    root = tmp_path / "project"
+    pickle_trials: executor_core.PickleTrials = {}
+
+    first = _helper_sent_submodules(pipeline, root, pickle_trials)
+    monkeypatch.setattr(local, "_LOCK", threading.Lock(), raising=False)
+    again = _helper_sent_submodules(pipeline, root, pickle_trials)
+    fresh = _helper_sent_submodules(pipeline, root, {})
+
+    assert (first, again, fresh) == ((local,), (local,), None)
+
+
+def test_a_module_that_did_not_pickle_alone_is_tried_again_in_the_next_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wi_trial` is a namespace package the program holds with a directory in `site-packages`
+    and one in the project root, whose `local.py` holds a lock, which cloudpickle cannot pickle;
+    the stage reads it through the package's name inside a lambda, whose names cloudpickle does
+    not follow. The first run of the pipeline in this process does not send the module, which does
+    not pickle alone, and the stage fails in its worker with `AttributeError`. The program then
+    takes the lock out of that module object, and the second run of the same pipeline tries it
+    again, sends it, and the stage writes `sent`: the engine records its trial pickles for one run
+    (`executor.core.PickleTrials`). Were the first run's record kept, the second run would not
+    send the module, and the stage would fail again."""
+    package = _helper_shared_namespace("wi_trial", tmp_path, monkeypatch)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {"wi_trial/local.py": _SENT_WITH_LOCK},
+        _pipeline("import wi_trial.local", "(lambda: wi_trial.local.plain())()"),
+    )
+    local = vars(package)["local"]
+
+    first = executor.run(pipeline=pipeline)
+    monkeypatch.delattr(local, "_LOCK")
+    second = executor.run(pipeline=pipeline)
+
+    failure = first["p/use"]["reason"].splitlines()[-1]
+    assert (first["p/use"]["status"], failure) == (
+        "failed",
+        "AttributeError: module 'wi_trial' has no attribute 'local'",
+    ), first
+    assert second["p/use"]["status"] == "ran", second
+    assert (tmp_path / "project" / "data" / "p" / "use.txt").read_text() == "sent"
 
 
 def _helper_library_namespace(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -514,10 +514,15 @@ A stage can read your module through a package it shares with an installed
 library: `import company.local`, then `company.local.value()`, where `company`
 also has a directory in `site-packages` (a namespace package, or a library
 package whose `__init__` calls `pkgutil.extend_path`). Pivot sends that module
-with the stage when it can pickle it alone, and the worker puts it on the
-package while the stage runs, so the stage runs as a plain `python` run of your
-code does, and an edit to the module reruns it. Three cases behave as in Pivot
-0.10.4
+with the stage: a module of your project that Pivot sends by value as itself,
+when Pivot can pickle it alone, and any other (a module outside the project
+root, say) by its name, which the worker imports before the stage runs. The
+worker puts it on the package while the stage runs, so the stage runs as a
+plain `python` run of your code does, and an edit to the module reruns it.
+When the worker's import of a module sent by name fails, only that stage fails,
+with a reason that names the module.
+
+These cases behave as in Pivot 0.10.4
 ([Imports a Stage Makes While It Runs](../architecture/fingerprinting.md#imports-a-stage-makes-while-it-runs)):
 
 - A module that cannot be pickled (one holding a `threading.Lock`) is not
@@ -533,6 +538,25 @@ code does, and an edit to the module reruns it. Three cases behave as in Pivot
   compares the stage's `Mode.FAST` with the helper's copy of `Mode`.
 - The module's import-time code does not run in the worker: a class it
   registers with a library as it is imported is not registered there.
+- A stage body that imports the library's package itself (`import company`
+  inside the stage) gets it without your module. Only a library package whose
+  `__init__` calls `pkgutil.extend_path` reaches this: Pivot refuses such an
+  import of a namespace package that has a directory in your project.
+- A `@no_fingerprint` stage's helper module is not read, so a module that only
+  the helper reads through the package is in the worker only where an import
+  there puts it (see `@pivot.no_fingerprint()` below).
+- A function of the module that rebinds one of its globals (`global COUNT`)
+  changes the copy its functions read: code that then reads
+  `company.local.COUNT` through the package still sees the old value.
+- A package of yours below the shared one (`company/proj/__init__.py`) one of
+  whose modules a helper outside the project root imports itself
+  (`import company.proj.other`) is the helper's copy in the worker, which holds
+  only the modules that import loaded: reading another one through it
+  (`company.proj.mod`) fails with `AttributeError`.
+- A module outside the project root that the stage's own code reads through the
+  package (not inside a lambda) is imported as the worker receives the stage:
+  if that import fails, every stage running in Pivot's workers at that moment
+  fails, with `A task has failed to un-serialize`.
 
 ## @pivot.no_fingerprint()
 

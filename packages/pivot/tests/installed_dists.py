@@ -17,19 +17,16 @@ It also holds what the test files of those keys share: the stage `STAGE` of thei
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
 (`pipeline`, or `pipeline_text` for any imports, expression and decorator), the `stage_complete`
 events a `pivot repro --json` prints (`stage_complete_events`), the sources of the fixture
-libraries `Fix_Lib` and `fixdep`, the project's part `LOCAL` of the namespace package `company`
-and the module `CLIENT` of the library's part of it (what the tests of that part share besides:
-`tests.shared_namespace`), the two refusals of an
-install Pivot cannot read, word for word, as templates (`DISTRIBUTION_REFUSAL`, and
-`UNLISTED_FILE_REFUSAL`, which `unlisted_refusal` fills; each ends with the fix `REFUSAL_FIX`
-starts) and as those of a broken install of the fixtures, with the start pivot gives each for
-`STAGE`, in an error (`STAGE_FAILED`) and in a warning (`STAGE_PREFIX`), a run that refuses and
-warns of nothing (`assert_runs_with_no_refusal`), the layout flit's `install --symlink` gives an
-editable install (`flit_symlink_install`), built by hand since CI has no flit, the layout uv
-gives an install from a package index, its files copied or linked into a cache
-(`index_install_by_hand`), built by hand for the tests that start no process, and what those
-tests give `installed_distributions.distribution_keys` of a module loaded from a file
-(`module_loaded_from`).
+libraries `Fix_Lib` and `fixdep`, the two refusals of an install Pivot cannot read, word for
+word, as templates (`DISTRIBUTION_REFUSAL`, and `UNLISTED_FILE_REFUSAL`, which `unlisted_refusal`
+fills; each ends with the fix `REFUSAL_FIX` starts) and as those of a broken install of the
+fixtures, with the start pivot gives each for `STAGE`, in an error (`STAGE_FAILED`) and in a
+warning (`STAGE_PREFIX`), a run that refuses and warns of nothing (`assert_runs_with_no_refusal`),
+the layout flit's `install --symlink` gives an editable install (`flit_symlink_install`), built
+by hand since CI has no flit, the layout uv gives an install from a package index, its files
+copied or linked into a cache (`index_install_by_hand`), built by hand for the tests that start
+no process, and what those tests give `installed_distributions.distribution_keys` of a module
+loaded from a file (`module_loaded_from`).
 """
 
 from __future__ import annotations
@@ -128,15 +125,6 @@ def value():
 def main():
     print(value())
 """
-# The project's part of the namespace package `company` it shares with `company-client`, the module
-# `company.local`, and the module of `company-client`'s namespace portion `company.client`, which
-# imports its package, as a library module that reads a sibling through it does, so
-# `company.client` holds `company`. `CLIENT_FILES` are the files of a `company-client` whose one
-# package is that portion, each path relative to its project
-# (`shared_namespace.install_client_and_fixlib`).
-LOCAL = 'def value():\n    return "local-1"\n'
-CLIENT = 'import company\n\n\ndef value():\n    return "client-1"\n'
-CLIENT_FILES: Mapping[str, str] = {"company/client/__init__.py": CLIENT}
 
 # The two refusals pivot gives of an install it cannot read, word for word, each a template for
 # `str.format`, so that a change to the words of either is made here alone: a distribution's

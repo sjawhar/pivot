@@ -120,8 +120,8 @@ _PROJECT_FILES = {
     "site-packages/libfrom/lazysub.py": "from projpkg import sub\n",
 }
 
-# As BET-1194's reproduction starts a worker (`core._init_worker`, loky's initializer), then
-# imports as the stage would.
+# As the reproduction of a stage import that recursed in the hooks starts a worker
+# (`core._init_worker`, loky's initializer), then imports as the stage would.
 _WORKER_START = """\
 import os
 

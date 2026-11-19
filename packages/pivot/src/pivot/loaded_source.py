@@ -577,7 +577,7 @@ def _suspect_origin(
         name == "__main__"
         or module is None
         or held_modules.get(name) is not module
-        or _pickled_by_value(name, by_value)
+        or pickled_by_value(name, by_value)
     ):
         return None
     held = import_origin.of_module(module)
@@ -609,9 +609,10 @@ def _held_suspects(
     return suspects
 
 
-def _pickled_by_value(name: str, registry: set[str]) -> bool:
-    """Whether cloudpickle sends module `name` by value: it or one of its packages is
-    registered (as `cloudpickle.cloudpickle._is_registered_pickle_by_value` decides)."""
+def pickled_by_value(name: str, registry: set[str]) -> bool:
+    """Whether cloudpickle sends module `name` by value: it or one of its packages is in
+    `registry` (`cloudpickle.list_registry_pickle_by_value()`), as
+    `cloudpickle.cloudpickle._is_registered_pickle_by_value` decides."""
     parts = name.split(".")
     return any(".".join(parts[:index]) in registry for index in range(1, len(parts) + 1))
 

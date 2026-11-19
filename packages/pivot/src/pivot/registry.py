@@ -60,9 +60,10 @@ class RegistryStageInfo(TypedDict):
             packages that hold them, sorted (`fingerprint.read_submodules`), set with the
             fingerprint (`ensure_fingerprint`), for a `@no_fingerprint` stage too: the fingerprint,
             as a lock records it, leaves out the entries that name them, and the coordinator
-            sends with the stage each whose module pickles alone, for its worker to bind on the
-            package (`executor.core.prepare_worker_info`). Absent while the fingerprint is not
-            computed.
+            sends each with the stage, by name where cloudpickle pickles it by reference and as
+            the module where it pickles it by value and it pickles alone, for its worker to bind
+            on the package (`executor.core.prepare_worker_info`). Absent while the fingerprint is
+            not computed.
     """
 
     func: Callable[..., Any]

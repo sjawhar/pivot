@@ -97,7 +97,7 @@ with Pipeline("p") as pipeline:
 
 # What `mymod` and the project's part of `company` hold, each path relative to the directory
 # that holds them, and what the stage that calls them writes.
-_PROJECT_CODE = {"mymod/__init__.py": _MYMOD, "company/local.py": installed_dists.LOCAL}
+_PROJECT_CODE = {"mymod/__init__.py": _MYMOD, "company/local.py": shared_namespace.LOCAL}
 _PROJECT_CODE_OUTPUT = "mine-1:h1:client-1:value-1"
 
 
@@ -260,7 +260,7 @@ def _helper_in_a_pythonpath_entry_with_a_target_install(
         pytest.param(
             _NAMESPACE_PIPELINE,
             [],
-            {"company/local.py": installed_dists.LOCAL},
+            {"company/local.py": shared_namespace.LOCAL},
             "client-1:value-1",
             id="shared-namespace",
         ),
@@ -283,7 +283,9 @@ def test_a_flat_project_installed_editable_runs_as_with_its_egg_info_moved_out(
     nothing; with `myproj.egg-info` moved out of the root, `pivot repro --force` writes the same
     lock, its `dist:` keys included. Pivot 0.10.4 runs both projects so."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    shared_namespace.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
+    shared_namespace.install_client_and_fixlib(
+        venv, tmp_path / "src", shared_namespace.CLIENT_FILES
+    )
     project = installed_dists.make_project_in(tmp_path, venv, pipeline_text)
     _helper_write_myproj(project.root, tmp_path / "myproj", packages, files)
     installed_dists.install_directory(venv, project.root, editable=True)
@@ -337,7 +339,9 @@ def test_project_code_beside_metadata_with_no_record_outside_site_packages_is_wa
     changes, the stage is stale on `func:mymod.value` alone, and `pivot repro` writes the new
     value: the project's code is walked as user code, and no distribution's RECORD decides it."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    shared_namespace.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
+    shared_namespace.install_client_and_fixlib(
+        venv, tmp_path / "src", shared_namespace.CLIENT_FILES
+    )
     project = installed_dists.make_project_in(tmp_path, venv, _PROJECT_CODE_PIPELINE)
     directory = place(tmp_path, venv, project, monkeypatch)
 
@@ -362,7 +366,7 @@ def _helper_checkout_beside_a_target_install_without_record(
     there, which no RECORD lists beside `fixtarget`."""
     _helper_target_install_without_record(venv, tmp_path / "src", checkout)
     (checkout / "company").mkdir()
-    (checkout / "company" / "checkout.py").write_text(installed_dists.LOCAL)
+    (checkout / "company" / "checkout.py").write_text(shared_namespace.LOCAL)
     return installed_dists.UNLISTED_LOCAL_DIRECTORY_REFUSAL.format(
         module="company", file="company/checkout.py", site=checkout.resolve(), name="fixtarget"
     )
@@ -419,7 +423,9 @@ def test_the_part_of_a_namespace_package_in_a_checkout_under_the_venv_is_refused
     `is_user_code` takes a namespace directory under the prefix alone, the directory would be left
     out, and the stage would run with it neither keyed nor refused."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    shared_namespace.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
+    shared_namespace.install_client_and_fixlib(
+        venv, tmp_path / "src", shared_namespace.CLIENT_FILES
+    )
     checkout = tmp_path / "venv" / "src" / "checkout"
     refusal = place(tmp_path, venv, checkout)
     (venv.site_packages / "checkout.pth").write_text(f"{checkout}\n")
