@@ -40,7 +40,7 @@ from pivot.storage import cache, listing, lock, naming, state, track
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
     from pivot.registry import RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
@@ -991,7 +991,7 @@ def stage_output_paths(
     project_root: pathlib.Path, stages: Mapping[str, RegistryStageInfo]
 ) -> dict[pathlib.Path, str]:
     """The ``normalized`` path of each output of ``stages``, with the stage that writes it: the
-    ``outputs`` that ``tracked_output_overlaps`` takes. ``store.relative_output_path`` places each
+    ``outputs`` that ``tracked_output_refusal`` takes. ``store.relative_output_path`` places each
     output in the project, as ``member_skip.own_member_skip`` places it."""
     # store imports this module
     from pivot.storage import store as store_mod
@@ -1003,39 +1003,91 @@ def stage_output_paths(
     }
 
 
-def tracked_output_overlaps(
+def tracked_output_refusal(
+    missing: Collection[str],
+    outputs: Mapping[pathlib.Path, str],
+    project_root: pathlib.Path,
+    *,
+    checkout_attempted: bool,
+) -> exceptions.TrackedFileMissingError | None:
+    """The refusal of the stages whose outputs ``outputs`` holds, or None: a missing tracked
+    path of ``missing`` (absolute normalized paths, as ``track.discover_pvt_files`` gives them)
+    is, lies inside or contains one of those outputs, so that stage's write would delete the
+    path's sidecar. ``outputs`` maps the ``normalized`` path of each output to the stage that
+    writes it (``stage_output_paths``). The error names each such path and how it overlaps
+    (``_tracked_output_overlaps``); ``checkout_attempted`` says whether a restore
+    (``--checkout-missing``) tried those paths first. Every check of missing tracked files
+    against stage outputs builds its refusal here: the run start's check of the loaded stages
+    (``executor.core.verify_tracked_files``), the run's check of a mapped stage's planned
+    instances (``Engine._expand_template``) and the dry run's check of both
+    (``pivot repro --dry-run``), so all of them agree. With no missing path it reads nothing.
+    """
+    if not missing:
+        return None
+    overlaps = _tracked_output_overlaps(missing, outputs, project_root)
+    if not overlaps:
+        return None
+    return exceptions.TrackedFileMissingError(
+        list(overlaps), checkout_attempted=checkout_attempted, overlaps=overlaps
+    )
+
+
+def _tracked_output_overlaps(
     missing: Iterable[str], outputs: Mapping[pathlib.Path, str], project_root: pathlib.Path
 ) -> dict[str, str]:
-    """Say how each missing tracked path overlaps a stage output, for each one that overlaps one.
+    """Say how each missing tracked path overlaps an output, for each one that overlaps one.
 
-    ``missing`` holds absolute normalized paths, as ``track.discover_pvt_files`` gives them.
-    ``outputs`` maps the ``normalized`` path of each output to the stage that writes it. A path
-    overlaps an output when it is that output, lies inside it or contains it. Path parts decide
-    this (a ``pygtrie.Trie`` keyed by ``Path.parts``), never a string prefix: ``data-backup/x``
-    is not inside ``data``. When a path overlaps more than one output, its description names the
-    first of them in sorted path order: the outermost output that is or holds the path, else the
-    first output inside the path. Every check of missing tracked files against stage outputs
-    calls this one function (``executor.core.verify_tracked_files`` for the loaded stages,
-    ``expansion.tracked_output_refusal`` for a mapped stage's instances), so all of them agree.
+    A path overlaps an output when it is that output, lies inside it or contains it, by their
+    normalized paths or by their resolved ones (``os.path.realpath``, which resolves a missing
+    path's existing ancestors): a path that reaches an output through a symlink overlaps it, and
+    its description then says what both resolve to, as ``find_declared_overlap`` says. Path
+    parts decide this (a ``pygtrie.Trie`` keyed by ``Path.parts``), never a string prefix:
+    ``data-backup/x`` is not inside ``data``. When a path overlaps more than one output, its
+    description names the first of them in sorted path order: the outermost output that is or
+    holds the path, else the first output inside the path.
     """
-    trie: pygtrie.Trie[pathlib.Path] = pygtrie.Trie()
-    for output in outputs:
-        trie[output.parts] = output
+    real_outputs = {output: pathlib.Path(os.path.realpath(output)) for output in outputs}
+    lexical: pygtrie.Trie[pathlib.Path] = pygtrie.Trie()
+    resolved: pygtrie.Trie[pathlib.Path] = pygtrie.Trie()
+    for output, real_output in real_outputs.items():
+        lexical[output.parts] = output
+        resolved[real_output.parts] = output
     overlaps = dict[str, str]()
     for missing_path in missing:
         path = pathlib.Path(missing_path)
-        enclosing = trie.shortest_prefix(path.parts)
-        if enclosing is not None and enclosing.is_set:
-            output = trie[enclosing.key]
-        elif trie.has_subtrie(path.parts):
-            output = min(trie.values(prefix=path.parts))
+        output = _overlapping_output(lexical, path)
+        if output is not None:
+            relation = _relation(path, output)
+            resolves = ""
         else:
-            continue
+            real_path = pathlib.Path(os.path.realpath(path))
+            output = _overlapping_output(resolved, real_path)
+            if output is None:
+                continue
+            relation = _relation(real_path, real_outputs[output])
+            resolves = (
+                f" (the path resolves to '{real_path}'; the output resolves to "
+                + f"'{real_outputs[output]}')"
+            )
         overlaps[missing_path] = (
-            f"it {_relation(path, output)} output '{display_path(output, project_root)}' "
-            + f"of stage '{outputs[output]}'"
+            f"it {relation} output '{display_path(output, project_root)}' "
+            + f"of stage '{outputs[output]}'{resolves}"
         )
     return overlaps
+
+
+def _overlapping_output(
+    trie: pygtrie.Trie[pathlib.Path], path: pathlib.Path
+) -> pathlib.Path | None:
+    """The output that ``path`` overlaps, ``trie`` and ``path`` keyed by the same form of their
+    paths: the outermost one that is or holds it, else the first in sorted path order that it
+    holds; None for none."""
+    enclosing = trie.shortest_prefix(path.parts)
+    if enclosing is not None and enclosing.is_set:
+        return trie[enclosing.key]
+    if trie.has_subtrie(path.parts):
+        return min(trie.values(prefix=path.parts))
+    return None
 
 
 def _warning(overlap: OutputOverlap, project_root: pathlib.Path) -> str:

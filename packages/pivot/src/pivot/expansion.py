@@ -26,7 +26,7 @@ import lmdb
 
 from pivot import exceptions, registry, types
 from pivot import state_dir as state_dir_mod
-from pivot.storage import listing, lock, ownership
+from pivot.storage import listing, lock
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
@@ -82,34 +82,6 @@ def refusal_reason(source: types.ArtifactIdentity, error: exceptions.PivotError)
             + f"remote that holds it, and `pivot repro --force {source.producer}` writes it again"
         )
     return f"cannot expand over the files of '{shown}': {error}"
-
-
-def tracked_output_refusal(
-    stages: Mapping[str, registry.RegistryStageInfo],
-    missing_tracked: Collection[str],
-    project_root: pathlib.Path,
-    *,
-    checkout_attempted: bool,
-) -> exceptions.TrackedFileMissingError | None:
-    """Why stages ``stages`` (by name) cannot run, or None: an output that is, lies inside or
-    contains a missing tracked file of ``missing_tracked`` (the absolute normalized paths
-    discovery gives), which that stage's write would delete with its sidecar. The stages are a
-    template's planned instances, as ``registry.instantiate`` builds them, or the loaded stages a
-    dry run checks before it expands (``pivot repro --dry-run``). The error names each such file
-    and the output it overlaps (``ownership.tracked_output_overlaps``), worded as the run start's
-    check of the loaded stages' outputs (``executor.core.verify_tracked_files``);
-    ``checkout_attempted`` says whether a restore (``--checkout-missing``) tried those files
-    first. With no missing file it reads nothing."""
-    if not missing_tracked:
-        return None
-    overlaps = ownership.tracked_output_overlaps(
-        missing_tracked, ownership.stage_output_paths(project_root, stages), project_root
-    )
-    if not overlaps:
-        return None
-    return exceptions.TrackedFileMissingError(
-        list(overlaps), checkout_attempted=checkout_attempted, overlaps=overlaps
-    )
 
 
 def mapped_targets(
@@ -262,7 +234,7 @@ def expand_current(
     when given, may refuse a template before its instances are added: given the template and
     the (key, file key) of each instance, it returns why the template cannot expand, or None. Its
     refusal is recorded as any other (a dry run of ``pivot repro`` passes the run's check of the
-    instances' outputs over missing tracked files, ``tracked_output_refusal``).
+    instances' outputs over missing tracked files, ``ownership.tracked_output_refusal``).
     """
     pipeline.reset_expansions()
     result = Expansion(expanded={}, not_expanded={}, listings={})

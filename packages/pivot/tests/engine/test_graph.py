@@ -15,8 +15,8 @@ from pivot.engine import graph, types
 from pivot.executor import core as executor_core
 from pivot.registry import RegistryStageInfo
 from pivot.storage import store as store_mod
-from pivot.storage import track
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, OnError
+from tests import helpers
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -525,12 +525,7 @@ def _helper_missing_tracked(root: Path, *paths: str) -> list[str]:
     cache object, and return the tracked files the pre-flight finds missing, as it gives them.
     The directory holding each path exists, since it holds the .pvt."""
     for path in paths:
-        data_path = root / path
-        data_path.parent.mkdir(parents=True, exist_ok=True)
-        track.write_pvt_file(
-            track.get_pvt_path(data_path),
-            track.PvtData(path=data_path.name, hash="0123456789abcdef", size=10),
-        )
+        helpers.track_without_data(root / path)
     return executor_core.find_missing_tracked_files(root).missing
 
 
@@ -538,7 +533,7 @@ def _helper_runnable(
     stages: dict[str, RegistryStageInfo],
     store: store_mod.WorkspaceStore,
     missing_tracked: list[str],
-    restorable_tracked: Collection[str] = (),
+    restored_tracked: Collection[str] = (),
 ) -> graph.RunnableStages:
     """``get_runnable_stages`` of a keep-going run across all pipelines."""
     return graph.get_runnable_stages(
@@ -547,7 +542,7 @@ def _helper_runnable(
         all_pipelines=True,
         on_error=OnError.KEEP_GOING,
         missing_tracked=missing_tracked,
-        restorable_tracked=restorable_tracked,
+        restored_tracked=restored_tracked,
     )
 
 
@@ -718,36 +713,117 @@ def test_get_runnable_stages_decides_containment_by_path_parts(set_project_root:
 
 
 @pytest.mark.parametrize(
-    ("tracked", "binding"),
+    ("binding", "kept"),
     [
-        pytest.param("data/x.csv", "data/x.csv", id="equal"),
-        pytest.param("data/tracked", "data/tracked/x.csv", id="inside"),
+        pytest.param("data/tracked", False, id="the-restored-directory"),
+        pytest.param("data/tracked/x.csv", False, id="a-file-of-its-listing"),
+        pytest.param("data/tracked/sub", False, id="a-subdirectory-holding-its-files"),
+        pytest.param("data/x.csv", False, id="a-restored-file"),
+        pytest.param("data/tracked/cat.png", True, id="a-file-its-listing-lacks"),
+        pytest.param("data/x.csv/inner", True, id="inside-a-restored-file"),
     ],
 )
-def test_get_runnable_stages_counts_a_restorable_tracked_file_as_present(
-    set_project_root: Path, tracked: str, binding: str
+def test_get_runnable_stages_counts_a_path_the_restore_creates_as_present(
+    set_project_root: Path, binding: str, kept: bool
 ) -> None:
-    """A dependency that is or lies inside a restorable tracked file has no error; a stage
-    reading a missing tracked file the cache cannot restore is still left out."""
-    restorable, gone = _helper_missing_tracked(set_project_root, tracked, "data/z.csv")
-    assert gone == str(set_project_root / "data" / "z.csv")
+    """A dry run with --checkout-missing counts a missing dependency as present when the restore
+    creates it: a restorable tracked file or directory, a file the directory's listing holds, or
+    a subdirectory holding such files. Any other missing dependency keeps its error, as the run
+    still finds it missing after the restore; a stage reading a missing tracked file the cache
+    cannot restore is left out either way."""
+    [gone] = _helper_missing_tracked(set_project_root, "data/z.csv")
+    tracked = set_project_root / "data" / "tracked"
+    restored = [
+        str(set_project_root / "data" / "x.csv"),
+        str(tracked),
+        str(tracked / "x.csv"),
+        str(tracked / "sub" / "y.csv"),
+    ]
     stages = {
         "p/read": _helper_input_stage("p/read", ["x"]),
         "p/other": _helper_input_stage("p/other", ["z"]),
     }
     store = _helper_store(set_project_root, {"x": binding, "z": "data/z.csv"})
 
-    found = _helper_runnable(stages, store, [gone], restorable_tracked=[restorable])
+    found = _helper_runnable(stages, store, [gone], restored_tracked=restored)
+
+    assert found.stages is not None
+    assert set(found.stages) == (set() if kept else {"p/read"})
+    assert [(error.stage, error.input_path) for error in found.errors] == [
+        *([("p/read", set_project_root / binding)] if kept else []),
+        ("p/other", set_project_root / "data" / "z.csv"),
+    ]
+    assert str(found.errors[-1]) == (
+        "Stage 'p/other' depends on input 'z' (path data/z.csv), which does not exist"
+    )
+
+
+def test_get_runnable_stages_counts_a_restored_path_reached_through_a_symlink_as_present(
+    set_project_root: Path,
+) -> None:
+    """A dependency on ``alias/x``, where ``alias`` links to ``inputs/sub`` and the restore
+    creates ``inputs/sub/x``, counts as present: the resolved path decides too."""
+    sub = set_project_root / "data" / "inputs" / "sub"
+    sub.mkdir(parents=True)
+    (set_project_root / "data" / "alias").symlink_to(sub)
+    stages = {"p/read": _helper_input_stage("p/read", ["x"])}
+    store = _helper_store(set_project_root, {"x": "data/alias/x"})
+
+    found = _helper_runnable(stages, store, [], restored_tracked=[str(sub / "x")])
+    without = _helper_runnable(stages, store, [], restored_tracked=[str(sub / "y")])
 
     assert found.stages is not None
     assert set(found.stages) == {"p/read"}
-    [error] = found.errors
-    assert error.stage == "p/other"
-    assert error.input_path == set_project_root / "data" / "z.csv"
-    assert str(error) == (
-        "Stage 'p/other' depends on input 'z' (path data/z.csv), which does not exist"
+    assert found.errors == []
+    assert [error.input_path for error in without.errors] == [
+        set_project_root / "data" / "alias" / "x"
+    ]
+
+
+def test_get_runnable_stages_leaves_out_a_stage_reading_a_symlink_to_a_directory_holding_it(
+    set_project_root: Path,
+) -> None:
+    """A dependency on ``link``, a symlink to the directory ``real`` that holds a missing tracked
+    file, reads that file: its stage is left out with one error naming the directory as the
+    dependency gives it and the file."""
+    missing = _helper_missing_tracked(set_project_root, "data/raw/real/f.txt")
+    (set_project_root / "data" / "raw" / "real" / "present.txt").write_text("present")
+    (set_project_root / "data" / "raw" / "link").symlink_to("real")
+    stages = {"p/scan": _helper_input_stage("p/scan", ["link"])}
+
+    found = _helper_runnable(
+        stages, _helper_store(set_project_root, {"link": "data/raw/link"}), missing
     )
-    assert found.left_out == {"p/other": error}
+
+    assert found.stages == {}
+    [error] = found.errors
+    assert error.stage == "p/scan"
+    assert error.input_path == set_project_root / "data" / "raw" / "real" / "f.txt"
+    assert error.directory == set_project_root / "data" / "raw" / "link"
+    assert str(error) == (
+        "Stage 'p/scan' depends on directory 'link', which holds tracked file "
+        + "'data/raw/real/f.txt' that does not exist"
+    )
+    assert found.left_out == {"p/scan": error}
+
+
+def test_get_runnable_stages_reports_a_missing_tracked_file_reached_through_a_symlink_once(
+    set_project_root: Path,
+) -> None:
+    """Two dependencies of one stage inside one missing tracked directory, one of them through
+    the symlink ``alias`` to it, give that stage one error, the first."""
+    missing = _helper_missing_tracked(set_project_root, "data/tracked")
+    (set_project_root / "data" / "alias").symlink_to("tracked")
+    stages = {"p/read": _helper_input_stage("p/read", ["a", "b"])}
+    store = _helper_store(set_project_root, {"a": "data/alias/a.csv", "b": "data/tracked/b.csv"})
+
+    found = _helper_runnable(stages, store, missing)
+
+    assert found.stages == {}
+    [error] = found.errors
+    assert error.stage == "p/read"
+    assert error.input_path == set_project_root / "data" / "alias" / "a.csv"
+    assert found.left_out == {"p/read": error}
 
 
 def test_get_runnable_stages_leaves_out_downstream_stages_with_their_first_upstream_error(

@@ -1343,20 +1343,32 @@ def test_get_stage_explanation_allow_missing_uses_lock_file_hash(
     assert result["will_run"] is False
 
 
+@pytest.mark.parametrize("tracked", [True, False], ids=["its-pvt", "no-pvt"])
 def test_get_stage_explanation_restorable_of_dry_run_keep_going_has_no_lock_fallback(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, tracked: bool
 ) -> None:
     """A dry run that counts restorable tracked files as present (`--all --keep-going
-    --checkout-missing`) takes a missing dependency's hash from a restorable file's .pvt alone:
-    one no restorable file tracks stays missing, though the lock records its hash."""
-    dep = _input_ref("data.csv")
+    --checkout-missing`, no --allow-missing) takes a missing dependency's hash from the .pvt of
+    the restorable file that tracks it, which decides against the lock's; a missing dependency
+    that no restorable file tracks stays missing, though the lock records its hash."""
     state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", None)
+    normalized_path = str(project.normalize_path(tmp_path / "data.csv"))
+    dep = _input_ref("data.csv")
     _write_lock(
         state_dir,
         "restorable_stage",
         {"self:restorable_stage": "abc"},
         dep_hashes={dep.identity: {"hash": "4321432143214321"}},
     )
+    tracked_files = dict[str, track.PvtData]()
+    if tracked:
+        tracked_files[normalized_path] = track.PvtData(
+            path="data.csv", hash="1234123412341234", size=100
+        )
+    tracked_trie = pygtrie.Trie((pathlib.Path(path).parts, path) for path in tracked_files)
 
     result = explain.get_stage_explanation(
         stage_name="restorable_stage",
@@ -1368,10 +1380,11 @@ def test_get_stage_explanation_restorable_of_dry_run_keep_going_has_no_lock_fall
         state_dir=state_dir,
         store=_store(tmp_path),
         lock_data=_lock(state_dir, "restorable_stage"),
-        restorable=True,
-        tracked_files={},
-        tracked_trie=pygtrie.Trie(),
+        tracked_files=tracked_files,
+        tracked_trie=tracked_trie,
     )
 
     assert result["will_run"] is True
-    assert result["reason"] == "Missing deps: data.csv", result
+    assert result["reason"] == (
+        "Input dependencies changed" if tracked else "Missing deps: data.csv"
+    ), result

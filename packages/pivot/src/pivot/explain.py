@@ -199,34 +199,6 @@ def _find_tracked_hash(
     return None  # Path not found in the listing
 
 
-def _tracked_dependency_hash(
-    ref: types.ArtifactRef,
-    store: store_mod.WorkspaceStore,
-    tracked_files: dict[str, track.PvtData],
-    tracked_trie: pygtrie.Trie[str],
-) -> HashInfo | None:
-    """The hash missing dependency ``ref`` has by the ``.pvt`` files of ``tracked_files``
-    (``_find_tracked_hash``), or None when none of them tracks it."""
-    dep_path = project.normalize_path(store.checkout(ref))
-    tracked_hash = _find_tracked_hash(dep_path, tracked_files, tracked_trie, store.cache_dir)
-    if tracked_hash is not None and types.is_dir_hash(tracked_hash):
-        # Only the tracked directory itself gives a directory hash, so its .pvt is the one at
-        # this path. A .pvt keeps every file; the dependency hash leaves out what .pivotignore
-        # names, as hashing the restored input would, and the filtered hash comes from the
-        # whole listing.
-        pvt_data = tracked_files[str(dep_path)]
-        with contextlib.suppress(exceptions.ListingMissingError, exceptions.CorruptListingError):
-            # Without a readable listing the .pvt's whole hash stands, as 0.6.0 compares it: at
-            # worst the stage reads stale. The lock's own hash would compare with itself and
-            # call a changed input unchanged.
-            tracked_hash = store.recorded_input_hash(
-                ref,
-                tracked_hash,
-                functools.partial(track.tracked_members, dep_path, pvt_data, store.cache_dir),
-            )
-    return tracked_hash
-
-
 def get_stage_explanation(
     stage_name: str,
     fingerprint: dict[str, str],
@@ -240,7 +212,6 @@ def get_stage_explanation(
     lock_data: LockData | None,
     force: bool = False,
     allow_missing: bool = False,
-    restorable: bool = False,
     tracked_files: dict[str, track.PvtData] | None = None,
     tracked_trie: pygtrie.Trie[str] | None = None,
     producer_hashes: dict[ArtifactIdentity, HashInfo] | None = None,
@@ -260,11 +231,13 @@ def get_stage_explanation(
     given, receives the file-hash entry of every file whose content it read, for the caller to
     save with ``state.save_file_hashes``.
 
-    ``allow_missing`` takes a missing dependency's hash from the ``.pvt`` of ``tracked_files``
-    that tracks it, else from the lock. With ``restorable``, ``tracked_files`` holds the missing
-    tracked files the cache can restore (a dry run with ``--checkout-missing``): a missing
-    dependency one of them tracks takes that ``.pvt``'s hash, which the restore brings back, and
-    never the lock's; any other stays missing.
+    ``tracked_files`` (with ``tracked_trie``, keyed by their paths' parts) gives a missing
+    dependency the hash of the ``.pvt`` that tracks it. With ``allow_missing`` they hold every
+    tracked file, and a missing dependency none of them tracks takes the lock's hash. Without it
+    they hold the missing tracked files the cache can restore (a dry run with
+    ``--checkout-missing``), whose ``.pvt`` hash the restore brings back, and a dependency none
+    of them tracks stays missing: the lock's own hash would compare with itself and call an
+    input the restore changes unchanged.
     """
     if lock_data is None:
         return StageExplanation(
@@ -323,7 +296,7 @@ def get_stage_explanation(
             if ref.identity in known_hashes:
                 dep_hashes[ref.identity] = known_hashes[ref.identity]
 
-        if allow_missing:
+        if allow_missing or tracked_files is not None:
             unresolved = list[str]()
             for dep_key in missing_deps:
                 ref = next(
@@ -331,22 +304,31 @@ def get_stage_explanation(
                 )
                 tracked_hash = None
                 if tracked_files is not None and tracked_trie is not None:
-                    tracked_hash = _tracked_dependency_hash(ref, store, tracked_files, tracked_trie)
-                fallback_hash = tracked_hash or lock_data["dep_hashes"].get(ref.identity)
-                if fallback_hash is None:
-                    unresolved.append(dep_key)
-                else:
-                    dep_hashes[ref.identity] = fallback_hash
-            missing_deps = unresolved
-        elif restorable and tracked_files is not None and tracked_trie is not None:
-            unresolved = list[str]()
-            for dep_key in missing_deps:
-                ref = next(
-                    ref for ref in deps.values() if types.identity_key(ref.identity) == dep_key
-                )
-                # No fallback to the lock's hash: it would compare with itself and call an
-                # input the restore changes unchanged
-                tracked_hash = _tracked_dependency_hash(ref, store, tracked_files, tracked_trie)
+                    dep_path = project.normalize_path(store.checkout(ref))
+                    tracked_hash = _find_tracked_hash(
+                        dep_path, tracked_files, tracked_trie, store.cache_dir
+                    )
+                    if tracked_hash is not None and types.is_dir_hash(tracked_hash):
+                        # Only the tracked directory itself gives a directory hash, so its .pvt
+                        # is the one at this path. A .pvt keeps every file; the dependency hash
+                        # leaves out what .pivotignore names, as hashing the restored input
+                        # would, and the filtered hash comes from the whole listing.
+                        pvt_data = tracked_files[str(dep_path)]
+                        with contextlib.suppress(
+                            exceptions.ListingMissingError, exceptions.CorruptListingError
+                        ):
+                            # Without a readable listing the .pvt's whole hash stands, as
+                            # 0.6.0 compares it: at worst the stage reads stale. The lock's own
+                            # hash would compare with itself and call a changed input unchanged.
+                            tracked_hash = store.recorded_input_hash(
+                                ref,
+                                tracked_hash,
+                                functools.partial(
+                                    track.tracked_members, dep_path, pvt_data, store.cache_dir
+                                ),
+                            )
+                if tracked_hash is None and allow_missing:
+                    tracked_hash = lock_data["dep_hashes"].get(ref.identity)
                 if tracked_hash is None:
                     unresolved.append(dep_key)
                 else:

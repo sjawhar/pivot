@@ -22,6 +22,7 @@ import yaml
 from pivot import cli
 from pivot.storage import track
 from pivot.types import TrackedFileStatus
+from tests import helpers
 from tests.conftest import isolated_pivot_dir
 
 if TYPE_CHECKING:
@@ -202,24 +203,8 @@ def test_repro_refuses_a_missing_file_tracked_inside_another_pipelines_output(
         assert not (cwd / "data" / "a" / "alive.txt").exists(), "no stage runs"
 
 
-# Pipeline p's stage writes a directory output at data/p/plan/, holding a.txt and b.txt
-_PRODUCER_PIPELINE = """\
-from typing import Annotated
-
-from pivot import Pipeline, directory, stage
-
-
-@stage
-def plan() -> Annotated[dict[str, str], directory]:
-    return {"a.txt": "a", "b.txt": "b"}
-
-
-with Pipeline("p") as pipeline:
-    plan()
-"""
-
-# Adds p/cut, mapped over p/plan's files: instance p/cut@<key> writes the directory
-# data/p/cut@<key>/
+# helpers.PRODUCER_PIPELINE with p/cut, mapped over p/plan's files: instance p/cut@<key> writes
+# the directory data/p/cut@<key>/
 _MAPPED_DIRECTORY_PIPELINE = """\
 from typing import Annotated
 
@@ -240,28 +225,6 @@ with Pipeline("p") as pipeline:
     cut(pipeline.map(plan()))
 """
 
-# Adds p/cut, mapped over p/plan's files: instance p/cut@<key> writes the file
-# data/p/cut@<key>.txt
-_MAPPED_FILE_PIPELINE = """\
-from typing import Annotated
-
-from pivot import Pipeline, directory, stage
-
-
-@stage
-def plan() -> Annotated[dict[str, str], directory]:
-    return {"a.txt": "a", "b.txt": "b"}
-
-
-@stage
-def cut(entry: str) -> str:
-    return entry
-
-
-with Pipeline("p") as pipeline:
-    cut(pipeline.map(plan()))
-"""
-
 
 @pytest.mark.parametrize(
     ("mapped_pipeline", "tracked_path", "overlap"),
@@ -273,7 +236,7 @@ with Pipeline("p") as pipeline:
             id="inside-an-instance-directory",
         ),
         pytest.param(
-            _MAPPED_FILE_PIPELINE,
+            helpers.MAPPED_FILE_PIPELINE,
             "data/p/cut@a.txt",
             "it is output 'data/p/cut@a.txt' of stage 'p/cut@a'",
             id="an-instance-file",
@@ -295,7 +258,7 @@ def test_repro_keep_going_fails_a_mapped_stage_over_a_missing_file_tracked_insid
     the pipeline declares, as `_helper_missing_file_inside_b` says.
     """
     with isolated_pivot_dir(runner, tmp_path) as cwd:
-        _helper_write(cwd / "pipeline.py", _PRODUCER_PIPELINE)
+        _helper_write(cwd / "pipeline.py", helpers.PRODUCER_PIPELINE)
         _helper_ok(runner, "repro")
         tracked = cwd / tracked_path
         _helper_write(tracked, "tracked bytes")

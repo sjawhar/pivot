@@ -2576,14 +2576,15 @@ class Engine:
                 # An instance output that is, lies inside or contains a missing tracked file
                 # refuses the expansion, as the run start refuses a loaded stage's: the
                 # instance's write would delete that file's sidecar
-                overlap = expansion.tracked_output_refusal(
-                    planned,
-                    map_run.missing_tracked,
-                    map_run.project_root,
-                    checkout_attempted=map_run.checkout_missing,
-                )
-                if overlap is not None:
-                    raise overlap
+                if map_run.missing_tracked:
+                    overlap = ownership.tracked_output_refusal(
+                        map_run.missing_tracked,
+                        ownership.stage_output_paths(map_run.project_root, planned),
+                        map_run.project_root,
+                        checkout_attempted=map_run.checkout_missing,
+                    )
+                    if overlap is not None:
+                        raise overlap
                 problem = await anyio.to_thread.run_sync(
                     lambda: executor_core.incremental_refusal(
                         list(planned),

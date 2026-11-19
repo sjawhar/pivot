@@ -327,9 +327,10 @@ excludes each stage that reads the missing file, and every stage downstream of
 it, and runs the other stages.
 
 A stage reads the file when one of its dependencies is the file, lies inside
-it, or is an input directory that holds it. A `Skipping:` line names the stage
-and each missing file that it reads. When the run excludes a named target, the
-command exits 1 after the other targets run.
+it, or is an input directory that holds it, also when the path reaches the file
+through a symlink. A `Skipping:` line names the stage and each missing file
+that it reads. When the run excludes a named target, the command exits 1 after
+the other targets run.
 
 A missing tracked file that is, lies inside or holds a stage output still
 stops the run before any stage runs, also under `--all --keep-going`. The error

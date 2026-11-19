@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
     from pivot.cli import console as tui_console
     from pivot.executor import ExecutionSummary
+    from pivot.storage.track import PvtData
     from pivot.types import PipelineStatusInfo, StageExplanation
 
 
@@ -126,16 +127,16 @@ def _configure_oneshot_source(
 
 
 class _LeaveOut(NamedTuple):
-    """What a run in leave-out mode decides before it expands a mapped stage
-    (``_leave_out_plan``)."""
+    """What a run decides before it expands a mapped stage (``_leave_out_plan`` in leave-out
+    mode; ``_no_leave_out`` in any other mode, which leaves out nothing)."""
 
     missing: list[str]
     """The missing tracked files the cache cannot restore (absolute normalized paths)."""
-    restorable: list[str]
-    """The missing tracked files the cache can restore (``--checkout-missing``), which count as
-    present; nothing restores them."""
-    stages: dict[str, registry.RegistryStageInfo]
-    """The run's own stages and templates that it keeps."""
+    restorable: dict[str, PvtData]
+    """The missing tracked files the cache can restore (``--checkout-missing``), with their
+    ``.pvt`` data: they count as present, and nothing restores them."""
+    stages: dict[str, registry.RegistryStageInfo] | None
+    """The run's own stages and templates that it keeps; None for every one."""
     left_out: dict[str, exceptions.DependencyNotFoundError]
     """Each stage and template the run leaves out, with its cause."""
     targets: list[str] | None
@@ -147,6 +148,20 @@ class _LeaveOut(NamedTuple):
     (``expansion.mapped_targets``)."""
 
 
+def _no_leave_out(stages_list: list[str] | None) -> _LeaveOut:
+    """The decisions of a run that is not in leave-out mode: it keeps every stage and target and
+    finds no missing tracked file (its pre-flight stops on one)."""
+    return _LeaveOut(
+        missing=[],
+        restorable={},
+        stages=None,
+        left_out={},
+        targets=stages_list,
+        left_out_targets={},
+        wanted={},
+    )
+
+
 def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) -> _LeaveOut:
     """The decisions ``pivot repro --all --keep-going`` makes before it expands a mapped stage,
     made in its order (``Engine._orchestrate_execution`` in leave-out mode), reading only.
@@ -154,10 +169,10 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     It finds the missing tracked files with the run's skip, built from the loaded stages
     (``executor.core.find_missing_tracked_files``; with ``checkout_missing`` those the cache can
     restore count as present, and nothing is restored); stops on one that is, lies inside or
-    contains an output of a loaded stage (``expansion.tracked_output_refusal``), as the run start
-    does; leaves out each stage with a missing input and every stage downstream of it, with one
-    ``Skipping:`` warning per missing input (``engine.graph.get_runnable_stages``); and leaves
-    out each target whose stage it leaves out (``expansion.left_out_targets``).
+    contains an output of a loaded stage (``ownership.tracked_output_refusal``), as the run
+    start does; leaves out each stage with a missing input and every stage downstream of it,
+    with one ``Skipping:`` warning per missing input (``engine.graph.get_runnable_stages``); and
+    leaves out each target whose stage it leaves out (``expansion.left_out_targets``).
 
     Raises:
         TrackedFileMissingError: A missing tracked file the cache cannot restore overlaps an
@@ -165,7 +180,7 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
         MultipleDependencyError: Every stage is left out.
     """
     from pivot.executor import core as executor_core
-    from pivot.storage import member_skip
+    from pivot.storage import member_skip, ownership
 
     pipeline = cli_helpers.get_pipeline()
     # The loaded stages, as the run start holds them: no instance
@@ -180,20 +195,22 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
         ),
         checkout_missing=checkout_missing,
     )
-    restorable = set(found.restorable)
-    missing = [path for path in found.missing if path not in restorable]
-    overlap = expansion.tracked_output_refusal(
-        loaded, missing, project_root, checkout_attempted=checkout_missing
-    )
-    if overlap is not None:
-        raise overlap
+    if found.missing:
+        refusal = ownership.tracked_output_refusal(
+            found.missing,
+            ownership.stage_output_paths(project_root, loaded),
+            project_root,
+            checkout_attempted=checkout_missing,
+        )
+        if refusal is not None:
+            raise refusal
     runnable, errors, left_out = engine_graph.get_runnable_stages(
         cli_helpers.get_graph_stages(),
         cli_helpers.require_workspace_store(),
         all_pipelines=True,
         on_error=OnError.KEEP_GOING,
-        missing_tracked=missing,
-        restorable_tracked=found.restorable,
+        missing_tracked=found.missing,
+        restored_tracked=found.restored,
     )
     for error in errors:
         _logger.warning("Skipping: %s", error.format_user_message())
@@ -202,7 +219,7 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     left_out_targets = expansion.left_out_targets(stages_list or [], templates, left_out)
     targets = None if stages_list is None else [t for t in stages_list if t not in left_out_targets]
     return _LeaveOut(
-        missing=missing,
+        missing=found.missing,
         restorable=found.restorable,
         stages=runnable,
         left_out=left_out,
@@ -224,7 +241,12 @@ def _instance_output_refusal(
     """The run's refusal of ``template``'s instances over missing tracked files
     (``Engine._expand_template``): the instances it would add, of the keys its targets name
     (``wanted``) or every key, checked against ``missing``, the missing tracked files the cache
-    cannot restore (``expansion.tracked_output_refusal``)."""
+    cannot restore (``ownership.tracked_output_refusal``). With no missing file it builds no
+    instance."""
+    from pivot.storage import ownership
+
+    if not missing:
+        return None
     name = template["info"]["name"]
     if name in wanted:
         keys = [(key, file_key) for key, file_key in keys if key in wanted[name]]
@@ -232,8 +254,11 @@ def _instance_output_refusal(
         info["name"]: info
         for info in (registry.instantiate(template, key, file_key) for key, file_key in keys)
     }
-    return expansion.tracked_output_refusal(
-        planned, missing, project_root, checkout_attempted=checkout_attempted
+    return ownership.tracked_output_refusal(
+        missing,
+        ownership.stage_output_paths(project_root, planned),
+        project_root,
+        checkout_attempted=checkout_attempted,
     )
 
 
@@ -265,88 +290,34 @@ def _get_explanations(
     stage (``status.orphaned_instances``): of each mapped stage the run expands without refusing
     (``cli_helpers.eligible_templates``), unless it commits nothing.
 
-    In leave-out mode (``repro --all --keep-going``) it shows what that run would do
-    (``_leave_out_explanations``). Shared by --explain and --dry-run modes.
+    In leave-out mode (``repro --all --keep-going``) it shows what that run would do. The run's
+    decisions before it expands (``_leave_out_plan``) leave out stages and targets; when targets
+    were left out and none is left, nothing is explained, as the run runs nothing. The mapped
+    stages expand as the run would expand them: the missing tracked files the cache can restore
+    count as present, and a template whose instances' outputs overlap a missing tracked file is
+    refused (``_instance_output_refusal``). A left-out stage, every instance of a left-out
+    mapped stage, its not-expanded row and its orphaned instances are not shown, and a left-out
+    stage changes no orphan the run would remove (``cli_helpers.eligible_templates`` over the
+    stages the run keeps). Any other mode leaves out nothing (``_no_leave_out``), and a missing
+    dependency stops it unless ``allow_missing``.
+
+    Shared by --explain and --dry-run modes.
     """
     from pivot import status as status_mod
 
-    if leave_out:
-        return _leave_out_explanations(
-            stages_list,
-            force=force,
-            no_commit=no_commit,
-            allow_uncached_incremental=allow_uncached_incremental,
-            checkout_missing=checkout_missing,
-        )
-
-    result, known = cli_helpers.expand_mapped_stages(force=force, allow_missing=allow_missing)
-    removing = (
-        []
-        if no_commit
-        else cli_helpers.eligible_templates(
-            stages_list,
-            result,
-            force=force,
-            allow_uncached_incremental=allow_uncached_incremental,
-        )
+    plan = (
+        _leave_out_plan(stages_list, checkout_missing=checkout_missing)
+        if leave_out
+        else _no_leave_out(stages_list)
     )
-    orphans = status_mod.orphaned_instances(cli_helpers.get_pipeline(), result, removing)
-    stages_list, shown_templates = cli_helpers.resolve_mapped_targets(stages_list, result)
-    all_stages = cli_helpers.get_all_stages()
-
-    # Build graph with validation when allow_missing is False
-    graph = engine_graph.build_graph(all_stages)
-    if not allow_missing:
-        ws = cli_helpers.get_workspace_store()
-        dep_errors = engine_graph.validate_dependency_sources(all_stages, store=ws)
-        if dep_errors:
-            if len(dep_errors) == 1:
-                raise dep_errors[0]
-            raise exceptions.MultipleDependencyError(dep_errors)
-
-    explanations = status_mod.get_pipeline_explanations(
-        stages_list,
-        single_stage=False,
-        all_stages=all_stages,
-        pipeline=cli_helpers.get_pipeline(),
-        force=force,
-        allow_missing=allow_missing,
-        graph=graph,
-        known=known,
-    )
-    return _Explained(
-        explanations, status_mod.not_expanded_status(result, shown_templates), orphans, {}
-    )
-
-
-def _leave_out_explanations(
-    stages_list: list[str] | None,
-    *,
-    force: bool,
-    no_commit: bool,
-    allow_uncached_incremental: bool,
-    checkout_missing: bool,
-) -> _Explained:
-    """``_get_explanations`` in leave-out mode: what ``pivot repro --all --keep-going`` would do.
-
-    The run's decisions before it expands (``_leave_out_plan``) leave out stages and targets.
-    When the targets name stages and every one is left out, nothing is explained, as the run
-    runs nothing. The mapped stages expand as the run would expand them: the missing tracked
-    files the cache can restore count as present, and a template whose instances' outputs
-    overlap a missing tracked file is refused (``_instance_output_refusal``). A left-out stage,
-    every instance of a left-out mapped stage, its not-expanded row and its orphaned instances
-    are not shown, and a left-out stage changes no orphan the run would remove
-    (``cli_helpers.eligible_templates`` over the stages the run keeps).
-    """
-    from pivot import status as status_mod
-
-    plan = _leave_out_plan(stages_list, checkout_missing=checkout_missing)
-    if plan.targets == []:
-        # No target is left; an empty target list would explain every stage
+    if plan.left_out_targets and not plan.targets:
+        # Every target is left out; no target would explain every stage
         return _Explained([], [], {}, plan.left_out_targets)
     pipeline = cli_helpers.get_pipeline()
-    result, known = cli_helpers.expand_mapped_stages(
+    result, known = status_mod.expand_current(
+        pipeline,
         force=force,
+        allow_missing=allow_missing,
         restorable=plan.restorable,
         refuse=functools.partial(
             _instance_output_refusal,
@@ -376,19 +347,32 @@ def _leave_out_explanations(
     )
     orphans = status_mod.orphaned_instances(pipeline, kept, removing)
     targets, shown_templates = cli_helpers.resolve_mapped_targets(plan.targets, kept)
-    templates = pipeline.list_templates()
+    # Each left-out stage and template, and every instance of a left-out template
+    hidden = set(plan.left_out).union(
+        *(result["expanded"][name] for name in plan.left_out if name in result["expanded"])
+    )
     all_stages = {
-        name: info
-        for name, info in cli_helpers.get_all_stages().items()
-        if name not in plan.left_out and registry.template_of(name, templates) not in plan.left_out
+        name: info for name, info in cli_helpers.get_all_stages().items() if name not in hidden
     }
+
+    # Build graph with validation when allow_missing is False
+    graph = engine_graph.build_graph(all_stages)
+    if not leave_out and not allow_missing:
+        ws = cli_helpers.get_workspace_store()
+        dep_errors = engine_graph.validate_dependency_sources(all_stages, store=ws)
+        if dep_errors:
+            if len(dep_errors) == 1:
+                raise dep_errors[0]
+            raise exceptions.MultipleDependencyError(dep_errors)
+
     explanations = status_mod.get_pipeline_explanations(
         targets,
         single_stage=False,
         all_stages=all_stages,
         pipeline=pipeline,
         force=force,
-        graph=engine_graph.build_graph(all_stages),
+        allow_missing=allow_missing,
+        graph=graph,
         known=known,
         restorable=plan.restorable,
     )
@@ -1217,7 +1201,7 @@ def _run_oneshot_mode(
     "--allow-missing",
     is_flag=True,
     help="Allow missing dep files if tracked (.pvt exists). Only affects --dry-run and "
-    + "--explain; refused with --all --keep-going.",
+    + "--explain. Refused with --all --keep-going unless --watch or --fail-fast is also given.",
 )
 @click.pass_context
 def repro(
@@ -1354,14 +1338,24 @@ def repro(
     tui_log = _run_common.validate_tui_log(tui_log, as_json, tui_flag, dry_run=dry_run)
 
     # Validate flag prerequisites
-    all_pipelines = cli_decorators.get_all_pipelines_from_context()
     if serve and not watch:
         raise click.ClickException("--serve requires --watch mode")
     if debounce_from_cli and not watch:
         raise click.ClickException("--debounce requires --watch mode")
-    if allow_missing and all_pipelines and keep_going:
-        # The run and its dry run leave out each stage with a missing input; --allow-missing would
-        # show such a stage as one that runs
+    # Leave-out mode, the run's (``Engine._orchestrate_execution``): across all pipelines,
+    # keeping going past failures, outside a watch session, it leaves out each stage with a
+    # missing input, and the dry run and --explain show what it would do. --explain takes
+    # --fail-fast with --keep-going, which is not that mode.
+    leave_out = (
+        engine_graph.skips_missing_dependencies(
+            all_pipelines=cli_decorators.get_all_pipelines_from_context(),
+            on_error=OnError.KEEP_GOING if keep_going and not fail_fast else OnError.FAIL,
+        )
+        and not watch
+    )
+    if allow_missing and leave_out:
+        # Leave-out mode leaves out each stage with a missing input; --allow-missing would show
+        # such a stage as one that runs
         raise click.UsageError(
             "--allow-missing cannot be used with --all --keep-going, which leaves out each stage "
             + "with a missing input"
@@ -1374,18 +1368,6 @@ def repro(
     has_stages = pipeline is not None and bool(pipeline.list_stages())
     if not has_stages and not dry_run and not as_json:
         raise click.ClickException("No pipeline found (pipeline.py)")
-
-    # The dry run and --explain show what the run would do in leave-out mode, the run's
-    # (``Engine._orchestrate_execution``): across all pipelines, keeping going past failures,
-    # outside a watch session, it leaves out each stage with a missing input. --explain takes
-    # --fail-fast with --keep-going, which is not that mode.
-    leave_out = (
-        engine_graph.skips_missing_dependencies(
-            all_pipelines=all_pipelines,
-            on_error=OnError.KEEP_GOING if keep_going and not fail_fast else OnError.FAIL,
-        )
-        and not watch
-    )
 
     # Handle explain mode
     if explain:

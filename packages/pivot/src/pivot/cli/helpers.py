@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
     from pivot.cli import CliContext
-    from pivot.expansion import Expansion, InstanceRefusal
+    from pivot.expansion import Expansion
     from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.storage import listing, track
     from pivot.storage.store import WorkspaceStore
@@ -86,24 +86,15 @@ def expand_mapped_stages(
     force: bool = False,
     allow_missing: bool = False,
     fetched: Mapping[str, listing.DirListing] | None = None,
-    restorable: Collection[str] | None = None,
-    refuse: InstanceRefusal | None = None,
 ) -> tuple[Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage of the Pipeline in context whose producer is current, as a run
     would (``status.expand_current``, a listing the cache lacks taken from ``fetched``), and
     return the expansion with the explanations it read. A command that lists stages calls it
-    first, so the stages it lists hold the instances. A dry run of ``pivot repro`` that counts
-    the missing tracked files the cache can restore as present passes them as ``restorable``,
-    and the run's refusal of a template's instances as ``refuse``."""
+    first, so the stages it lists hold the instances."""
     from pivot import status as status_mod
 
     return status_mod.expand_current(
-        get_pipeline(),
-        force=force,
-        allow_missing=allow_missing,
-        fetched=fetched,
-        restorable=restorable,
-        refuse=refuse,
+        get_pipeline(), force=force, allow_missing=allow_missing, fetched=fetched
     )
 
 

@@ -77,43 +77,6 @@ with Pipeline("healthy") as pipeline:
     keep(pipeline.map(plan(pipeline.input("healthy_plan.yaml", t=dict[str, int]))))
 """
 
-# p/plan writes the directory data/p/plan/ holding a.txt and b.txt
-_PRODUCER_PIPELINE = """\
-from typing import Annotated
-
-from pivot import Pipeline, directory, stage
-
-
-@stage
-def plan() -> Annotated[dict[str, str], directory]:
-    return {"a.txt": "a", "b.txt": "b"}
-
-
-with Pipeline("p") as pipeline:
-    plan()
-"""
-
-# Adds p/cut, mapped over p/plan's files: instance p/cut@<key> writes data/p/cut@<key>.txt
-_MAPPED_FILE_PIPELINE = """\
-from typing import Annotated
-
-from pivot import Pipeline, directory, stage
-
-
-@stage
-def plan() -> Annotated[dict[str, str], directory]:
-    return {"a.txt": "a", "b.txt": "b"}
-
-
-@stage
-def cut(entry: str) -> str:
-    return entry
-
-
-with Pipeline("p") as pipeline:
-    cut(pipeline.map(plan()))
-"""
-
 _ORPHAN_REASON = "its key left the listing of 'healthy/plan'"
 
 
@@ -256,13 +219,13 @@ def _refused_mapped_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathl
     tracked file. It is tracked before p/cut is declared, since `pivot track` refuses a path an
     output the pipeline declares holds."""
     root, home = _git_project(tmp_path)
-    (root / "pipeline.py").write_text(_PRODUCER_PIPELINE)
+    (root / "pipeline.py").write_text(helpers.PRODUCER_PIPELINE)
     _ok(helpers.run_pivot(root, home, "repro"))
     tracked = root / "data" / "p" / "cut@a.txt"
     tracked.write_text("tracked bytes")
     _ok(helpers.run_pivot(root, home, "track", "data/p/cut@a.txt"))
     tracked.unlink()
-    (root / "pipeline.py").write_text(_MAPPED_FILE_PIPELINE)
+    (root / "pipeline.py").write_text(helpers.MAPPED_FILE_PIPELINE)
     return root, home
 
 

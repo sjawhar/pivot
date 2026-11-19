@@ -400,7 +400,7 @@ class TrackedFileMissingError(CacheError):
     """Raised when .pvt tracked files are missing (user should run pivot checkout).
 
     ``overlaps`` maps a missing file to how it overlaps a stage output
-    (``ownership.tracked_output_overlaps``). Such a file stops a run even when the run tolerates
+    (``ownership.tracked_output_refusal``). Such a file stops a run even when the run tolerates
     missing files (``executor.core.verify_tracked_files``'s ``tolerate_missing``)."""
 
     _missing: list[str]

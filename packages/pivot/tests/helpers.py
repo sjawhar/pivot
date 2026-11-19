@@ -1,5 +1,6 @@
-"""Test helpers shared by test modules: pipelines built with the compositional API, sockets, and
-venvs that CI-only tests install with uv."""
+"""Test helpers shared by test modules: pipelines built with the compositional API or written as
+pipeline.py text, tracked files with no data, sockets, and venvs that CI-only tests install with
+uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
@@ -23,7 +24,7 @@ import pytest
 from pivot import compose, exceptions, project, stage_def
 from pivot import names as stage_names
 from pivot.storage import mounts as mounts_module
-from pivot.storage import state, store
+from pivot.storage import state, store, track
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -36,6 +37,56 @@ DepValue = compose.ArtifactHandle | str | list[compose.ArtifactHandle]
 # The `pivot` command installed beside the interpreter running the tests. CI runs the suite
 # without uv on PATH, so tests start this path, never `uv run pivot`.
 PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
+
+# Pipeline p's stage p/plan writes the directory output data/p/plan/, holding a.txt and b.txt
+PRODUCER_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+with Pipeline("p") as pipeline:
+    plan()
+"""
+
+# PRODUCER_PIPELINE with p/cut, mapped over p/plan's files: instance p/cut@<key> writes the file
+# data/p/cut@<key>.txt
+MAPPED_FILE_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan()))
+"""
+
+
+def track_without_data(data_path: pathlib.Path) -> pathlib.Path:
+    """Write the ``.pvt`` of ``data_path`` alone, as ``pivot track`` names it, with no data on disk
+    and no object in any cache: a tracked file that is missing and that ``--checkout-missing``
+    cannot restore. Makes the directory that holds the ``.pvt``; returns the ``.pvt``'s path."""
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    pvt_path = track.get_pvt_path(data_path)
+    track.write_pvt_file(
+        pvt_path, track.PvtData(path=data_path.name, hash="0123456789abcdef", size=10)
+    )
+    return pvt_path
 
 
 def cli_env(home: pathlib.Path, **extra: str) -> dict[str, str]:

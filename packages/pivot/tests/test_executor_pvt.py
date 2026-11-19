@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import pathlib  # noqa: TC003 - compose resolves postponed stage annotations at runtime
 import pickle
 import shutil
@@ -16,7 +17,6 @@ from pivot.storage import cache, ownership, track
 from tests import helpers
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Callable
 
     import click.testing
@@ -359,15 +359,6 @@ _OVERLAP_STOPS = (
 )
 
 
-def _track_without_data(data_path: pathlib.Path) -> None:
-    """Write a .pvt for ``data_path`` alone: no data on disk and no object in the cache."""
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    track.write_pvt_file(
-        track.get_pvt_path(data_path),
-        track.PvtData(path=data_path.name, hash="0123456789abcdef", size=10),
-    )
-
-
 def _track_then_remove(runner: click.testing.CliRunner, root: pathlib.Path, name: str) -> None:
     """Track ``root / name`` with the real ``pivot track`` (its objects go to the cache), then
     remove it from the workspace."""
@@ -388,7 +379,7 @@ def test_tolerate_missing_returns_a_missing_file_that_overlaps_no_output(
     """With tolerate_missing, a missing tracked file that overlaps no output is returned, not
     raised."""
     data_file = pipeline_dir / "data.csv"
-    _track_without_data(data_file)
+    helpers.track_without_data(data_file)
 
     missing = executor_core.verify_tracked_files(
         pipeline_dir,
@@ -449,7 +440,7 @@ def test_tolerate_missing_raises_for_only_the_missing_file_that_overlaps_an_outp
         tracked_path.parent.mkdir(parents=True)
         tracked_path.write_text("tracked data")
     _track_then_remove(runner, pipeline_dir, tracked)
-    _track_without_data(pipeline_dir / "elsewhere.csv")
+    helpers.track_without_data(pipeline_dir / "elsewhere.csv")
 
     with pytest.raises(exceptions.TrackedFileMissingError) as exc_info:
         executor_core.verify_tracked_files(
@@ -465,13 +456,56 @@ def test_tolerate_missing_raises_for_only_the_missing_file_that_overlaps_an_outp
     )
 
 
+@pytest.mark.parametrize("through", ["output", "tracked_path"])
+def test_tolerate_missing_raises_for_a_missing_file_that_reaches_an_output_through_a_symlink(
+    pipeline_dir: pathlib.Path, through: str
+) -> None:
+    """A missing tracked path that lies inside an output only once a symlink is resolved stops
+    the run too, naming what both resolve to: the output's directory ``data/b`` is a symlink to
+    ``store`` and the tracked path is under ``store/tree``, or the tracked path runs through a
+    symlink ``data/raw/link`` to the output's own directory (a ``.pvt`` whose ``path:`` names
+    ``link/f.txt``)."""
+    real_root = pathlib.Path(os.path.realpath(pipeline_dir))
+    if through == "output":
+        (pipeline_dir / "store" / "tree").mkdir(parents=True)
+        (pipeline_dir / "data").mkdir()
+        (pipeline_dir / "data" / "b").symlink_to(pipeline_dir / "store")
+        tracked_path = pipeline_dir / "store" / "tree" / "f.txt"
+        helpers.track_without_data(tracked_path)
+        real_output = real_root / "store" / "tree"
+    else:
+        (pipeline_dir / "data" / "b" / "tree").mkdir(parents=True)
+        (pipeline_dir / "data" / "raw").mkdir()
+        (pipeline_dir / "data" / "raw" / "link").symlink_to(pipeline_dir / "data" / "b" / "tree")
+        tracked_path = pipeline_dir / "data" / "raw" / "link" / "f.txt"
+        track.write_pvt_file(
+            pipeline_dir / "data" / "raw" / "f.txt.pvt",
+            track.PvtData(path="link/f.txt", hash="0123456789abcdef", size=10),
+        )
+        real_output = real_root / "data" / "b" / "tree"
+
+    with pytest.raises(exceptions.TrackedFileMissingError) as exc_info:
+        executor_core.verify_tracked_files(
+            pipeline_dir,
+            tolerate_missing=True,
+            outputs={ownership.normalized(pipeline_dir / "data" / "b" / "tree"): "b/tree"},
+        )
+
+    assert str(exc_info.value) == (
+        "The following tracked files are missing:\n"
+        + f"  - {tracked_path}: it is inside output 'data/b/tree' of stage 'b/tree' (the path "
+        + f"resolves to '{real_output / 'f.txt'}'; the output resolves to '{real_output}')\n\n"
+        + f"{_NOT_ON_DISK}\n{_OVERLAP_STOPS}"
+    )
+
+
 def test_tolerate_missing_compares_path_parts_not_string_prefixes(
     pipeline_dir: pathlib.Path,
 ) -> None:
     """``data-backup/x`` does not lie inside the directory output ``data``, although its path
     string starts with that output's path string."""
     missing_file = pipeline_dir / "data-backup" / "x"
-    _track_without_data(missing_file)
+    helpers.track_without_data(missing_file)
 
     missing = executor_core.verify_tracked_files(
         pipeline_dir,
@@ -520,7 +554,7 @@ def test_tolerate_missing_restores_a_cached_file_and_returns_the_uncached_one(
     cached.write_text("cached data")
     _track_then_remove(runner, pipeline_dir, "cached.csv")
     uncached = pipeline_dir / "uncached.csv"
-    _track_without_data(uncached)
+    helpers.track_without_data(uncached)
 
     missing = executor_core.verify_tracked_files(
         pipeline_dir, checkout_missing=True, tolerate_missing=True
@@ -537,8 +571,8 @@ def test_without_tolerate_missing_every_missing_file_raises_with_the_same_text(
     when one of them lies inside a given output."""
     first = pipeline_dir / "data.csv"
     second = pipeline_dir / "raw" / "labels.csv"
-    _track_without_data(first)
-    _track_without_data(second)
+    helpers.track_without_data(first)
+    helpers.track_without_data(second)
 
     with pytest.raises(exceptions.TrackedFileMissingError) as exc_info:
         executor_core.verify_tracked_files(
@@ -578,8 +612,9 @@ def test_find_missing_tracked_files_says_what_the_cache_restores_and_restores_no
 ) -> None:
     """The dry run's read-only view of the pre-flight: every missing tracked path, and with
     checkout_missing those the local cache restores (a file whose object it holds, a directory
-    whose listing and member objects it holds). It restores nothing, and the pre-flight's own
-    restore then agrees with it."""
+    whose listing and member objects it holds), apart from the others, with their .pvt data and
+    every path their restore creates. It restores nothing, and the pre-flight's own restore then
+    agrees with it."""
     cache_dir = pipeline_dir / ".pivot" / "cache" / "files"
     cached_file = pipeline_dir / "cached.csv"
     cached_file.write_text("cached data")
@@ -587,6 +622,7 @@ def test_find_missing_tracked_files_says_what_the_cache_restores_and_restores_no
     cached_dir.mkdir()
     (cached_dir / "a.jpg").write_bytes(b"image1")
     (cached_dir / "b.jpg").write_bytes(b"image2")
+    (cached_dir / "empty").mkdir()
     broken_dir = pipeline_dir / "scans"
     broken_dir.mkdir()
     (broken_dir / "c.jpg").write_bytes(b"scan1")
@@ -598,21 +634,36 @@ def test_find_missing_tracked_files_says_what_the_cache_restores_and_restores_no
     lost = track.tracked_members(broken_dir, broken_pvt, cache_dir)["files"][0]["hash"]
     cache.get_cache_path(cache_dir, lost).unlink()
     uncached_file = pipeline_dir / "uncached.csv"
-    _track_without_data(uncached_file)
+    helpers.track_without_data(uncached_file)
     missing = sorted(str(path) for path in (cached_file, cached_dir, broken_dir, uncached_file))
+    restorable = dict[str, track.PvtData]()
+    for path in (cached_file, cached_dir):
+        record = track.read_pvt_file(track.get_pvt_path(path))
+        assert record is not None
+        restorable[str(path)] = record
 
     found = executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
 
     assert found == executor_core.MissingTrackedFiles(
-        missing=missing, restorable=sorted([str(cached_file), str(cached_dir)])
+        missing=[str(broken_dir), str(uncached_file)],
+        restorable=restorable,
+        restored=[
+            str(cached_file),
+            str(cached_dir),
+            str(cached_dir / "a.jpg"),
+            str(cached_dir / "b.jpg"),
+            str(cached_dir / "empty"),
+        ],
     )
+    assert list(found.restorable) == [str(cached_file), str(cached_dir)]
     assert [path for path in missing if pathlib.Path(path).exists()] == [], "nothing restored"
     assert executor_core.find_missing_tracked_files(pipeline_dir) == (
-        executor_core.MissingTrackedFiles(missing=missing, restorable=[])
+        executor_core.MissingTrackedFiles(missing=missing, restorable={}, restored=[])
     )
     assert executor_core.verify_tracked_files(
         pipeline_dir, checkout_missing=True, tolerate_missing=True
     ) == sorted([str(broken_dir), str(uncached_file)]), "the restore leaves the same files out"
+    assert (cached_dir / "empty").is_dir(), "the restore creates the empty directory it lists"
 
 
 def test_find_missing_tracked_files_raises_for_a_corrupt_listing_as_the_restore_does(
@@ -639,5 +690,5 @@ def test_find_missing_tracked_files_raises_for_a_corrupt_listing_as_the_restore_
             pipeline_dir, checkout_missing=True, tolerate_missing=True
         )
     assert executor_core.find_missing_tracked_files(pipeline_dir) == (
-        executor_core.MissingTrackedFiles(missing=[str(images)], restorable=[])
+        executor_core.MissingTrackedFiles(missing=[str(images)], restorable={}, restored=[])
     )

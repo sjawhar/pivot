@@ -47,6 +47,7 @@ import contextvars
 import logging
 import os
 import pathlib
+import types
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
 
@@ -110,18 +111,16 @@ NOT_EXPANDED_REASON_PREFIX = "Not yet expanded"
 ORPHANED_REASON_PREFIX = "Orphaned"
 """Reason prefix for an instance of a mapped stage whose key left its producer's listing."""
 
+_NO_TRACKED_FILES: Mapping[str, PvtData] = types.MappingProxyType({})
+"""No tracked file: the default ``restorable`` (an empty mapping no caller can change)."""
+
 
 def _discover_tracked_files(
-    allow_missing: bool,
-    all_stages: dict[str, RegistryStageInfo],
-    *,
-    restorable: Collection[str] | None = None,
+    allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
 ) -> tuple[dict[str, PvtData] | None, pygtrie.Trie[str] | None]:
-    """Discover tracked files for .pvt hash lookup when allow_missing is set; else, given
-    ``restorable`` (missing tracked files the cache can restore, as absolute normalized paths),
-    those files alone. A stage's own ``*.pvt`` member of its output is none
-    (``member_skip.own_member_skip``)."""
-    if not allow_missing and not restorable:
+    """Discover tracked files for .pvt hash lookup when allow_missing is set. A stage's own
+    ``*.pvt`` member of its output is none (``member_skip.own_member_skip``)."""
+    if not allow_missing:
         return None, None
 
     project_root = project.get_project_root()
@@ -134,9 +133,6 @@ def _discover_tracked_files(
             config.locate_cache_dir() / "files",
         ),
     )
-    if not allow_missing and restorable:
-        kept = set(restorable)
-        tracked_files = {path: data for path, data in tracked_files.items() if path in kept}
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     for path in tracked_files:
         tracked_trie[pathlib.Path(path).parts] = path
@@ -154,12 +150,10 @@ def _get_explanations_in_parallel(
     tracked_trie: pygtrie.Trie[str] | None = None,
     *,
     known: Collection[str] = (),
-    restorable: bool = False,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing), for each
     stage of ``execution_order`` but ``known``. A known stage's lock is still read: a stage that
-    reads one file of its directory output finds that file's hash in it. ``restorable``: as
-    ``explain.get_stage_explanation`` takes it."""
+    reads one file of its directory output finds that file's hash in it."""
     default_state_dir = config.locate_state_dir()
     pending = [name for name in execution_order if name not in known]
     max_workers = min(8, len(pending))
@@ -197,7 +191,6 @@ def _get_explanations_in_parallel(
                 lock_data=locks[stage_name],
                 force=force,
                 allow_missing=allow_missing,
-                restorable=restorable,
                 tracked_files=tracked_files,
                 tracked_trie=tracked_trie,
                 producer_hashes=producer_hashes,
@@ -249,16 +242,18 @@ def _explanations_for(
     force: bool,
     allow_missing: bool,
     known: Mapping[str, StageExplanation] | None,
-    restorable: Collection[str] | None = None,
+    restorable: Mapping[str, PvtData] = _NO_TRACKED_FILES,
 ) -> dict[str, StageExplanation]:
     """Each stage of ``execution_order``'s own explanation, before its upstream is counted
     (``_compute_explanations_with_upstream``): ``known``'s where it holds one, computed with the
     same ``force``, ``allow_missing`` and ``restorable``, else read now. ``restorable`` holds the
-    missing tracked files the cache can restore, which the explanations count as present (a dry
-    run with ``--checkout-missing``); None or empty counts none."""
-    tracked_files, tracked_trie = _discover_tracked_files(
-        allow_missing, all_stages, restorable=restorable
-    )
+    missing tracked files the cache can restore, with their ``.pvt`` data, which the
+    explanations count as present (a dry run with ``--checkout-missing``,
+    ``executor.core.find_missing_tracked_files``)."""
+    tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
+    if tracked_files is None and restorable:
+        tracked_files = dict(restorable)
+        tracked_trie = pygtrie.Trie((pathlib.Path(path).parts, path) for path in tracked_files)
     with fingerprint_mod.fingerprint_pass():
         for stage_name in execution_order:
             pipeline.ensure_fingerprint(stage_name)
@@ -279,7 +274,6 @@ def _explanations_for(
             tracked_trie=tracked_trie,
             store=_make_workspace_store(pipeline),
             known=reused.keys(),
-            restorable=bool(restorable),
         ),
     }
 
@@ -294,7 +288,7 @@ def get_pipeline_explanations(
     graph: nx.DiGraph[str] | None = None,
     *,
     known: Mapping[str, StageExplanation] | None = None,
-    restorable: Collection[str] | None = None,
+    restorable: Mapping[str, PvtData] = _NO_TRACKED_FILES,
 ) -> list[StageExplanation]:
     """Explain each stage of ``stages``' execution order. ``known`` holds explanations already
     computed with the same ``force``, ``allow_missing`` and ``restorable``
@@ -350,7 +344,7 @@ def expand_current(
     force: bool = False,
     allow_missing: bool = False,
     fetched: Mapping[str, listing.DirListing] | None = None,
-    restorable: Collection[str] | None = None,
+    restorable: Mapping[str, PvtData] = _NO_TRACKED_FILES,
     refuse: expansion.InstanceRefusal | None = None,
 ) -> tuple[expansion.Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage (``Pipeline.map``) of ``pipeline`` whose producer is current,

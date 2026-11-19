@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 from typing import TYPE_CHECKING
 
 import pytest
 
 from pivot import cli
-from pivot.storage import lock, track
+from pivot.storage import lock
+from tests import helpers
 from tests.conftest import isolated_pivot_dir
 
 if TYPE_CHECKING:
@@ -232,8 +234,11 @@ _READER_SKIPPED = (
     + "(path data/raw/missing.txt), which does not exist"
 )
 
-# dirs/scan reads the directory data/raw/dir/
-_DIRECTORY_READER_CODE = """\
+
+def _helper_directory_reader_code(input_name: str = "dir") -> str:
+    """Pipeline dirs, whose stage dirs/scan reads the directory data/raw/<input_name>/ and lists
+    its entries."""
+    return f"""\
 import pathlib
 
 from pivot.compose import Pipeline, stage
@@ -245,8 +250,9 @@ def scan(folder: pathlib.Path) -> str:
 
 
 with Pipeline("dirs") as pipeline:
-    scan(pipeline.input("dir", t=pathlib.Path))
+    scan(pipeline.input("{input_name}", t=pathlib.Path))
 """
+
 
 # m/cut is mapped over m/plan's files (keys a and b), and its shared input is data/raw/missing.txt
 _MAPPED_SHARED_INPUT_CODE = """\
@@ -270,16 +276,6 @@ with Pipeline("m") as pipeline:
 """
 
 
-def _helper_track_without_data(data_path: pathlib.Path) -> None:
-    """Write a .pvt for ``data_path`` alone, as ``tests/test_executor_pvt.py`` does: a tracked
-    file with no data on disk and no object in the cache."""
-    data_path.parent.mkdir(parents=True, exist_ok=True)
-    track.write_pvt_file(
-        track.get_pvt_path(data_path),
-        track.PvtData(path=data_path.name, hash="0123456789abcdef", size=10),
-    )
-
-
 def _helper_write_pipeline(root: pathlib.Path, name: str, code: str) -> None:
     (root / name).mkdir()
     (root / name / "pipeline.py").write_text(code)
@@ -292,7 +288,7 @@ def _helper_reader_project(root: pathlib.Path, *, tracked: bool = True) -> None:
     _helper_write_pipeline(root, "broken", _helper_broken_pipeline_code(1, downstream=True))
     _helper_write_pipeline(root, "alpha", _helper_pipeline_code("alpha", "stage_a"))
     if tracked:
-        _helper_track_without_data(root / "data" / "raw" / "missing.txt")
+        helpers.track_without_data(root / "data" / "raw" / "missing.txt")
 
 
 def _helper_skipping_lines(output: str) -> list[str]:
@@ -317,23 +313,28 @@ def test_repro_all_tracked_keep_going_leaves_out_only_the_reader_of_a_missing_tr
         assert (cwd / "data" / "raw" / "missing.txt.pvt").is_file()
 
 
+@pytest.mark.parametrize("through_symlink", [False, True], ids=["directory", "symlink"])
 def test_repro_all_tracked_keep_going_leaves_out_a_stage_reading_a_directory_that_holds_it(
-    runner: CliRunner, tmp_path: pathlib.Path
+    runner: CliRunner, tmp_path: pathlib.Path, through_symlink: bool
 ) -> None:
     """A2 (R2): a stage reading an existing directory that holds a missing tracked file is left
-    out, with one line naming the directory and the file."""
+    out, with one line naming the directory and the file; so is one reading a symlink
+    data/raw/dir to the directory data/raw/real that holds it."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
-        _helper_write_pipeline(cwd, "dirs", _DIRECTORY_READER_CODE)
+        _helper_write_pipeline(cwd, "dirs", _helper_directory_reader_code())
         _helper_write_pipeline(cwd, "alpha", _helper_pipeline_code("alpha", "stage_a"))
-        _helper_track_without_data(cwd / "data" / "raw" / "dir" / "f.txt")
-        (cwd / "data" / "raw" / "dir" / "present.txt").write_text("present")
+        holder = cwd / "data" / "raw" / ("real" if through_symlink else "dir")
+        helpers.track_without_data(holder / "f.txt")
+        (holder / "present.txt").write_text("present")
+        if through_symlink:
+            (cwd / "data" / "raw" / "dir").symlink_to("real")
 
         result = runner.invoke(cli.cli, ["repro", "--all", "--keep-going"])
 
         assert result.exit_code == 0, result.output
         assert _helper_skipping_lines(result.output) == [
             "Skipping: Stage 'dirs/scan' depends on directory 'dir', which holds tracked file "
-            + "'data/raw/dir/f.txt' that does not exist"
+            + f"'data/raw/{holder.name}/f.txt' that does not exist"
         ], result.output
         assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
         assert not (cwd / "data" / "dirs" / "scan.txt").exists(), "the stage must not run"
@@ -373,7 +374,7 @@ def test_repro_all_tracked_keep_going_leaves_out_a_mapped_stage_whose_shared_inp
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _helper_write_pipeline(cwd, "m", _MAPPED_SHARED_INPUT_CODE)
         _helper_write_pipeline(cwd, "alpha", _helper_pipeline_code("alpha", "stage_a"))
-        _helper_track_without_data(cwd / "data" / "raw" / "missing.txt")
+        helpers.track_without_data(cwd / "data" / "raw" / "missing.txt")
 
         result = runner.invoke(cli.cli, ["repro", "--all", "--keep-going", "--jsonl"])
 
@@ -402,7 +403,7 @@ def test_repro_all_keep_going_left_out_target_fails_the_run_after_the_other_targ
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _helper_reader_project(cwd, tracked=tracked)
         if tracked:
-            _helper_track_without_data(cwd / "data" / "raw" / "unrelated.txt")
+            helpers.track_without_data(cwd / "data" / "raw" / "unrelated.txt")
 
         result = runner.invoke(
             cli.cli, ["repro", "--all", "--keep-going", "broken/after", "alpha/stage_a"]
@@ -444,7 +445,7 @@ def test_repro_all_keep_going_left_out_target_names_an_instance_of_a_left_out_ma
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _helper_write_pipeline(cwd, "m", _MAPPED_SHARED_INPUT_CODE)
         _helper_write_pipeline(cwd, "alpha", _helper_pipeline_code("alpha", "stage_a"))
-        _helper_track_without_data(cwd / "data" / "raw" / "missing.txt")
+        helpers.track_without_data(cwd / "data" / "raw" / "missing.txt")
 
         result = runner.invoke(
             cli.cli, ["repro", "--all", "--keep-going", "m/cut@a", "alpha/stage_a"]
@@ -574,6 +575,130 @@ def test_repro_all_dry_run_keep_going_checkout_missing_counts_a_cached_file_as_p
         assert cached.read_text() == "cached bytes"
 
 
+def test_repro_all_dry_run_keep_going_checkout_missing_counts_a_file_reached_through_a_symlink(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A5, D7: kept/read_0 reads data/raw/alias/x.txt, where alias links to inputs/sub and the
+    cache can restore the missing tracked file inputs/sub/x.txt. With --checkout-missing the
+    dry run lists kept/read_0, as the run restores the file and runs it."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_write_pipeline(
+            cwd, "kept", _helper_broken_pipeline_code(1, name="kept", input_name="alias/x.txt")
+        )
+        _helper_write_pipeline(cwd, "alpha", _helper_pipeline_code("alpha", "stage_a"))
+        tracked = cwd / "data" / "raw" / "inputs" / "sub" / "x.txt"
+        tracked.parent.mkdir(parents=True)
+        tracked.write_text("x bytes")
+        tracking = runner.invoke(cli.cli, ["track", "data/raw/inputs/sub/x.txt"])
+        assert tracking.exit_code == 0, tracking.output
+        tracked.unlink()
+        (cwd / "data" / "raw" / "alias").symlink_to("inputs/sub")
+
+        dry_run = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "--checkout-missing"])
+        ran = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+        )
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {
+                "alpha/stage_a": {"would_run": True, "reason": "No previous run"},
+                "kept/read_0": {"would_run": True, "reason": "No previous run"},
+            }
+        }, dry_run.output
+        assert _helper_skipping_lines(dry_run.stderr) == [], dry_run.output
+        assert ran.exit_code == 0, ran.output
+        completed = _helper_completed(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "ran",
+            "kept/read_0": "ran",
+        }, ran.output
+        assert (cwd / "data" / "kept" / "read_0.txt").read_text() == "x bytes"
+
+
+def test_repro_all_dry_run_keep_going_checkout_missing_follows_the_restored_directory_listing(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A5, D7: data/raw/images is a missing tracked directory the cache can restore, whose
+    listing holds a.png and sub/b.png. With --checkout-missing, dirs/scan reads its subdirectory
+    images/sub, which the restore brings back: the dry run lists it, and the run restores and
+    runs it. cat/read_0 reads images/cat.png, which the listing does not hold: the run still
+    finds it missing after the restore and leaves cat/read_0 out, and so does the dry run, with
+    the same `Skipping:` line."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_write_pipeline(cwd, "dirs", _helper_directory_reader_code("images/sub"))
+        _helper_write_pipeline(
+            cwd, "cat", _helper_broken_pipeline_code(1, name="cat", input_name="images/cat.png")
+        )
+        _helper_write_pipeline(cwd, "alpha", _helper_pipeline_code("alpha", "stage_a"))
+        images = cwd / "data" / "raw" / "images"
+        (images / "sub").mkdir(parents=True)
+        (images / "a.png").write_text("a")
+        (images / "sub" / "b.png").write_text("b")
+        tracking = runner.invoke(cli.cli, ["track", "data/raw/images"])
+        assert tracking.exit_code == 0, tracking.output
+        shutil.rmtree(images)
+
+        dry_run = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "--checkout-missing"])
+        restored = images.exists()
+        ran = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+        )
+
+        skipped = [
+            "Skipping: Stage 'cat/read_0' depends on input 'images/cat.png' "
+            + "(path data/raw/images/cat.png), which does not exist"
+        ]
+        assert dry_run.exit_code == 0, dry_run.output
+        assert not restored, "a dry run restores nothing"
+        assert json.loads(dry_run.stdout) == {
+            "stages": {
+                "alpha/stage_a": {"would_run": True, "reason": "No previous run"},
+                "dirs/scan": {"would_run": True, "reason": "No previous run"},
+            }
+        }, dry_run.output
+        assert _helper_skipping_lines(dry_run.stderr) == skipped, dry_run.output
+        assert ran.exit_code == 0, ran.output
+        completed = _helper_completed(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "ran",
+            "dirs/scan": "ran",
+        }, ran.output
+        assert _helper_skipping_lines(ran.stderr) == skipped, ran.output
+        assert (cwd / "data" / "dirs" / "scan.txt").read_text() == "b.png"
+
+
+def test_repro_all_dry_run_keep_going_target_naming_no_stage_lists_what_the_run_runs(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R4, R5: a target that is a pipeline file with no stages leaves no target at all, and
+    none was left out, so the run runs every stage it keeps; the dry run lists the same stages,
+    not none."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+        _helper_write_pipeline(
+            cwd,
+            "sub",
+            'from pivot.compose import Pipeline\n\nwith Pipeline("sub") as pipeline:\n    pass\n',
+        )
+
+        dry_run = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "sub/pipeline.py"])
+        ran = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--jsonl", "sub/pipeline.py"]
+        )
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
+        }, dry_run.output
+        assert _helper_skipping_lines(dry_run.stderr) == [_READER_SKIPPED], dry_run.output
+        assert ran.exit_code == 0, ran.output
+        completed = _helper_completed(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "ran"
+        }, ran.output
+
+
 @pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "run"])
 def test_repro_all_dry_run_keep_going_refuses_allow_missing(
     runner: CliRunner, tmp_path: pathlib.Path, dry_run: bool
@@ -601,6 +726,43 @@ def test_repro_all_dry_run_keep_going_refuses_allow_missing(
         ) in result.stderr, result.output
         assert "Skipping:" not in result.output, result.output
         assert not (cwd / "data" / "alpha" / "stage_a.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        pytest.param(["--explain", "--fail-fast"], id="explain-fail-fast"),
+        pytest.param(["--dry-run", "--jsonl", "--watch"], id="dry-run-watch"),
+    ],
+)
+def test_repro_all_dry_run_keep_going_allow_missing_outside_leave_out_mode_works_as_before(
+    runner: CliRunner, tmp_path: pathlib.Path, flags: list[str]
+) -> None:
+    """R6: with --fail-fast or --watch beside --all --keep-going, --explain and the dry run are
+    not in leave-out mode, so --allow-missing works as in 0.10.4: the reader of the missing
+    tracked file is listed with every other stage, and nothing is left out."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+
+        result = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--allow-missing", *flags]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Skipping:" not in result.output, result.output
+        if "--explain" in flags:
+            listed = {line for line in result.output.splitlines() if line.startswith("Stage: ")}
+            assert listed == {
+                "Stage: alpha/stage_a",
+                "Stage: broken/after",
+                "Stage: broken/read_0",
+            }, result.output
+        else:
+            assert json.loads(result.stdout)["stages"].keys() == {
+                "alpha/stage_a",
+                "broken/after",
+                "broken/read_0",
+            }, result.output
 
 
 def test_repro_all_dry_run_keep_going_explain_leaves_out_the_reader(
@@ -669,7 +831,7 @@ def test_repro_all_dry_run_keep_going_stops_on_a_missing_file_tracked_inside_an_
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _helper_reader_project(cwd)
         _helper_write_pipeline(cwd, "m", _MAPPED_SHARED_INPUT_CODE)
-        _helper_track_without_data(cwd / "data" / "m" / "plan" / "c.txt")
+        helpers.track_without_data(cwd / "data" / "m" / "plan" / "c.txt")
 
         result = runner.invoke(cli.cli, _DRY_RUN_KEEP_GOING)
         ran = runner.invoke(cli.cli, ["repro", "--all", "--keep-going"])

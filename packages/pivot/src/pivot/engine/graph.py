@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import os
 import pathlib
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
@@ -150,6 +151,8 @@ def _check_acyclic(g: nx.DiGraph[str]) -> None:
 def validate_dependency_sources(
     stages: dict[str, RegistryStageInfo],
     store: Store | None = None,
+    *,
+    present: list[tuple[str, pivot_types.ArtifactRef]] | None = None,
 ) -> list[DependencyNotFoundError]:
     """Check that every dependency is either produced by a stage or exists on disk.
 
@@ -158,6 +161,9 @@ def validate_dependency_sources(
     Returns a list of :class:`~pivot.exceptions.DependencyNotFoundError` for
     unresolvable deps.  With *store=None*, only structural checks run (wrong
     output key on a known stage); external-dep existence is silently skipped.
+    With *present*, each dependency that no stage produces and that exists on disk is
+    appended to it with its stage, in iteration order (``get_runnable_stages`` reads these
+    for the directories that hold a missing tracked file).
     """
     from pivot import exceptions
 
@@ -182,6 +188,8 @@ def validate_dependency_sources(
             if store is None:
                 continue
             if store.exists(dep):
+                if present is not None:
+                    present.append((stage_name, dep))
                 continue
             try:
                 input_path = store.checkout(dep)
@@ -332,7 +340,7 @@ def get_runnable_stages(
     all_pipelines: bool,
     on_error: pivot_types.OnError,
     missing_tracked: Collection[str] = (),
-    restorable_tracked: Collection[str] = (),
+    restored_tracked: Collection[str] = (),
 ) -> RunnableStages:
     """Return the stages a run executes, with the missing dependencies found.
 
@@ -343,14 +351,20 @@ def get_runnable_stages(
     ``missing_tracked`` holds the tracked files still missing, as the absolute normalized paths
     discovery gives (``executor.core.verify_tracked_files``). A stage reads such a file when a
     dependency is the file, lies inside it, or is an existing directory that holds it, and it
-    gets one error per such file. ``restorable_tracked`` holds missing tracked files the cache
-    can restore: they count as present (``_tracked_file_errors``).
+    gets one error per such file. ``restored_tracked`` holds every path that a restore of
+    missing tracked files creates (``executor.core.find_missing_tracked_files``, for a dry run
+    with ``--checkout-missing``): a missing dependency at such a path, or holding one, counts as
+    present (``_tracked_file_errors``).
     """
     from pivot import exceptions
 
-    errors = validate_dependency_sources(stages, store=store)
-    if missing_tracked or restorable_tracked:
-        errors = _tracked_file_errors(stages, store, errors, missing_tracked, restorable_tracked)
+    # The dependencies on disk, read for the directories that hold a missing tracked file
+    present = list[tuple[str, pivot_types.ArtifactRef]]()
+    errors = validate_dependency_sources(
+        stages, store=store, present=present if missing_tracked else None
+    )
+    if missing_tracked or restored_tracked:
+        errors = _tracked_file_errors(errors, present, store, missing_tracked, restored_tracked)
     if not errors:
         return RunnableStages(stages, errors, {})
     if not skips_missing_dependencies(all_pipelines=all_pipelines, on_error=on_error):
@@ -367,35 +381,41 @@ def get_runnable_stages(
 
 
 def _tracked_file_errors(
-    stages: dict[str, RegistryStageInfo],
-    store: Store,
     errors: list[DependencyNotFoundError],
+    present: list[tuple[str, pivot_types.ArtifactRef]],
+    store: Store,
     missing_tracked: Collection[str],
-    restorable_tracked: Collection[str],
+    restored_tracked: Collection[str],
 ) -> list[DependencyNotFoundError]:
     """``validate_dependency_sources``' ``errors`` with the missing tracked files counted, so a
     stage has one error per missing tracked file it reads.
 
     ``validate_dependency_sources`` reports each dependency that is a missing tracked file or
-    lies inside one: of a stage's errors for one tracked file, the first stays. A dependency
-    that no stage produces and that is an existing directory holding missing tracked files gets
-    one error per such file the stage has no error for yet. An error for a path that is a
-    restorable tracked file or lies inside one is dropped. Path parts decide containment, never
-    a string prefix: ``data-backup/x`` is not inside ``data``.
+    lies inside one: of a stage's errors for one tracked file, the first stays. A dependency of
+    ``present`` (one no stage produces, found on disk, with its stage) that is a directory
+    holding missing tracked files gets one error per such file the stage has no error for yet.
+    An error for a path that a restore creates (``restored_tracked``), or that holds such a
+    path, is dropped. Each path counts in both its forms, normalized and resolved
+    (``os.path.realpath``, which resolves a missing path's existing ancestors), as a watch run
+    waits for a missing input (``Engine``'s ``_MissingDependencyRun.awaits``): a dependency that
+    reaches a missing tracked file through a symlink reads it. Path parts decide containment,
+    never a string prefix: ``data-backup/x`` is not inside ``data``.
     """
     from pivot import exceptions
 
-    missing = _path_trie(missing_tracked)
-    restorable = _path_trie(restorable_tracked)
+    missing = _forms_trie(missing_tracked)
+    restored = _forms_trie(restored_tracked)
     # The stage and missing tracked file of each error kept
     reported = set[tuple[str, str]]()
     kept = list[exceptions.DependencyNotFoundError]()
     for error in errors:
         if error.input_path is not None:
-            parts = project.normalize_path(error.input_path).parts
-            if _enclosing_path(restorable, parts) is not None:
+            forms = _forms(project.normalize_path(error.input_path))
+            if restored is not None and any(
+                form.parts in restored or restored.has_subtrie(form.parts) for form in forms
+            ):
                 continue
-            tracked = _enclosing_path(missing, parts)
+            tracked = _enclosing_path(missing, forms)
             if tracked is not None:
                 if (error.stage, tracked) in reported:
                     continue
@@ -404,55 +424,59 @@ def _tracked_file_errors(
     if missing is None:
         return kept
 
-    outputs_map = _build_outputs_map(stages)
-    available = [pivot_types.identity_key(out) for out in outputs_map]
-    for stage_name, info in stages.items():
-        for dep in info["deps"].values():
-            dep_identity = _dep_identity(dep)
-            # Only a dependency that validate_dependency_sources looks for on disk reads a
-            # directory there
-            if dep_identity in outputs_map or dep_identity.producer in stages:
+    for stage_name, dep in present:
+        directory = project.normalize_path(store.checkout(dep))
+        held = {
+            tracked
+            for form in _forms(directory)
+            if missing.has_subtrie(form.parts)
+            for tracked in missing.values(prefix=form.parts)
+        }
+        for tracked in sorted(held):
+            if (stage_name, tracked) in reported:
                 continue
-            if not store.exists(dep):
-                continue
-            directory = project.normalize_path(store.checkout(dep))
-            if not missing.has_subtrie(directory.parts):
-                continue
-            for tracked in sorted(missing.values(prefix=directory.parts)):
-                if (stage_name, tracked) in reported:
-                    continue
-                reported.add((stage_name, tracked))
-                kept.append(
-                    exceptions.DependencyNotFoundError(
-                        stage=stage_name,
-                        dep=pivot_types.identity_key(dep_identity),
-                        available_outputs=available,
-                        input_path=pathlib.Path(tracked),
-                        input_path_display=project.to_relative_path(tracked),
-                        directory=directory,
-                    )
+            reported.add((stage_name, tracked))
+            kept.append(
+                exceptions.DependencyNotFoundError(
+                    stage=stage_name,
+                    dep=pivot_types.identity_key(_dep_identity(dep)),
+                    # The dependency exists, so no output name it resembles is the fix
+                    available_outputs=None,
+                    input_path=pathlib.Path(tracked),
+                    input_path_display=project.to_relative_path(tracked),
+                    directory=directory,
                 )
+            )
     return kept
 
 
-def _path_trie(paths: Collection[str]) -> pygtrie.Trie[str] | None:
-    """A trie of the absolute normalized ``paths`` keyed by their parts; None for no path."""
+def _forms(path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """Absolute normalized ``path`` and its resolved form (``os.path.realpath``)."""
+    return path, pathlib.Path(os.path.realpath(path))
+
+
+def _forms_trie(paths: Collection[str]) -> pygtrie.Trie[str] | None:
+    """A trie of the absolute normalized ``paths``, each keyed by the parts of both its forms
+    (``_forms``) to the path itself; None for no path."""
     if not paths:
         return None
     trie: pygtrie.Trie[str] = pygtrie.Trie()
     for path in paths:
-        trie[pathlib.Path(path).parts] = path
+        for form in _forms(pathlib.Path(path)):
+            trie[form.parts] = path
     return trie
 
 
-def _enclosing_path(trie: pygtrie.Trie[str] | None, parts: tuple[str, ...]) -> str | None:
-    """The outermost path of ``trie`` that is the path of ``parts`` or holds it, or None."""
+def _enclosing_path(trie: pygtrie.Trie[str] | None, forms: tuple[pathlib.Path, ...]) -> str | None:
+    """The outermost path of ``trie`` that is, or holds, a form of ``forms`` (in their order),
+    or None."""
     if trie is None:
         return None
-    step = trie.shortest_prefix(parts)
-    if step is None or not step.is_set:
-        return None
-    return trie[step.key]
+    for form in forms:
+        step = trie.shortest_prefix(form.parts)
+        if step is not None and step.is_set:
+            return trie[step.key]
+    return None
 
 
 def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInfo) -> None:

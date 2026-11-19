@@ -27,6 +27,7 @@ from pivot.storage import cache, track
 from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
 from pivot_tui import event_poller, rpc_client_impl
+from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
@@ -1952,11 +1953,7 @@ async def test_watch_across_all_pipelines_with_keep_going_stops_on_a_missing_tra
     The tracked file has a .pvt alone: no data on disk and no object in the cache.
     """
     (watch_project / "pipeline.py").write_text(_TRACKED_READER_SOURCE)
-    tracked = watch_project / "data" / "raw" / "tracked.txt"
-    pvt_path = track.get_pvt_path(tracked)
-    track.write_pvt_file(
-        pvt_path, track.PvtData(path="tracked.txt", hash="0123456789abcdef", size=10)
-    )
+    pvt_path = helpers.track_without_data(watch_project / "data" / "raw" / "tracked.txt")
     pipeline = discovery.discover_pipeline(watch_project, all_pipelines=True)
     assert pipeline is not None
     assert sorted(pipeline.list_stages()) == ["a/keep", "a/use"]
