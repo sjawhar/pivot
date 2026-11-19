@@ -1,7 +1,7 @@
 # Pivot - Project Rules
 
-Python 3.13+, Unix only, 90%+ test coverage. Pre-alpha: breaking changes are fine, with no migration code or
-compatibility shims.
+Python 3.13+, Unix only, 90%+ test coverage. Pre-alpha: breaking changes are fine, and no migration code or
+compatibility shims are needed.
 
 ## Where things are
 
@@ -22,8 +22,8 @@ PIVOT_TEST_UV="$(command -v uv)" uv run pytest packages/pivot/tests packages/piv
 uv run ruff format . && uv run ruff check . && uv run basedpyright                              # quality
 ```
 
-Run all three before you push. With `CI` set, the tests that install pivot into a fresh venv also run and need
-`PIVOT_TEST_UV` (`tests.helpers.venv_pivot`), and
+Run all three before you push or return work to the user. With `CI` set, the tests that install pivot into a
+fresh venv also run and need `PIVOT_TEST_UV` (`tests.helpers.venv_pivot`), and
 `test_helper_edited_in_the_second_its_process_started_on_a_whole_second_file_system` needs `mkfs.ext4` and
 passwordless `sudo`. Test conventions: `packages/pivot/tests/AGENTS.md`.
 
@@ -50,7 +50,7 @@ passwordless `sudo`. Test conventions: `packages/pivot/tests/AGENTS.md`.
 
 ## Architecture
 
-- No module-level mutable state: use `contextvars.ContextVar` or explicit parameters for context such as the
+- Avoid module-level mutable state: use `contextvars.ContextVar` or explicit parameters for context such as the
   current stage.
 - Keep LMDB read transactions short: materialise a generator's output inside the context manager.
 - All paths in lock files are relative to the stage's working directory.
@@ -70,7 +70,8 @@ Follow `docs/contributing/style.md` (imports, Python 3.13 types, TypedDict, simp
 ## Error Handling
 
 - Validate at boundaries (CLI, file I/O, config) and trust internals. Let errors propagate; catch only what you
-  can handle, and only the specific exceptions you expect.
+  can handle, and only the specific exceptions you expect. Avoid a blanket `except Exception` unless it re-raises
+  or logs at a boundary.
 - A failed operation returns to the last known good state.
 - Put an expensive diagnostic check (`exists()`, a stat) at debug level, behind
   `logger.isEnabledFor(logging.DEBUG)`.
@@ -86,7 +87,7 @@ Follow `docs/contributing/style.md` (imports, Python 3.13 types, TypedDict, simp
 - A pull request that changes `packages/*/src`, `benchmarks/`, `.github/workflows/benchmark.yaml` or `uv.lock` gets
   the `benchmark` label before its final review (`gh pr edit <n> --add-label benchmark`), so the gate runs on the
   final head. Without the label Benchmark skips every job. The run costs about 140 job-minutes of a cap all of the
-  account's repositories share, so add it when the change is ready for review, not earlier.
+  account's repositories share, so add it when the change is ready for that review, not earlier.
 - The gate's rule and the threshold commands are in the `benchmarks/compare.py` docstring. A change under
   `benchmarks/` changes the gate itself, because the job runs `compare.py` and `threshold.json` from the merge
   commit: review it as such.

@@ -36,9 +36,9 @@ Tests: `uv run pytest packages/pivot/tests/remote -n auto`.
   reports as `ConnectionError`): `get` then stops using the remote for the rest of the command.
   Any other failure is that object's or that call's error (a `RemoteError` subclass); each
   backend's docstrings say which.
-- No message, log line or exception chain carries an aiohttp exception's str or repr: it holds
-  the request headers, and so the bearer token. Report the status and the server's message and
-  raise `from None` (`gcs._describe`, `gcs._remote_error`).
+- No GCS error or log line carries an HTTP client exception's str or repr, or chains one as its
+  cause: aiohttp's repr holds the request headers, and so the bearer token. Report the status and
+  Google's message and raise `from None` (`gcs._describe`, `gcs._remote_error`).
 
 ## Auth and errors
 

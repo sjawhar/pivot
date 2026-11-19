@@ -78,8 +78,8 @@ with Pipeline("scores") as pipeline:
   `Ctrl+C` raises `WorkerTerminated` in the stage, and 10 seconds later the worker kills its own process tree, which
   holds no detached process or container. Use `docker rm --force`, not `docker stop`.
 - `@stage(resources={"gpu": 1})` limits how many such stages run at once (capacities under `resources:` in
-  `.pivot/config.yaml`); `{"cpu": "all"}` runs the stage alone. For a process pool inside a stage, declare
-  `{"cpu": "all"}` and run `PIVOT_NESTED_PARALLELISM=processes pivot repro` (`joblib.Parallel` uses threads).
+  `.pivot/config.yaml`); `{"cpu": "all"}` runs the stage alone. `joblib.Parallel` uses threads inside a stage; for
+  CPU-bound Python work, run `PIVOT_NESTED_PARALLELISM=processes pivot repro` and declare `{"cpu": "all"}`.
 
 ## Inputs and outputs
 
@@ -132,5 +132,8 @@ pivot status --explain      # why each stage would run
 
 Commit `pipeline.py`, the `data/raw/` inputs you own and the lock directory (`.pivot/stages/`, or `stages/` under
 `core.state_dir` when that is set). A tracked directory also needs its `<path>.pvt.listing` beside its `.pvt`.
+
+Before you call a pipeline done, check that `pivot list` shows the stages you expect, then run `pivot repro` twice:
+both runs pass, and the second finds every stage cached.
 
 When loading or running fails, or when porting from DVC, read `references/common-errors.md`.
