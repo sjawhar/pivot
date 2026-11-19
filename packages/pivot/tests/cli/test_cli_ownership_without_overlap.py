@@ -590,10 +590,18 @@ def test_coordinator_skip_replaces_a_pvt_member_only_the_record_lists(
         assert (root / "data" / "b" / "tree" / "value.txt").read_text() == "1"
 
 
-def test_storage_agents_md_names_only_existing_workspace_store_methods() -> None:
-    """storage/AGENTS.md tells the next author which methods guard an output's replacement;
-    each `WorkspaceStore.<name>` it cites exists."""
-    text = (pathlib.Path(store.__file__).parent / "AGENTS.md").read_text()
-    cited = set(re.findall(r"WorkspaceStore\.(\w+)", text))
+_STORAGE_GUIDES = (
+    pathlib.Path(store.__file__).parent / "AGENTS.md",
+    pathlib.Path(__file__).parents[4] / "docs" / "architecture" / "storage.md",
+)
+
+
+@pytest.mark.parametrize("guide", _STORAGE_GUIDES, ids=("storage/AGENTS.md", "storage.md"))
+def test_storage_guides_name_only_existing_workspace_store_methods(guide: pathlib.Path) -> None:
+    """storage/AGENTS.md and docs/architecture/storage.md tell the next author which methods
+    guard an output's replacement: each cites some `WorkspaceStore.<name>`, and each one it
+    cites exists."""
+    cited = set(re.findall(r"WorkspaceStore\.(\w+)", guide.read_text()))
+    assert cited, f"{guide} cites no WorkspaceStore method"
     missing = sorted(name for name in cited if not hasattr(store.WorkspaceStore, name))
-    assert not missing, f"storage/AGENTS.md cites missing WorkspaceStore methods: {missing}"
+    assert not missing, f"{guide} cites missing WorkspaceStore methods: {missing}"

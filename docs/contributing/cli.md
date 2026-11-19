@@ -8,7 +8,7 @@ Before submitting a PR with a new CLI command:
 
 - [ ] File created at `src/pivot/cli/<command>.py`
 - [ ] Uses `@cli_decorators.pivot_command()` decorator
-- [ ] Registered in `src/pivot/cli/__init__.py`
+- [ ] Registered in `_LAZY_COMMANDS` (and `COMMAND_CATEGORIES`) in `src/pivot/cli/__init__.py`
 - [ ] Has shell completion for stage arguments
 - [ ] Validates inputs using Click types
 - [ ] Shows explicit message for empty states
@@ -22,7 +22,9 @@ Before submitting a PR with a new CLI command:
 This decorator provides:
 
 1. **Auto-discovery** - Discovers `pipeline.py` and stores the Pipeline in the Click context before the command runs
-2. **Error handling** - Converts `PivotError` exceptions to user-friendly `ClickException` messages
+2. **Error handling** - Converts `PivotError` exceptions to user-friendly `ClickException` messages with their suggestion. Any other exception becomes one line from `exceptions.describe_error`, never a Python repr: an `OSError` as `<strerror>: <path>` (`<strerror>: <path> -> <path2>` for two paths, `<strerror>` for none), anything else as `Unexpected <type>: <message>`; `pivot --verbose` logs its traceback. Let an unexpected exception reach this handler rather than printing `str(e)` or `repr(e)` yourself; `ctx.exit(code)` passes through with its exit code.
+
+`allow_all=True` adds a `--all` flag that discovers every pipeline in the project.
 
 ```python
 from pivot.cli import decorators as cli_decorators
@@ -46,16 +48,20 @@ def init() -> None:
 
 ### When to Use `auto_discover=False`
 
-Set `auto_discover=False` only for commands that don't need the pipeline:
+Set `auto_discover=False` only for commands that don't read stage metadata, or that must keep working when `pipeline.py` is broken and discover the pipeline themselves when they need it. The pipeline is the canonical source of stage metadata: a command that inspects outputs, tags or deps uses auto-discovery.
 
 | Command | auto_discover | Reason |
 |---------|---------------|--------|
-| run, list, status, dag | True (default) | Need pipeline to find stages |
-| checkout, track | True (default) | Need pipeline for validation |
-| push, pull, fetch | True (default) | Need pipeline for output cache filtering |
-| init, doctor, check-ignore | False | No stage data needed |
+| run, repro, commit, verify | True (default), allow_all=True | Need the pipeline to find stages |
+| list, dag, status | True (default), allow_all=True | Need the pipeline; `status` skips its stages section when there is none |
+| checkout | True (default), allow_all=True | Needs the pipeline; handles a missing one |
+| push, pull, fetch | True (default), allow_all=True | Need the pipeline for output cache filtering |
+| track | False | Discovers every pipeline itself (`discovery.declared_outputs`) and refuses a path that overlaps any of their outputs, or a `.pvt` sidecar that the lock of a removed stage records as that stage's file |
+| get | False | Restores files and `.pvt` targets from git; discovers the pipeline itself for stage targets, so a broken `pipeline.py` stops only stage targets |
+| gc | False | Reads locks, `.pvt` files, run-cache rows and links on disk, so a broken `pipeline.py` never stops a user from freeing disk |
+| import, update | False | Work from git revisions, lock files and `.pvt` files |
 | history, show | False | Read run history only |
-| get, import, update | False | Work from git revisions, lock files and `.pvt` files |
+| init, doctor, check-ignore, forget-cache | False | No stage data needed |
 
 ### Group Subcommands
 
@@ -110,13 +116,17 @@ def mycommand(stages: tuple[str, ...], verbose: bool, output_json: bool) -> None
 
 ### 2. Register the Command
 
+Commands load lazily: `pivot --help` imports no command module, and `pivot <command> --help` imports only that command's. Add an entry to `_LAZY_COMMANDS` (command name, module, attribute, one-line help) and put the name in a `COMMAND_CATEGORIES` section:
+
 ```python
 # src/pivot/cli/__init__.py
-from pivot.cli.mycommand import mycommand
-
-# ... at the bottom with other commands ...
-cli.add_command(mycommand)
+_LAZY_COMMANDS: dict[str, tuple[str, str, str]] = {
+    ...
+    "mycommand": ("pivot.cli.mycommand", "mycommand", "One-line description."),
+}
 ```
+
+Import pandas, numpy, loky, the engine or the executor worker inside the command function, not at module top; `tests/cli/test_cli_performance.py` fails a command whose `--help` loads them.
 
 ### 3. Add Shell Completion
 

@@ -98,6 +98,7 @@ nav:
     - Code Tour: architecture/code-tour.md
     - Fingerprinting: architecture/fingerprinting.md
     - Execution Model: architecture/execution.md
+    - Storage: architecture/storage.md
     - Engine: architecture/engine.md
     - Watch Engine: architecture/watch.md
     - TUI: architecture/tui.md

@@ -1,117 +1,34 @@
-# Pivot CLI - Development Guidelines
+# Pivot CLI
 
-## The `pivot_command` Decorator (Critical)
+Click commands behind the `pivot` entry point. A worked example, output conventions and which
+commands discover the pipeline: `docs/contributing/cli.md`.
 
-**All new CLI commands MUST use `@cli_decorators.pivot_command()` instead of `@click.command()`.**
+## Adding a command
 
-The `pivot_command` decorator wraps Click commands with two essential behaviors:
+- Put it in `cli/<name>.py` and decorate it with `@cli_decorators.pivot_command()`, not
+  `@click.command()`. Register it in `_LAZY_COMMANDS` in `cli/__init__.py`, and in
+  `COMMAND_CATEGORIES` for its `pivot --help` section.
+- Commands load lazily. Import pandas, numpy, loky, the engine or the executor worker inside the
+  function, not at module top (`tests/cli/test_cli_performance.py` checks each `--help`).
+- `pivot_command` discovers `pipeline.py` into the Click context before the command runs.
+  Set `auto_discover=False` for a command that reads no stage metadata, or that must still work
+  when `pipeline.py` is broken and discovers only when it needs to (`gc`, `get`, `track`).
+  `allow_all=True` adds `--all` (every pipeline in the project).
+- A subcommand of a `@click.group()` (`pivot metrics show`) cannot use `pivot_command`: decorate
+  it with `@cli_decorators.with_error_handling` and call `_run_common.ensure_stages_registered()`
+  first.
+- Validate options with Click types (`click.IntRange`, `click.Path`, `click.Choice`), not in the
+  function body.
 
-1. **Auto-discovery** - Discovers `pipeline.py` (`discovery.discover_pipeline()`) and stores the Pipeline in the Click context before the command runs
-2. **Error handling** - Converts `PivotError` exceptions to user-friendly `ClickException` messages. Any other exception becomes one line from `exceptions.describe_error`, never a Python repr: an `OSError` as `<strerror>: <path>` (`<strerror>: <path> -> <path2>` for two paths, `<strerror>` for none), anything else as `Unexpected <type>: <message>`; `pivot --verbose` logs its traceback. Let an unexpected exception reach this handler rather than printing `str(e)` or `repr(e)` yourself; `ctx.exit(code)` passes through with its exit code.
+## Errors
 
-```python
-from pivot.cli import decorators as cli_decorators
+- Raise a `PivotError` subclass from `pivot.exceptions`; the decorator prints its message and
+  suggestion.
+- Let any other exception reach the decorator, which prints one line from
+  `exceptions.describe_error` and logs the traceback under `pivot --verbose`. Do not print
+  `str(e)` or `repr(e)` yourself. `ctx.exit(code)` passes through with its code.
 
-# Standard command - auto-discovers stages before running
-@cli_decorators.pivot_command()
-def list_cmd() -> None:
-    """List registered stages."""
-    # Pipeline is guaranteed to be in context here
-    stages = cli_helpers.list_stages()
-    ...
+## Tests
 
-# Command that doesn't need the registry
-@cli_decorators.pivot_command(auto_discover=False)
-def init() -> None:
-    """Initialize new project."""
-    # No discovery needed - creating new project
-    ...
-```
-
-### When to use `auto_discover=False`
-
-Set `auto_discover=False` only for commands that don't use the stage registry:
-
-| Command | auto_discover | Reason |
-|---------|---------------|--------|
-| run | True (default) | Need registry to find stages |
-| list, dag | True (default), allow_all=True | Need registry; --all for multi-pipeline |
-| checkout | True (default) | Need registry; handles None pipeline gracefully |
-| track | False | Discovers every pipeline itself (`discovery.declared_outputs`, as `--all` does) and refuses a new path overlapping any of their outputs, or one whose `.pvt` sidecar the lock of a stage that no longer exists records as that stage's file |
-| status | True (default), allow_all=True | Handles None pipeline gracefully (skips stages section) |
-| init, doctor, check-ignore | False | No stage data needed |
-| history, show | False | Read run history only |
-| get | False | Restores files and `.pvt` targets from git; discovers the pipeline itself for stage targets, and a broken `pipeline.py` only stops stage targets |
-| import, update | False | Work from git revisions, lock files and `.pvt` files |
-| gc | False | Reads the locks, `.pvt` files, run-cache rows and links on disk; a broken `pipeline.py` must never stop a user from freeing disk |
-| push, pull, fetch | True (default) | Need registry for output cache filtering |
-
-**Principle:** The pipeline registry is the canonical source of stage metadata. Commands that inspect stage properties (outputs, tags, deps) must use auto-discovery. Only commands that truly don't touch stage data should use `auto_discover=False`.
-
-### Why this matters
-
-Without auto-discovery, commands fail if called before any other pivot command:
-
-```bash
-# In a fresh shell, this would fail without auto-discovery:
-$ pivot list
-No stages registered.  # Wrong! Should discover pipeline.py first
-```
-
-The decorator ensures consistent behavior regardless of command order.
-
-### For group subcommands
-
-Commands under a `@click.group()` (like `pivot metrics show`) can't use `pivot_command`. Use `@with_error_handling` and call `ensure_stages_registered()` explicitly:
-
-```python
-from pivot.cli._run_common import ensure_stages_registered
-
-@metrics.command("show")
-@cli_decorators.with_error_handling
-def metrics_show() -> None:
-    ensure_stages_registered()  # Manual discovery for group subcommands
-    ...
-```
-
-## Input Validation (Critical)
-
-**Validate inputs as early as possible** - use Click's built-in validation in option/argument decorators.
-
-### Numeric Options
-
-Always use `click.IntRange` or `click.FloatRange` for numeric inputs:
-
-```python
-# Good - validates at argument parsing time
-@click.option("--precision", type=click.IntRange(min=0), default=5)
-@click.option("--jobs", type=click.IntRange(min=1), default=20)
-@click.option("--debounce", type=click.IntRange(min=0), default=300)
-
-# Bad - allows invalid values through
-@click.option("--precision", type=int, default=5)  # Allows negative!
-```
-
-### Path Options
-
-Use `click.Path` with appropriate parameters:
-
-```python
-@click.option("--output", type=click.Path(path_type=pathlib.Path))
-@click.option("--config", type=click.Path(exists=True, dir_okay=False))
-```
-
-### Choice Options
-
-Use `click.Choice` for limited valid values:
-
-```python
-@click.option("--format", type=click.Choice(["json", "yaml", "csv"]))
-```
-
-### Why Early Validation Matters
-
-1. **Better error messages** - Click provides user-friendly error messages automatically
-2. **Fail fast** - Don't waste time processing before discovering invalid input
-3. **Type safety** - Validated inputs have correct types in the function body
-4. **Consistency** - Users get the same error format for all validation failures
+Every command gets an integration test that runs it on real files for its success path, its
+error paths and each output format (`packages/pivot/tests/AGENTS.md`).

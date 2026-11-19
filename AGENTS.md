@@ -1,231 +1,103 @@
 # Pivot - Project Rules
 
-**Python 3.13+ | Unix only | 90%+ coverage | Pre-alpha (breaking changes OK)**
+Python 3.13+, Unix only, 90%+ test coverage. Pre-alpha: breaking changes are fine, with no migration code or
+compatibility shims.
 
-## Project Status
+## Where things are
 
-**Pre-alpha** - breaking changes acceptable, no migration code or compatibility shims needed.
-
-## Project Structure
-
-```
-packages/pivot/src/pivot/
-├── cli/           # Click commands, decorators, helpers (see cli/AGENTS.md)
-├── config/        # YAML parsing, validation
-├── config_files.py # Reading one config file (ruamel parser, dotted keys, global path); a leaf
-├── dag/           # DAG rendering for `pivot dag` (ASCII, DOT, Mermaid)
-├── engine/        # Execution coordinator, watch mode, RPC server
-├── executor/      # Worker process execution (see executor/AGENTS.md)
-├── remote/        # S3 and GCS remote cache storage (see remote/AGENTS.md)
-├── storage/       # StateDB, lock files, cache management (see storage/AGENTS.md)
-├── show/           # selection.py: HEAD/workspace output selection; data.py: decoding, comparison, formatting
-├── compose.py     # @stage, Pipeline, ArtifactHandle, metric/plot/incremental/directory tags, format inference
-├── discovery.py   # Finds and loads pipeline.py
-├── fingerprint.py # Code hashing, change detection
-├── loaded_source.py # Source each user module was compiled from; fingerprinting reads it, not the file
-├── import_origin.py # Where a worker would import a module from; a leaf a fresh interpreter runs
-├── registry.py    # StageRegistry, RegistryStageInfo, MapTemplate (built by Pipeline)
-├── expansion.py   # Expanding mapped stages (Pipeline.map) from the producer's recorded listing
-├── stage_def.py   # StageParams, output writing helpers
-├── state_dir.py   # core.state_dir: resolution, creation, per-invocation warnings, 0.5.2 layout
-├── loaders.py     # File I/O (CSV, JSON, Pickle, etc.)
-└── types.py       # TypedDicts, enums, type aliases, ArtifactIdentity
-
-packages/pivot-tui/src/pivot_tui/  # (see pivot_tui/AGENTS.md)
-├── client.py          # PivotRpc/PivotClient protocols + TypedDicts
-├── rpc_client_impl.py # RpcPivotClient: JSON-RPC 2.0 over Unix socket
-├── event_poller.py    # EventPoller: polls events, converts to TUI messages
-├── run.py             # PivotApp (Textual app), main TUI logic
-├── diff.py            # Diff formatting helpers
-├── diff_panels.py     # Input/Output diff panel renderers
-├── types.py           # TUI message types, enums
-├── widgets/           # Textual widgets (stage list, panels, logs, debug)
-├── screens/           # Modal screens (help, history, confirm dialogs)
-└── testing/
-    └── fake_server.py # FakeRpcServer test double
-```
-
-## Key Entry Points
-
-| File | Purpose |
-|------|---------|
-| `packages/pivot/src/pivot/cli/__init__.py` | CLI entry point (`pivot` command) |
-| `packages/pivot/src/pivot/engine/engine.py` | Pipeline execution coordinator |
-| `packages/pivot/src/pivot/engine/agent_rpc.py` | JSON-RPC 2.0 server (Unix socket) |
-| `packages/pivot/src/pivot/executor/worker.py` | Worker process execution |
-| `packages/pivot/src/pivot/storage/state.py` | LMDB state database |
-| `packages/pivot/src/pivot/fingerprint.py` | Code change detection |
-| `packages/pivot-tui/src/pivot_tui/run.py` | TUI application (Textual) |
-| `packages/pivot-tui/src/pivot_tui/rpc_client_impl.py` | TUI's RPC client |
-| `packages/pivot/src/pivot/cli/_run_common.py` | 3-thread TUI launch coordinator |
-
-## Institutional Knowledge
-
-**`docs/solutions/`** contains documented learnings. Check before implementing features touching:
-- Multiprocessing/loky (pickling, worker lifecycle)
-- Type system (TypedDict, generics, Protocol)
-- Fingerprinting (what triggers re-runs)
-- LMDB/StateDB (prefixes, transactions)
-- Path resolution / symlinks (normpath vs resolve, registration vs execution validation)
-
----
-
-## Core Design
-
-- **Artifact-first**: The DAG emerges from artifact dependencies, not explicit wiring
-- **Pipeline is canonical**: The registry (built from `pipeline.py`) is the single source of truth for stage metadata — deps, outs, tags, params. Lock files record execution state (hashes, generations), not stage definitions. Never infer stage properties from lock files.
-- Per-stage lock files, automatic code fingerprinting, warm worker pools
-- `ProcessPoolExecutor` for true parallelism (GIL would serialize threads)
-- Invalidation is content-addressed: same inputs + same code = same outputs
-
-## Skip Detection
-
-Three-tier algorithm: generation tracking → lock file comparison → run cache lookup. See `storage/AGENTS.md` for StateDB prefixes and implementation details.
-
-## Fingerprinting Guidelines
-
-Fingerprint checks must be cheap — O(1) shallow/static checks only. No deep recursive field traversal for immutability detection.
-
-**Error policy:**
-- **Soundness risk** (changes could go undetected) → error
-- **Noise risk** (spurious reruns only) → warn
-
-Aggregate all fingerprinting errors before reporting. Don't fail on the first one. Error messages must name the captured variables/types and suggest using `StageParams`.
-
-Unsafe fingerprinting is opt-in via a single config flag. Default is strict (error).
-
-## Caching Guidelines
-
-The manifest cache (`sm:`) is best-effort for performance. Correctness must never depend on it.
-
-## Architecture Guidelines
-
-Avoid module-level mutable state. Use `contextvars.ContextVar` or explicit parameters for contextual state like "current stage name."
-
-Keep LMDB/DB read transactions short-lived. Materialize generator outputs inside a context manager — don't leave transactions pinned via lazy generators.
-
-Centralize decision logic. The `explain` and `run` paths must use the same skip-decision code — no divergent implementations that can drift.
-
-## Artifact-Centric Mental Model (Critical)
-
-- Think **artifact-first**, not **stage-first**. The DAG emerges from artifact dependencies.
-- **Right:** "This file changed. What needs to happen because of that?"
-
-## Running Stages
-
-```bash
-pivot repro                  # Run entire pipeline (DAG-aware)
-pivot repro demo/train       # Run demo/train AND all its dependencies
-pivot repro --watch          # Watch mode - re-run on file changes
-pivot repro --dry-run        # Validate DAG without executing
-
-pivot run demo/train         # Run ONLY demo/train (no dependency resolution)
-pivot run demo/a demo/b      # Run specific stages in order (no deps)
-```
-
-**Key difference:** `repro` resolves dependencies automatically; `run` executes only the named stages.
-
-## Defining Stages and Pipelines
-
-`pipeline.py` defines stages with `@stage` and wires them in a `with Pipeline("name") as pipeline:` block; discovery loads it and reads the module variable `pipeline`. Stage names are `<pipeline>/<function>`.
-
-```python
-class TrainParams(StageParams):
-    min_score: float = 0.5
-
-
-@stage
-def train(data: pd.DataFrame, params: TrainParams) -> pd.DataFrame:
-    return data[data["score"] >= params.min_score]
-
-
-with Pipeline("demo") as pipeline:
-    train(pipeline.input("input.csv"), params=TrainParams())
-```
-
-- **Inputs**: `pipeline.input(name)` reads `data/raw/<name>`; format from the extension (`compose.py` `_infer_format_from_extension`)
-- **Dependencies**: stage parameters that receive handles (or lists/tuples of handles) at the call site; no annotations on parameters. `handle["train.csv"]` on a `directory` output depends on that one file
-- **Outputs**: the return type; format inferred (`DataFrame`→JSONL, `dict`/`list`→YAML, `str`→text) or set with `Annotated[T, loader]`; `TypedDict` for several outputs; `metric`/`plot`/`incremental` tags; `Annotated[dict[str, T], directory]` for a variable set of files. Pivot chooses paths (`data/<pipeline>/<stage>.<ext>`, a directory `data/<pipeline>/<stage>/`)
-- **Parameters**: one `StageParams` subclass per stage, defined beside it; `params.yaml` overrides by stage name
-- **Variants**: Python loops, `pipeline.variant("name")`; composition: imported handles, `Pipeline.include()`
-- **Mapping**: `pipeline.map(handle)` over a `directory` output makes a template (`registry.MapTemplate`); a run that finds the producer current adds one instance `<stage>@<key>` per file (`Scheduler.extend`), and every command expands by the same rule from the producer's lock and listing (`expansion.py`, `status.expand_current`). No expansion is saved
-- Stages must be **pure, module-level functions** (workers receive them by pickling); config belongs in `StageParams`, not module-level collections
-
-User-facing guide: `skills/writing-pivot-stages/SKILL.md`.
-
----
-
-## Code Quality
-
-- Type hints everywhere; `ruff format` (100 chars); `ruff check`
-- `_prefix` for private functions; import modules not functions
-- Zero tolerance for basedpyright warnings—use targeted ignores: `# type: ignore[code] - reason`
-- Prefer type stubs (`pandas-stubs`, `types-PyYAML`) over ignores
-- Check `typings/` first for untyped packages; use `scripts/generate_stubs.py` if needed
-- **aioboto3/S3 types:** Use `types_aiobotocore_s3.S3Client` (not `Any`) for S3 client parameters. Import under `TYPE_CHECKING`. The `types-aioboto3[all]` stubs are in dev deps.
-- **Network I/O:** See `remote/AGENTS.md` for async patterns, aioboto3 session management, and aiohttp usage.
-
-## Python 3.13+ Types
-
-- Empty collections: `list[int]()` not `: list[int] = []`
-- Simplified Generator: `Generator[int]` not `Generator[int, None, None]`
-- **Enums over Literals** for programmatic values (catches typos at type-check time)
-
-## TypedDict
-
-- Use over dataclasses/namedtuples (zero overhead, native JSON)
-- Direct access only, never `.get()`. For optional: `if "key" in d: d["key"]`
-- Constructor syntax: `Result(status="ok")` not `{"status": "ok"}`
-
-## Import Style
-
-Import modules, not functions: `from pivot import fingerprint` then `fingerprint.func()`.
-
-**Exceptions:** `TYPE_CHECKING` blocks, `pivot.types`, `typing` module, CLI lazy imports.
-
-**No duplicate imports:** If a module is imported at runtime (`import pathlib`), do NOT also import from it under `TYPE_CHECKING` (`from pathlib import Path`). Use `pathlib.Path` in annotations instead. Each module should appear in exactly one place — either a runtime module import or a `TYPE_CHECKING` import, never both.
-
-## Error Handling
-
-- Validate at boundaries (CLI, file I/O, config), trust internals
-- Let errors propagate; catch only where you can handle meaningfully
-- Catch specific expected exceptions — avoid blanket `except Exception` unless re-raising or logging at a boundary
-- Failed operations should be atomic—return to last known good state
-- Before adding defensive changes (locks, guards, extra validation), verify whether existing mechanisms (DAG ordering, lock files, transaction isolation) already guarantee safety. Don't add redundant protection.
-- Demote expensive diagnostic checks (`exists()`, stat calls) to debug level. Guard with `logger.isEnabledFor(logging.DEBUG)` to avoid overhead when debug logging is off.
-
-## Simplicity Over Abstraction
-
-- Don't create thin wrappers—inline single-use library calls
-- Don't over-modularize—inline modules with one public function
-- Three similar lines > premature abstraction
-
----
-
-## Path Handling
-
-All paths in lockfiles must be **relative** (to stage cwd), never absolute.
+- `packages/pivot/src/pivot/`: the library and the `pivot` CLI. Package guides: `cli/AGENTS.md`,
+  `executor/AGENTS.md`, `remote/AGENTS.md`, `storage/AGENTS.md`; tests: `packages/pivot/tests/AGENTS.md`.
+- `packages/pivot-tui/src/pivot_tui/`: the Textual TUI, a client of the engine's JSON-RPC server
+  (`pivot_tui/AGENTS.md`).
+- `docs/`: the published documentation; `docs/architecture/` explains the engine, execution, storage, fingerprinting and
+  watch mode. `docs/solutions/` holds past learnings: read the ones on your topic before you change
+  multiprocessing and worker lifecycle, typing, fingerprinting, LMDB/StateDB, or path resolution.
+- The user-facing guide to writing pipelines is `skills/writing-pivot-stages/SKILL.md`.
 
 ## Development
 
 ```bash
-uv sync --active                                                                      # Install deps
-uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto                  # Test
-uv run ruff format . && uv run ruff check . && uv run basedpyright                    # Quality
+uv sync --active                                                                                # install
+PIVOT_TEST_UV="$(command -v uv)" uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto  # test
+uv run ruff format . && uv run ruff check . && uv run basedpyright                              # quality
 ```
 
-**Run all quality checks before returning to user or pushing.**
+Run all three before you push. With `CI` set, the tests that install pivot into a fresh venv also run and need
+`PIVOT_TEST_UV` (`tests.helpers.venv_pivot`), and
+`test_helper_edited_in_the_second_its_process_started_on_a_whole_second_file_system` needs `mkfs.ext4` and
+passwordless `sudo`. Test conventions: `packages/pivot/tests/AGENTS.md`.
 
-**CI runs the test suite without uv on PATH**, so a test that starts pivot runs `pathlib.Path(sys.executable).parent / "pivot"`. With `CI` set, the tests that install pivot into a fresh venv also run and need uv's path (`tests.helpers.venv_pivot`): the wheel smoke tests (`tests/integration/test_fresh_install_smoke.py`) and the pivot 0.5.11 two-build test (`tests/cli/test_cli_acceptance.py`). Run the suite as `PIVOT_TEST_UV="$(command -v uv)" uv run pytest ...`. With `CI` set, `test_helper_edited_in_the_second_its_process_started_on_a_whole_second_file_system` (`tests/fingerprint/test_code_edited_during_run.py`) also runs: it needs `mkfs.ext4` and passwordless `sudo` to loop-mount an ext4 image, and fails without them.
+## Core design
 
-**A draft pull request runs no CI suite.** Tests (`pr-and-main.yaml`) and Benchmark (`benchmark.yaml`) skip every job on a draft, and a skipped job reads as passed, so `draft-marker.yml` sets the commit status `ci/untested-draft` to failure on the draft's head. Mark the pull request ready (`gh pr ready <n>`) to run Tests on its head, and Benchmark too when it carries the `benchmark` label; Tests' lint job then sets `ci/untested-draft` to success. To run the suites on drafts, set the repository variable `CI_RUN_DRAFT_PRS` to `true`. If a ready pull request's head still reads untested while no Tests run of that head is going (GitHub can process a push after the ready event, and then the suites run on the previous commit), push again or run `gh pr ready --undo <n> && gh pr ready <n>`. A new push to a ready pull request cancels the runs of the push it replaced; to run a cancelled run of the head you need, `gh run rerun <id>`. Runs on main, the weekly benchmark and `workflow_dispatch` runs are never cancelled.
+- Artifact-first: the DAG comes from artifact dependencies, not explicit wiring. Ask "this file changed; what has to
+  happen because of it?"
+- The registry, built from `pipeline.py`, is the one source of stage metadata (deps, outs, tags, params). Lock files
+  record execution state (hashes, generations), never stage definitions: do not infer a stage's properties from a
+  lock file.
+- Invalidation is content-addressed: same inputs and same code give the same outputs. Skip detection is generation
+  tracking, then lock-file comparison, then the run cache (`docs/architecture/execution.md`; StateDB prefixes in
+  `docs/architecture/storage.md`).
+- The `explain` and `run` paths use the same skip-decision code; never give one of them its own copy.
 
-**A regression found on main gets a line in `.github/known-regressions`, by PR.** Main then goes red and nothing publishes until the fix's PR deletes the line.
+## Fingerprinting
 
-Measure a performance change on one pipeline and on one task with its upstream stages, the scopes people run, with wall time and CPU, against main in the same job. `.github/workflows/benchmark.yaml` does this (`benchmarks/run.py`, `benchmarks/compare.py`) in its weekly run, in each `workflow_dispatch` run, and on a pull request that carries the `benchmark` label and is not a draft; it runs pivot with a user's environment, so never pin `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` or `MKL_NUM_THREADS` for a measurement. `run.py` also drops `PIVOT_CACHE_DIR`, so each variant writes its own project's `.pivot/cache` rather than one cache both share.
+- Fingerprint checks are cheap: O(1) shallow or static checks, no deep recursive traversal.
+- A soundness risk (a change could go undetected) is an error; a noise risk (only spurious reruns) is a warning.
+  Unsafe fingerprinting is opt-in through one config flag; the default is strict.
+- Collect every fingerprinting error before reporting. A message names the captured variable or type and suggests
+  `StageParams`.
+- The manifest cache (`sm:`) is best-effort: correctness never depends on it.
 
-**A pull request that changes `packages/*/src`, `benchmarks/`, `.github/workflows/benchmark.yaml` or `uv.lock` gets the `benchmark` label before its final review** (`gh pr edit <n> --add-label benchmark`), so the benchmark gate runs at its final head. Benchmark's `unit` job is the only CI job that runs the tests in `benchmarks/`, and the bench jobs build pivot from `uv.lock`, so a change to the harness, its workflow or the dependencies needs the run as much as a source change does. Adding the label to a ready pull request runs the benchmark on its head, and each later push runs it again and cancels the run it replaces; adding another label neither starts nor cancels one, and removing the label starts no run, so a running benchmark finishes (`gh run cancel <id>` stops it). Its eight jobs take about 140 job-minutes of the hosted-job cap that every repository of the sjawhar account shares, so add the label when the change is ready for that review, not earlier. Without the label Benchmark skips every job, and a skipped job reads as passed. `gh pr checks <n>` shows whether the final head's benchmark ran: the `bench (<project>)` rows appear only when it ran. It shows only the newest check of each name, so after a later label event `unit` can read `skipping` over a `unit` that ran.
+## Architecture
 
-A scenario's metric fails the benchmark only when both hold: its median change exceeds the scenario's limit in `benchmarks/threshold.json` (the minimum effect), and a bootstrap 95% interval of the median per-rep ratio head/base, with reps paired by their `rep` number (fixed seed, 10,000 resamples), lies entirely above 1. Each limit is three times the largest absolute median change across the A/A runs (the same build on both sides) recorded in `benchmarks/calibration.json`, rounded up to a whole percent, with a two-percent minimum. A recalibration replaces that record rather than extending it. Take four or more new samples, each from its own `workflow_dispatch` run with `base` and `head` set to the same ref, not a re-run attempt: a dispatch run also measures the 1,000-stage projects that pull request runs skip, and GitHub keeps artifacts only for a run's last attempt. Write the record with one `uv run python benchmarks/compare.py --write-calibration benchmarks/calibration.json` call, passing one `--sample SAMPLE RUN ATTEMPT JOB BASE HEAD` per project per run. Then run `uv run python benchmarks/compare.py --derive-threshold --calibration benchmarks/calibration.json > benchmarks/threshold.json` once over the whole record.
+- No module-level mutable state: use `contextvars.ContextVar` or explicit parameters for context such as the
+  current stage.
+- Keep LMDB read transactions short: materialise a generator's output inside the context manager.
+- All paths in lock files are relative to the stage's working directory.
+- Before you add a lock, guard or extra validation, check whether DAG ordering, lock files or transaction isolation
+  already makes the case safe.
 
-The job runs compare.py and threshold.json from the merge commit, so a PR that edits either one sets its own verdict, and the PR gets that verdict because a change under `benchmarks/` carries the `benchmark` label (above); review changes under benchmarks/ as changes to the gate.
+## Code style
+
+- Type hints everywhere, and zero basedpyright warnings: a targeted ignore reads `# type: ignore[code] - reason`.
+  Prefer stub packages over ignores; check `typings/` before you add one (`scripts/generate_stubs.py`).
+- Import modules, not functions: `from pivot import fingerprint`, then `fingerprint.func()`. Exceptions:
+  `TYPE_CHECKING` blocks, `pivot.types`, `typing`, and lazy imports in the CLI. A module is imported either at run
+  time or under `TYPE_CHECKING`, never both (`pathlib.Path` in annotations, not a second `from pathlib import Path`).
+- `_prefix` for private functions.
+- Empty collections as `list[int]()`, not `x: list[int] = []`; `Generator[int]`, not `Generator[int, None, None]`;
+  an enum, not a `Literal`, for a value code passes around.
+- TypedDict over dataclasses and namedtuples. Read keys directly, never with `.get()` (`if "key" in d: d["key"]`
+  for an optional key), and build one with its constructor: `Result(status="ok")`.
+- No thin wrappers around a single library call and no module with one public function; three similar lines beat a
+  premature abstraction.
+
+## Error Handling
+
+- Validate at boundaries (CLI, file I/O, config) and trust internals. Let errors propagate; catch only what you
+  can handle, and only the specific exceptions you expect.
+- A failed operation returns to the last known good state.
+- Put an expensive diagnostic check (`exists()`, a stat) at debug level, behind
+  `logger.isEnabledFor(logging.DEBUG)`.
+
+## Pull requests and CI
+
+- A draft pull request runs no suite, and a skipped job reads as passed: `draft-marker.yml` sets
+  `ci/untested-draft` to failure on a draft's head. Mark it ready (`gh pr ready <n>`) to run Tests. If a ready
+  head still reads untested and no Tests run of it is going, push again or run
+  `gh pr ready --undo <n> && gh pr ready <n>`.
+- A regression found on main gets a line in `.github/known-regressions`, by pull request. Main then stays red and
+  nothing publishes until the fix's pull request deletes the line.
+- A pull request that changes `packages/*/src`, `benchmarks/`, `.github/workflows/benchmark.yaml` or `uv.lock` gets
+  the `benchmark` label before its final review (`gh pr edit <n> --add-label benchmark`), so the gate runs on the
+  final head. Without the label Benchmark skips every job. The run costs about 140 job-minutes of a cap all of the
+  account's repositories share, so add it when the change is ready for review, not earlier.
+- The gate's rule and the threshold commands are in the `benchmarks/compare.py` docstring. A change under
+  `benchmarks/` changes the gate itself, because the job runs `compare.py` and `threshold.json` from the merge
+  commit: review it as such.
+- To recalibrate, take four or more A/A samples, each from its own `workflow_dispatch` run of Benchmark with `base`
+  and `head` set to the same ref (not a re-run: GitHub keeps artifacts only for a run's last attempt), write a new
+  `benchmarks/calibration.json` with `compare.py --write-calibration`, then derive `benchmarks/threshold.json`
+  from it.
+- Never pin `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` or `MKL_NUM_THREADS` for a measurement: the benchmark runs
+  pivot with a user's environment.
