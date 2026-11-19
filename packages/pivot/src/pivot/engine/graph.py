@@ -20,8 +20,7 @@ if TYPE_CHECKING:
 
     from pivot.exceptions import DependencyNotFoundError
     from pivot.registry import RegistryStageInfo
-    from pivot.storage.store import Store, WorkspaceStore
-    from pivot.storage.track import PvtData
+    from pivot.storage.store import Store
 
 __all__ = [
     "artifact_node",
@@ -31,8 +30,7 @@ __all__ = [
     "skips_missing_dependencies",
     "RunnableStages",
     "get_runnable_stages",
-    "RestoreLimit",
-    "restore_limits",
+    "tracked_overlap",
     "get_consumers",
     "get_producer",
     "get_downstream_stages",
@@ -352,6 +350,7 @@ def get_runnable_stages(
     on_error: pivot_types.OnError,
     missing_tracked: Collection[str] = (),
     restored_tracked: Mapping[str, AbstractSet[tuple[str, ...]]] | None = None,
+    present: list[tuple[str, pivot_types.ArtifactRef]] | None = None,
 ) -> RunnableStages:
     """Return the stages a run executes, with the missing dependencies found.
 
@@ -368,13 +367,17 @@ def get_runnable_stages(
     ``--checkout-missing``): a missing dependency the restore creates, or that holds a path the
     restore creates, counts as one that exists, as the run finds it after its restore
     (``_restore_creates``), so a directory among them that holds a missing tracked file leaves
-    its stage out too.
+    its stage out too. ``present``, when given, receives each dependency that no stage produces
+    and that exists, or that the restore creates, with its stage (``validate_dependency_sources``'
+    ``present``), for a caller to read them without checking the disk again (a dry run's notice,
+    ``status.restore_limits``).
     """
     from pivot import exceptions
 
     # The dependencies on disk, or created by the restore, read for the directories that hold a
     # missing tracked file
-    present = list[tuple[str, pivot_types.ArtifactRef]]()
+    if present is None:
+        present = list[tuple[str, pivot_types.ArtifactRef]]()
     errors = validate_dependency_sources(
         stages,
         store=store,
@@ -440,14 +443,7 @@ def _tracked_file_errors(
     for stage_name, dep in present:
         directory = project.normalize_path(store.checkout(dep))
         if directory not in held_by_directory:
-            held_by_directory[directory] = sorted(
-                {
-                    tracked
-                    for form in _forms(directory)
-                    if missing.has_subtrie(form.parts)
-                    for tracked in missing.values(prefix=form.parts)
-                }
-            )
+            held_by_directory[directory] = _held_paths(missing, _forms(directory))
         for tracked in held_by_directory[directory]:
             if (stage_name, tracked) in reported:
                 continue
@@ -500,87 +496,23 @@ def _restore_creates(
     return creates
 
 
-class RestoreLimit(NamedTuple):
-    """Why a dry run's explanation of a stage may not follow the ``--checkout-missing`` restore
-    (``restore_limits``)."""
+def tracked_overlap(tracked: Collection[str]) -> Callable[[pathlib.Path], str | None]:
+    """For the absolute normalized tracked paths ``tracked``, the function that gives the one an
+    absolute normalized path is or lies inside, else the first, sorted, of those it holds, else
+    None. Each path counts in both its forms (``_forms``), as ``get_runnable_stages`` counts a
+    missing tracked file (``_tracked_file_errors``). Path parts decide containment, never a
+    string prefix. The trie of ``tracked`` is built here, once."""
+    trie = _forms_trie(tracked)
 
-    reader: str
-    """The stage that reads ``path``: the stage itself, or a stage upstream of it."""
-    path: pathlib.Path
-    """The dependency of ``reader`` that the restore changes (absolute normalized)."""
-    tracked: str
-    """The restorable missing tracked path whose restore changes ``path`` (absolute
-    normalized)."""
-
-
-def restore_limits(
-    stages: dict[str, RegistryStageInfo],
-    store: WorkspaceStore,
-    restorable: Mapping[str, PvtData],
-    restored: Mapping[str, AbstractSet[tuple[str, ...]]],
-) -> dict[str, RestoreLimit]:
-    """Each stage of ``stages`` whose dry-run explanation may not follow the restore of the
-    missing tracked paths of ``restorable``, with why. A dry run with ``--checkout-missing``
-    counts these paths as present (``executor.core.find_missing_tracked_files`` gives
-    ``restorable`` and ``restored``), and ``stages`` are the stages and templates it keeps.
-
-    The explanation takes a dependency's hash from a ``.pvt`` only where
-    ``explain.find_tracked_hash`` gives one: for a restorable path itself, and for a file of a
-    restorable directory's listing. It reads every other dependency from the disk, which does not
-    hold the restored files yet. So a stage has a limit when a dependency that no stage produces,
-    found on disk or created by the restore (``validate_dependency_sources``' ``present``), is,
-    holds or lies inside a restorable path in either form (``_forms``), and
-    ``find_tracked_hash`` gives it no hash: a directory on disk that holds a restorable path, a
-    subdirectory of a restorable directory, or a path that reaches a restorable path through a
-    symlink. Its limit names its first such dependency, with the restorable path that dependency
-    is or lies inside, else the first one it holds. Every stage downstream of a stage with a
-    limit has one too: its own, else that of the first such stage upstream of it. Path parts
-    decide containment, never a string prefix. With no restorable path it reads nothing.
-    """
-    if not restorable:
-        return {}
-    from pivot import explain
-
-    present = list[tuple[str, pivot_types.ArtifactRef]]()
-    # The kept stages have no missing dependency: get_runnable_stages left out each stage with
-    # one, and every stage downstream of it
-    validate_dependency_sources(
-        stages, store=store, present=present, created=_restore_creates(restored)
-    )
-    roots = _forms_trie(restorable)
-    # The restorable paths keyed as the dry run's explanation keys them
-    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie(
-        (pathlib.Path(path).parts, path) for path in restorable
-    )
-    readers = dict[str, RestoreLimit]()
-    for stage_name, dep in present:
-        if stage_name in readers:
-            continue
-        path = project.normalize_path(store.checkout(dep))
+    def overlap(path: pathlib.Path) -> str | None:
         forms = _forms(path)
-        tracked = _enclosing_path(roots, forms)
-        if tracked is None:
-            held = [
-                inside
-                for form in forms
-                if roots.has_subtrie(form.parts)
-                for inside in roots.values(prefix=form.parts)
-            ]
-            if not held:
-                continue
-            tracked = min(held)
-        if explain.find_tracked_hash(path, restorable, tracked_trie, store.cache_dir) is not None:
-            # The explanation takes its hash from the .pvt, the hash the restore brings back
-            continue
-        readers[stage_name] = RestoreLimit(reader=stage_name, path=path, tracked=tracked)
-    if not readers:
-        return readers
-    graph = build_graph(stages)
-    limits = dict(readers)
-    for name, limit in readers.items():
-        for downstream in get_downstream_stages(graph, name):
-            limits.setdefault(downstream, limit)
-    return limits
+        enclosing = _enclosing_path(trie, forms)
+        if enclosing is not None:
+            return enclosing
+        held = _held_paths(trie, forms)
+        return held[0] if held else None
+
+    return overlap
 
 
 def _forms(path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
@@ -606,6 +538,18 @@ def _enclosing_path(trie: pygtrie.Trie[str], forms: tuple[pathlib.Path, ...]) ->
         if step is not None and step.is_set:
             return trie[step.key]
     return None
+
+
+def _held_paths(trie: pygtrie.Trie[str], forms: tuple[pathlib.Path, ...]) -> list[str]:
+    """The paths of ``trie`` (``_forms_trie``) that lie inside a form of ``forms``, sorted."""
+    return sorted(
+        {
+            path
+            for form in forms
+            if trie.has_subtrie(form.parts)
+            for path in trie.values(prefix=form.parts)
+        }
+    )
 
 
 def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInfo) -> None:

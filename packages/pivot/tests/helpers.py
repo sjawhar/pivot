@@ -1,6 +1,6 @@
 """Test helpers shared by test modules: pipelines built with the compositional API or written as
-pipeline.py text, tracked files with no data, sockets, and venvs that CI-only tests install with
-uv."""
+pipeline.py text, tracked files with no data, the output of `pivot repro --jsonl`, sockets, and
+venvs that CI-only tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import json
 import os
 import pathlib
 import re
@@ -87,6 +88,43 @@ def track_without_data(data_path: pathlib.Path) -> pathlib.Path:
         pvt_path, track.PvtData(path=data_path.name, hash="0123456789abcdef", size=10)
     )
     return pvt_path
+
+
+# `pivot repro --all --keep-going --dry-run --jsonl`: its one JSON document on stdout
+DRY_RUN_KEEP_GOING = ["repro", "--all", "--keep-going", "--dry-run", "--jsonl"]
+
+
+def one_stage_pipeline_code(name: str, stage_name: str) -> str:
+    """Return a complete compositional pipeline.py with one value-returning stage."""
+    return f'''\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def {stage_name}() -> str:
+    return "{stage_name} output"
+
+
+with Pipeline("{name}") as pipeline:
+    {stage_name}()
+'''
+
+
+def write_pipeline(root: pathlib.Path, name: str, code: str) -> None:
+    """Write pipeline.py ``code`` into the new directory ``root / name``."""
+    (root / name).mkdir()
+    (root / name / "pipeline.py").write_text(code)
+
+
+def skipping_lines(output: str) -> list[str]:
+    """Each `Skipping:` line of ``output``: a stage a run leaves out, with why."""
+    return [line for line in output.splitlines() if "Skipping:" in line]
+
+
+def completed_stages(stdout: str) -> dict[str, dict[str, object]]:
+    """The `stage_complete` event of each stage a `--jsonl` run reports, by stage."""
+    events = [json.loads(line) for line in stdout.splitlines()]
+    return {event["stage"]: event for event in events if event["type"] == "stage_complete"}
 
 
 def cli_env(home: pathlib.Path, **extra: str) -> dict[str, str]:

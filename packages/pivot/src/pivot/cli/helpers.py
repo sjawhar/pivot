@@ -88,12 +88,14 @@ def expand_mapped_stages(
     fetched: Mapping[str, listing.DirListing] | None = None,
     restorable: Mapping[str, track.PvtData] | None = None,
     refuse: InstanceRefusal | None = None,
+    waiting: dict[str, str] | None = None,
 ) -> tuple[Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage of the Pipeline in context whose producer is current, as a run
     would (``status.expand_current``, a listing the cache lacks taken from ``fetched``, the
     missing tracked files of ``restorable`` counted as present, a template ``refuse`` refuses
-    left unexpanded), and return the expansion with the explanations it read. A command that
-    lists stages calls it first, so the stages it lists hold the instances."""
+    left unexpanded, why each stage it waits for is not current given to ``waiting``), and
+    return the expansion with the explanations it read. A command that lists stages calls it
+    first, so the stages it lists hold the instances."""
     from pivot import status as status_mod
 
     return status_mod.expand_current(
@@ -103,6 +105,7 @@ def expand_mapped_stages(
         fetched=fetched,
         restorable=restorable,
         refuse=refuse,
+        waiting=waiting,
     )
 
 

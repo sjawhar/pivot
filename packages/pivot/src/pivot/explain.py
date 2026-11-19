@@ -174,7 +174,7 @@ def find_tracked_hash(
     listing), None otherwise. ``tracked_trie`` keys each path of ``tracked_files`` by its
     ``Path.parts``. A missing dependency's explanation takes its hash from here
     (``get_stage_explanation``), and the dry run's notice of a restore it cannot follow asks the
-    same (``engine.graph.restore_limits``).
+    same, with the same store and cache (``status.restore_limits``).
     """
     tracked_path = _find_tracked_ancestor(dep, tracked_trie)
     if not tracked_path:

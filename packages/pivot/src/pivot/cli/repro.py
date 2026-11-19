@@ -34,6 +34,7 @@ from pivot.engine import graph as engine_graph
 from pivot.engine import sources as engine_sources
 from pivot.engine import watch as engine_watch
 from pivot.types import (
+    ArtifactRef,
     DisplayCategory,
     ExecutionResultEvent,
     OnError,
@@ -43,13 +44,14 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from types import FrameType
 
     import networkx as nx
 
     from pivot.cli import console as tui_console
     from pivot.executor import ExecutionSummary
-    from pivot.storage.track import PvtData
+    from pivot.executor.core import MissingTrackedFiles
     from pivot.types import PipelineStatusInfo, StageExplanation
 
 
@@ -130,14 +132,13 @@ class _LeaveOut(NamedTuple):
     """What a run decides before it expands a mapped stage (``_leave_out_plan`` in leave-out
     mode; ``_no_leave_out`` in any other mode, which leaves out nothing)."""
 
-    missing: list[str]
-    """The missing tracked files the cache cannot restore (absolute normalized paths)."""
-    restorable: dict[str, PvtData]
-    """The missing tracked files the cache can restore (``--checkout-missing``), with their
-    ``.pvt`` data: they count as present, and nothing restores them."""
-    restored: dict[str, set[tuple[str, ...]]]
-    """Each path of ``restorable``, with every path its restore creates inside it
-    (``executor.core.MissingTrackedFiles.restored``)."""
+    found: MissingTrackedFiles
+    """The missing tracked files, split by whether the cache can restore them
+    (``--checkout-missing``; ``executor.core.find_missing_tracked_files``): the restorable ones
+    count as present, and nothing restores them."""
+    present: list[tuple[str, ArtifactRef]]
+    """Each dependency of the kept stages and templates that no stage produces, with its stage:
+    each exists, or the restore creates it (``engine.graph.get_runnable_stages``' ``present``)."""
     stages: dict[str, registry.RegistryStageInfo] | None
     """The run's own stages and templates that it keeps; None for every one."""
     left_out: dict[str, exceptions.DependencyNotFoundError]
@@ -154,10 +155,11 @@ class _LeaveOut(NamedTuple):
 def _no_leave_out(stages_list: list[str] | None) -> _LeaveOut:
     """The decisions of a run that is not in leave-out mode: it keeps every stage and target and
     finds no missing tracked file (its pre-flight stops on one)."""
+    from pivot.executor import core as executor_core
+
     return _LeaveOut(
-        missing=[],
-        restorable={},
-        restored={},
+        found=executor_core.MissingTrackedFiles(missing=[], restorable={}, restored={}),
+        present=[],
         stages=None,
         left_out={},
         targets=stages_list,
@@ -208,6 +210,7 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
         )
         if refusal is not None:
             raise refusal
+    present = list[tuple[str, ArtifactRef]]()
     runnable, errors, left_out = engine_graph.get_runnable_stages(
         cli_helpers.get_graph_stages(),
         cli_helpers.require_workspace_store(),
@@ -215,6 +218,7 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
         on_error=OnError.KEEP_GOING,
         missing_tracked=found.missing,
         restored_tracked=found.restored,
+        present=present,
     )
     for error in errors:
         _logger.warning("Skipping: %s", error.format_user_message())
@@ -223,9 +227,8 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     left_out_targets = expansion.left_out_targets(stages_list or [], templates, left_out)
     targets = None if stages_list is None else [t for t in stages_list if t not in left_out_targets]
     return _LeaveOut(
-        missing=found.missing,
-        restorable=found.restorable,
-        restored=found.restored,
+        found=found,
+        present=[(name, dep) for name, dep in present if name in runnable],
         stages=runnable,
         left_out=left_out,
         targets=targets,
@@ -267,23 +270,39 @@ def _instance_output_refusal(
     )
 
 
-def _log_restore_limits(not_expanded: list[PipelineStatusInfo], plan: _LeaveOut) -> None:
-    """Log one notice for each mapped stage of ``not_expanded`` (its rows) whose producer, or a
-    stage upstream of it, reads a path that the ``--checkout-missing`` restore changes and that
-    the dry run's explanation reads from the disk (``engine_graph.restore_limits``). The dry run
-    shows such a mapped stage as not yet expanded, but the run may restore the path, find the
-    producer current and add its instances. With no restorable file it reads nothing."""
-    if plan.stages is None or not plan.restorable or not not_expanded:
+def _log_restore_limits(
+    not_expanded: list[PipelineStatusInfo],
+    plan: _LeaveOut,
+    graph: nx.DiGraph[str],
+    known: Mapping[str, StageExplanation],
+    waiting: Mapping[str, str],
+) -> None:
+    """Log one notice for each mapped stage of ``not_expanded`` (its rows) that waits for its
+    producer (``waiting``, ``status.expand_current``'s) where the run may expand it: the dry
+    run explains the producer as not current only because it, or a stage upstream of it, reads
+    from the disk a path that the ``--checkout-missing`` restore changes
+    (``status.restore_limits``, given the dry run's ``graph`` and the explanations its
+    expansion read, ``known``). The run may restore the path, find the producer current and add
+    its instances. With no restorable file it reads nothing."""
+    from pivot import status as status_mod
+
+    if not plan.found.restorable or not not_expanded:
         return
-    limits = engine_graph.restore_limits(
-        plan.stages, cli_helpers.require_workspace_store(), plan.restorable, plan.restored
-    )
     pipeline = cli_helpers.get_pipeline()
-    for row in not_expanded:
-        template = row["name"]
-        # A template mapped over another one's instances shares its source: this is the
-        # producer of the first template of its chain
-        producer = pipeline.get_template(template)["source"].producer
+    # A template mapped over another one's instances shares its source: this is the producer
+    # of the first template of its chain
+    producers = {
+        row["name"]: pipeline.get_template(row["name"])["source"].producer for row in not_expanded
+    }
+    limits = status_mod.restore_limits(
+        pipeline,
+        {producer for producer in producers.values() if producer in waiting},
+        graph,
+        present=plan.present,
+        restorable=plan.found.restorable,
+        known=known,
+    )
+    for template, producer in producers.items():
         if producer not in limits:
             continue
         limit = limits[producer]
@@ -340,9 +359,10 @@ def _get_explanations(
     mapped stage, its not-expanded row and its orphaned instances are not shown, and a left-out
     stage changes no orphan the run would remove (``cli_helpers.eligible_templates`` over the
     stages the run keeps). With ``--checkout-missing``, a notice on stderr names each mapped
-    stage shown as not yet expanded whose producer the dry run may explain apart from the run
-    (``_log_restore_limits``). Any other mode leaves out nothing (``_no_leave_out``), and a
-    missing dependency stops it unless ``allow_missing``.
+    stage shown as not yet expanded that the run may expand: its producer waits only for a path
+    the restore changes and the dry run reads from the disk (``_log_restore_limits``). Any other
+    mode leaves out nothing (``_no_leave_out``), and a missing dependency stops it unless
+    ``allow_missing``.
 
     Shared by --explain and --dry-run modes.
     """
@@ -357,17 +377,20 @@ def _get_explanations(
         # Every target is left out; no target would explain every stage
         return _Explained([], [], {}, plan.left_out_targets)
     pipeline = cli_helpers.get_pipeline()
+    # Why each stage of the producers' execution order that is not current is not
+    waiting = dict[str, str]()
     result, known = cli_helpers.expand_mapped_stages(
         force=force,
         allow_missing=allow_missing,
-        restorable=plan.restorable,
+        restorable=plan.found.restorable,
         refuse=functools.partial(
             _instance_output_refusal,
             wanted=plan.wanted,
-            missing=plan.missing,
+            missing=plan.found.missing,
             project_root=project.get_project_root(),
             checkout_attempted=checkout_missing,
         ),
+        waiting=waiting,
     )
     kept = expansion.Expansion(
         expanded={n: found for n, found in result["expanded"].items() if n not in plan.left_out},
@@ -417,10 +440,10 @@ def _get_explanations(
         allow_missing=allow_missing,
         graph=graph,
         known=known,
-        restorable=plan.restorable,
+        restorable=plan.found.restorable,
     )
     not_expanded = status_mod.not_expanded_status(kept, shown_templates)
-    _log_restore_limits(not_expanded, plan)
+    _log_restore_limits(not_expanded, plan, graph, known, waiting)
     return _Explained(explanations, not_expanded, orphans, plan.left_out_targets)
 
 

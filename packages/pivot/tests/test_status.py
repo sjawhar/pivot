@@ -1,22 +1,26 @@
 from __future__ import annotations
 
+import shutil
 from typing import TYPE_CHECKING
 
 import lmdb
 import networkx as nx
 import pytest
 
-from pivot import config, exceptions, executor, explain, registry, status
+from pivot import cli, config, exceptions, executor, explain, registry, status
+from pivot.engine import graph as engine_graph
+from pivot.executor import core as executor_core
 from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, listing, track
 from pivot.storage import state as state_mod
-from pivot.types import Recovery, StageExplanation
+from pivot.types import ArtifactRef, OnError, Recovery, StageExplanation
 from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
 
+    import click.testing
     from pytest_mock import MockerFixture
 
     from pivot.registry import PipelineLike as Pipeline
@@ -861,6 +865,93 @@ def test_get_pipeline_explanations_uses_provided_graph(
     # Verify it found the stage
     assert len(explanations) == 1
     assert explanations[0]["stage_name"] == "test/test_stage"
+
+
+def _helper_read(path: str) -> str:
+    return path
+
+
+def test_dry_run_keep_going_restore_reads_name_each_stage_whose_explanation_misses_the_restore(
+    mock_discovery: Pipeline, runner: click.testing.CliRunner
+) -> None:
+    """A dry run with --checkout-missing takes a dependency's hash from a .pvt only for a
+    restorable path itself and for a file of a restorable directory's listing; it reads any
+    other dependency from the disk. So these stages read a path the restore changes: dir reads
+    an existing directory that holds the restorable file dir/f.txt, link a symlink to that
+    directory, sub a subdirectory of the restorable directory images, and alias a path that
+    reaches the restorable file inputs/x.txt through a symlink. file, images and png read a
+    restorable path or a file of its listing, and input reads the directory input, which holds
+    none: path parts decide, so inputs/x.txt is not inside input, though its path starts with
+    input's. The dependencies are those the dry run's get_runnable_stages finds present."""
+    raw = mock_discovery.root / "data" / "raw"
+    (raw / "dir").mkdir(parents=True)
+    (raw / "dir" / "present.txt").write_text("present")
+    (raw / "dir" / "f.txt").write_text("f")
+    (raw / "images" / "sub").mkdir(parents=True)
+    (raw / "images" / "a.png").write_text("a")
+    (raw / "images" / "sub" / "b.png").write_text("b")
+    (raw / "inputs").mkdir()
+    (raw / "inputs" / "x.txt").write_text("x")
+    (raw / "input").mkdir()
+    for name in ("dir/f.txt", "images", "inputs/x.txt"):
+        tracking = runner.invoke(cli.cli, ["track", f"data/raw/{name}"])
+        assert tracking.exit_code == 0, tracking.output
+    (raw / "dir" / "f.txt").unlink()
+    (raw / "inputs" / "x.txt").unlink()
+    shutil.rmtree(raw / "images")
+    (raw / "link").symlink_to("dir")
+    (raw / "alias").symlink_to("inputs")
+    found = executor_core.find_missing_tracked_files(mock_discovery.root, checkout_missing=True)
+    assert found.missing == []
+    assert list(found.restorable) == [
+        str(raw / "dir" / "f.txt"),
+        str(raw / "images"),
+        str(raw / "inputs" / "x.txt"),
+    ]
+    for name, path in {
+        "dir": "dir",
+        "link": "link",
+        "sub": "images/sub",
+        "alias": "alias/x.txt",
+        "file": "dir/f.txt",
+        "images": "images",
+        "png": "images/sub/b.png",
+        "input": "input",
+    }.items():
+        helpers.register_test_stage(_helper_read, name=name, deps={"path": f"data/raw/{path}"})
+    present = list[tuple[str, ArtifactRef]]()
+    runnable = engine_graph.get_runnable_stages(
+        mock_discovery.snapshot(),
+        status._make_workspace_store(mock_discovery),
+        all_pipelines=True,
+        on_error=OnError.KEEP_GOING,
+        missing_tracked=found.missing,
+        restored_tracked=found.restored,
+        present=present,
+    )
+    assert runnable.errors == []
+
+    reads = status._restore_reads(mock_discovery, present, found.restorable)
+
+    assert reads == {
+        "test/dir": status.RestoreLimit("test/dir", raw / "dir", str(raw / "dir" / "f.txt")),
+        "test/link": status.RestoreLimit("test/link", raw / "link", str(raw / "dir" / "f.txt")),
+        "test/sub": status.RestoreLimit("test/sub", raw / "images" / "sub", str(raw / "images")),
+        "test/alias": status.RestoreLimit(
+            "test/alias", raw / "alias" / "x.txt", str(raw / "inputs" / "x.txt")
+        ),
+    }
+    assert (
+        status.restore_limits(
+            mock_discovery,
+            {"test/dir"},
+            engine_graph.build_graph(mock_discovery.snapshot()),
+            present=present,
+            restorable={},
+            known={},
+        )
+        == {}
+    ), "with no restorable path it reads nothing"
 
 
 # `what_if_changed` path semantics are owned by Task 3 (Copilot finding 2853197734).
