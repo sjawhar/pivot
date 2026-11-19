@@ -164,17 +164,13 @@ binding `threading.Thread.start` calls (`worker.install_import_hooks`). Importin
 `pivot.executor.worker` alone changes none of them, and a stage executed in a process without
 that initializer gets the hooks for its call only. For a relative `builtins.__import__`, the hook
 uses CPython 3.13's `_calc___package__` order (`__package__`, `__spec__.parent`, then
-`__name__`/`__path__`) before it records the absolute module. The hooks' own recording can import,
-and not only their own machinery: Debian's CPython 3.13.5 `pathlib` imports `ntpath` in every
-`PurePath.__init__`, and `is_user_code` builds paths and reads a module's `__name__`, which runs
-the body of a module `importlib.util.LazyLoader` set up, with each import that body makes. An
-import a thread makes while its hook records passes straight to the original import, so a hook
-never runs inside itself, and the names of the modules it requested are queued. Once the hook has
-recorded its own import, it records each queued batch as it records a hooked import (for the
-running stage, when it records for one), and skips a batch it has already recorded, so it ends
-even where every recording imports the same module (`worker._HookRecordingState`). Pivot-owned
-threads start through `worker._start_pivot_thread`, which bypasses coverage: a pipe reader,
-parent watcher or stop-grace timer is not user work and cannot excuse a later user module
+`__name__`/`__path__`) before it records the absolute module. An import the hooks' own recording
+makes goes through the hooks at once, under the covered thread rule below, and is recorded once,
+after that recording, as the stage's import when a stage runs and the thread was not covered as
+the import returned (`worker._record_hooked_import`).
+
+Pivot-owned threads start through `worker._start_pivot_thread`, which bypasses coverage: a pipe
+reader, parent watcher or stop-grace timer is not user work and cannot excuse a later user module
 registration. While a stage runs, the import hooks record each user module (and its user
 packages) the stage requests, including one already in `sys.modules`, and the worker compares the
 `sys.modules` keys before and after the stage, counting a newly resident module only when it has
