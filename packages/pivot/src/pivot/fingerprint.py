@@ -2400,7 +2400,8 @@ def read_submodules(manifest: Mapping[str, str]) -> tuple[str, ...]:
     (`company.local` in `company.local.f()`, `_process_user_submodules`), sorted, so a package
     comes before its submodules: its `submodule:<name>` keys (`_add_submodule_read`), the stage's
     own and its loaders', which join the stage's without a prefix (`merge_loader_fingerprint`).
-    The worker imports each by name before the stage runs (`executor.core.prepare_worker_info`).
+    The coordinator sends each whose module pickles alone with the stage, for its worker to bind
+    on the package (`executor.core.prepare_worker_info`).
     A lock does not record these keys (`as_locked`), so the registry keeps the names beside the
     stage's fingerprint (`registry.RegistryStageInfo`)."""
     return tuple(
@@ -2749,8 +2750,8 @@ def bound_submodule(package: types.ModuleType, attribute: str) -> types.ModuleTy
     (`_is_submodule`), and which `sys.modules` holds under that name, so one an import session
     removed since (`discovery`) is not. Read through `ModuleType`'s descriptor
     (`_module_namespace`), so no `__getattr__` of the package runs and nothing is imported. The
-    walk follows such a submodule (`_submodules_to_user_code`), and the worker imports it by name
-    before the stage runs (`read_submodules`)."""
+    walk follows such a submodule (`_submodules_to_user_code`), and the coordinator sends it with
+    the stage where it pickles alone (`read_submodules`)."""
     namespace = _module_namespace(package)
     value = namespace.get(attribute)
     name = namespace.get("__name__")

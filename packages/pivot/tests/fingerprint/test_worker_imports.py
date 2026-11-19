@@ -9,14 +9,13 @@ other one, and an edit to the project's file would read `cached`. Fingerprinting
 started as a worker starts before it raises.
 
 A submodule the program holds bound on a library package, which a stage reads through the
-package's name, is what the walk follows and records, so that its worker imports it by name
-before the stage runs (`fingerprint.bound_submodule`, `fingerprint.read_submodules`): a plain
-module with a source file, or a namespace package of the project's, that `sys.modules` holds under
-its name, re-read on a manifest cache hit, and, for a `@no_fingerprint` stage, found by a scan of
-the stage's own code. Discovery registers a module under the project root for pickling by value
-only where its package goes by value too, or where it has no package, so that the worker imports
-the project's part of a library's package by name, as a plain run does
-(`discovery._track_root_modules`).
+package's name, is what the walk follows and records, so that the coordinator sends it with the
+stage where it pickles alone, for its worker to bind on the package (`fingerprint.bound_submodule`,
+`fingerprint.read_submodules`): a plain module with a source file, or a namespace package of the
+project's, that `sys.modules` holds under its name, re-read on a manifest cache hit, and, for a
+`@no_fingerprint` stage, found by a scan of the stage's own code. Discovery registers every module
+under the project root for pickling by value, the project's part of a library's package too, as
+pivot 0.10.4 does (`discovery._track_root_modules`).
 
 Each test names its modules uniquely: the test process puts `packages/pivot/tests` (with its own
 `helpers.py`) on `sys.path`.
@@ -943,7 +942,7 @@ def _helper_shared_namespace(
     return _held_namespace(name, [tmp_path / "project" / name, site / name], monkeypatch)
 
 
-def test_a_lazy_module_subclass_on_a_library_module_is_neither_walked_nor_imported_by_name(
+def test_a_lazy_module_subclass_on_a_library_module_is_neither_walked_nor_sent(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The program holds the library module `wi_six` from `site-packages`, a package with an
@@ -952,8 +951,8 @@ def test_a_lazy_module_subclass_on_a_library_module_is_neither_walked_nor_import
     `reduce` imports a module the first time it is read, as `six.moves.dbm_gnu` imports `_gdbm`,
     which an interpreter may lack. A stage that reads `wi_six.moves.reduce` records `wi_six` by
     name alone, as a stage that reads no submodule of a library package does: the walk reads
-    nothing of `wi_six.moves`, so its import does not run, and records no submodule, so the worker
-    imports none by name before the stage runs."""
+    nothing of `wi_six.moves`, so its import does not run, and records no submodule, so the
+    coordinator sends none with the stage."""
     site = tmp_path / "lib" / "site-packages"
     library = _held("wi_six", site / "wi_six.py", monkeypatch, "__path__ = []\n")
     moves = _LazyModule("wi_six.moves")
@@ -978,8 +977,8 @@ def test_a_module_with_no_file_and_no_directory_on_a_library_package_is_not_walk
     made with no file and an empty `__path__`, as a library makes a module of names it imports on
     demand. A stage that reads `wi_lazy.moves.reduce` records `wi_lazy` by name alone: the module,
     which `is_user_code` takes as code `exec` made, has no source to walk and is no namespace
-    package of the project's, so no submodule is recorded for the worker to import by name, a name
-    no file has."""
+    package of the project's, so no submodule is recorded for the coordinator to send, which a
+    worker would bind under a name no file has."""
     site = tmp_path / "lib" / "site-packages"
     library = _held("wi_lazy", site / "wi_lazy.py", monkeypatch, "__path__ = []\n")
     moves = types.ModuleType("wi_lazy.moves")
@@ -1026,8 +1025,8 @@ def test_a_submodule_read_in_several_parts_of_a_walk_is_one_name(
     and one in the project root, whose `local.py` `pipeline.py` imports. The stage calls
     `ra.plain()` and `rz.plain()`, two project modules that each read `wi_joined.local` through
     the package's name, and its output writer's `save` reads it so too. The registry keeps its
-    name once beside the stage's fingerprint, whatever part of the walk read it: the name the
-    worker imports by name before the stage runs."""
+    name once beside the stage's fingerprint, whatever part of the walk read it: the name of the
+    module the coordinator sends with the stage."""
     _helper_shared_namespace("wi_joined", tmp_path, monkeypatch)
     pipeline = helpers.discover_project(
         tmp_path,
@@ -1085,7 +1084,7 @@ def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_w
     `other`. The program then loads `other.py` as `wi_bound.other` bound on the package, which
     changes no file the cache checks. The next fingerprint of the stage walks it, as a cache hit
     re-reads which submodules the package holds; a hit that kept the cached manifest would leave
-    an edit to `other.py` unseen and the module not imported by name in the worker."""
+    an edit to `other.py` unseen and the module not sent with the stage."""
     package = _helper_shared_namespace("wi_bound", tmp_path, monkeypatch)
     pipeline = helpers.discover_project(
         tmp_path,
@@ -1136,14 +1135,20 @@ def _helper_no_library(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) 
             _helper_library_namespace,
             {"wi_rn/local.py": _PLAIN, "wi_rn/sub/__init__.py": "", "wi_rn/sub/deep.py": _PLAIN},
             "import wi_rn.local\nimport wi_rn.sub.deep",
-            {"pipeline": True, "wi_rn.local": False, "wi_rn.sub": False, "wi_rn.sub.deep": False},
+            {
+                "pipeline": True,
+                "wi_rn": False,
+                "wi_rn.local": True,
+                "wi_rn.sub": True,
+                "wi_rn.sub.deep": True,
+            },
             id="library-namespace-package",
         ),
         pytest.param(
             _helper_library_package,
             {"wi_re/local.py": _PLAIN},
             "import wi_re.local",
-            {"pipeline": True, "wi_re": False, "wi_re.local": False},
+            {"pipeline": True, "wi_re": False, "wi_re.local": True},
             id="library-regular-package",
         ),
         pytest.param(
@@ -1162,7 +1167,7 @@ def _helper_no_library(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) 
         ),
     ],
 )
-def test_discovery_registers_a_root_module_by_value_only_where_its_package_goes_by_value(
+def test_discovery_registers_every_module_under_the_root_by_value(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     library: Callable[[pathlib.Path, pytest.MonkeyPatch], None],
@@ -1175,12 +1180,12 @@ def test_discovery_registers_a_root_module_by_value_only_where_its_package_goes_
     package below it, `wi_rn.sub`, and its module; or a library's regular package from
     `site-packages` whose `__init__` extends its `__path__` over the project's directory) or the
     project's (a regular package, or a namespace package with its one directory in the root).
-    Discovery registers with cloudpickle by value `pipeline.py` and each module whose package goes
-    by value, and no module whose package is a library's, nor one below such a module, so that
-    cloudpickle pickles its functions and classes by reference and a worker imports it by name,
-    as a plain run does: one copy, whose import-time code runs there. Were every module under the
-    root registered, the project's part of a library's package would go by value, a copy apart
-    from the module a worker's import of it loads."""
+    Discovery registers with cloudpickle by value `pipeline.py` and every one of those modules, as
+    pivot 0.10.4 does, and not the library's package, which is library code
+    (`fingerprint.is_user_code`): cloudpickle then pickles the project's code by value with the
+    stage that holds it, one copy of each class and of each value the program holds. Were the
+    project's part of a library's package left unregistered, a worker would import it from its
+    file, a copy apart from the classes and values the stage holds."""
     library(tmp_path, monkeypatch)
     calls = " + ".join(f"{line.removeprefix('import ')}.plain()" for line in imports.splitlines())
     helpers.discover_project(tmp_path, monkeypatch, files, _pipeline(imports, calls))

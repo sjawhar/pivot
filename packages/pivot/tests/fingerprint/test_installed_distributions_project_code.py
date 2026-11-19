@@ -14,15 +14,15 @@ that no RECORD lists is refused beside the checkout's metadata with no RECORD (a
 `.egg-info`, or a `--target` install that has lost its RECORD), for a module of the checkout and
 for a namespace package reached by its top name alike.
 
-Each test makes its own venv with uv over this test environment (`tests.installed_dists`), installs
-`Fix_Lib` from its path, and, but for the library checkout's test, the namespace portion
-`company.client`, and drives its own pivot project, whose stage calls that installed code and
-the code beside it that the test names. The setuptools project `myproj`, which requires
-`Fix_Lib`, leaves `myproj.egg-info` beside its code when it is built: `uv pip install -e` with
-build isolation, as a user runs it, writes it there through setuptools' `egg_info`, and so does
-the wheel build these tests run, offline and with no build isolation (after `uv pip install -e`,
-where a test installs the project editable); the checkout's project `foo` leaves `foo.egg-info`
-so.
+Each test makes its own venv with uv over this test environment (`tests.installed_dists`,
+`tests.shared_namespace`), installs `Fix_Lib` from its path, and, but for the library checkout's
+test, the namespace portion `company.client`, and drives its own pivot project, whose stage calls
+that installed code and the code beside it that the test names. The setuptools project `myproj`,
+which requires `Fix_Lib`, leaves `myproj.egg-info` beside its code when it is built: `uv pip
+install -e` with build isolation, as a user runs it, writes it there through setuptools'
+`egg_info`, and so does the wheel build these tests run, offline and with no build isolation
+(after `uv pip install -e`, where a test installs the project editable); the checkout's project
+`foo` leaves `foo.egg-info` so.
 
 The in-process test of the same rule, over uv's cache inside the project root, is in
 `test_installed_distributions_snapshot.py`.
@@ -36,7 +36,7 @@ import pathlib
 import shutil
 
 import pytest
-from tests import helpers, installed_dists
+from tests import helpers, installed_dists, shared_namespace
 
 # The project's `@pivot.fingerprint_by_name` helper `helpers.stamp`, and `mymod`, whose `value()`
 # the walk hashes and whose `stamp()` is such a helper.
@@ -283,7 +283,7 @@ def test_a_flat_project_installed_editable_runs_as_with_its_egg_info_moved_out(
     nothing; with `myproj.egg-info` moved out of the root, `pivot repro --force` writes the same
     lock, its `dist:` keys included. Pivot 0.10.4 runs both projects so."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
+    shared_namespace.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
     project = installed_dists.make_project_in(tmp_path, venv, pipeline_text)
     _helper_write_myproj(project.root, tmp_path / "myproj", packages, files)
     installed_dists.install_directory(venv, project.root, editable=True)
@@ -337,7 +337,7 @@ def test_project_code_beside_metadata_with_no_record_outside_site_packages_is_wa
     changes, the stage is stale on `func:mymod.value` alone, and `pivot repro` writes the new
     value: the project's code is walked as user code, and no distribution's RECORD decides it."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
+    shared_namespace.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
     project = installed_dists.make_project_in(tmp_path, venv, _PROJECT_CODE_PIPELINE)
     directory = place(tmp_path, venv, project, monkeypatch)
 
@@ -419,7 +419,7 @@ def test_the_part_of_a_namespace_package_in_a_checkout_under_the_venv_is_refused
     `is_user_code` takes a namespace directory under the prefix alone, the directory would be left
     out, and the stage would run with it neither keyed nor refused."""
     venv = installed_dists.make_venv(tmp_path / "venv")
-    installed_dists.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
+    shared_namespace.install_client_and_fixlib(venv, tmp_path / "src", installed_dists.CLIENT_FILES)
     checkout = tmp_path / "venv" / "src" / "checkout"
     refusal = place(tmp_path, venv, checkout)
     (venv.site_packages / "checkout.pth").write_text(f"{checkout}\n")

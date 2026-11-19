@@ -9,16 +9,29 @@ import multiprocessing.resource_tracker
 import os
 import pathlib
 import signal
+import sys
 import threading
+import types as _stdlib_types
 import typing
 from multiprocessing import managers
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 
+import cloudpickle
 import loky
 import loky.backend.resource_tracker
 import loky.reusable_executor
 
-from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
+from pivot import (
+    config,
+    discovery,
+    exceptions,
+    fingerprint,
+    loaded_source,
+    parameters,
+    project,
+    registry,
+    types,
+)
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, naming, ownership, track
@@ -28,7 +41,7 @@ from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from pivot.engine import types as engine_types
     from pivot.registry import RegistryStageInfo
@@ -588,11 +601,44 @@ def prepare_worker_info(
     # The workers started with other digests: the coordinator loaded user code since then.
     if (digests := loaded_source.digests_for_stage()) is not None:
         info["loaded_sources"] = digests
-    # The worker imports by name each submodule the stage reads through its package
-    # (`read_submodules`) before the stage runs, as a plain run's import binds it there.
-    if names := stage_info.get("read_submodules"):
-        info["imported_submodules"] = names
+    # The submodules the stage reads through their packages (`read_submodules`), each sent where
+    # it pickles alone, for the worker to bind on its package before anything of the stage runs.
+    if (names := stage_info.get("read_submodules")) and (sent := _sent_submodules(names)):
+        info["sent_submodules"] = sent
     return info
+
+
+class _Discarded:
+    """A binary file that keeps nothing written to it."""
+
+    def write(self, data: bytes) -> int:
+        return len(data)
+
+
+def _sent_submodules(names: Sequence[str]) -> tuple[_stdlib_types.ModuleType, ...]:
+    """The submodules of `names` (`RegistryStageInfo.read_submodules`, a package before its
+    submodules) that the coordinator sends with the stage (`worker.WorkerStageInfo.
+    sent_submodules`), in that order: each module its package in this process holds bound
+    (`fingerprint.bound_submodule`, so not one an import session took out of `sys.modules` since
+    the walk) that cloudpickle pickles alone, tried once here and written nowhere. A module whose
+    pickling raises, as one holding a `threading.Lock` that cloudpickle pickles by value does, is
+    not sent: the worker's call, which would carry it whole, could not be pickled. Why:
+    `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs"."""
+    sent = list[_stdlib_types.ModuleType]()
+    for name in names:
+        package, _, attribute = name.rpartition(".")
+        parent = sys.modules.get(package)
+        if not isinstance(parent, _stdlib_types.ModuleType):
+            continue
+        module = fingerprint.bound_submodule(parent, attribute)
+        if module is None:
+            continue
+        try:
+            cloudpickle.dump(module, _Discarded())
+        except Exception:  # noqa: BLE001 - a module that does not pickle alone is not sent
+            continue
+        sent.append(module)
+    return tuple(sent)
 
 
 # =========================================================================

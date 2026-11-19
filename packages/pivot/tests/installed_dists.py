@@ -16,14 +16,10 @@ when `packages/pivot/src` is pivot 0.10.4's.
 It also holds what the test files of those keys share: the stage `STAGE` of their projects, the
 file `OUTPUT` it writes and the `pipeline.py` of a project whose stage calls installed modules
 (`pipeline`, or `pipeline_text` for any imports, expression and decorator), the `stage_complete`
-events a `pivot repro --json` prints (`stage_complete_events`) and what one such run gives of
-`STAGE` (`repro_stage_event`, `repro_stage_outcome`), a `PYTHONPATH` entry from which a worker
-imports by name (`pythonpath_entry`), the sources of the fixture libraries `Fix_Lib` and `fixdep`,
-the project's part `LOCAL` of the namespace package `company` and the module `CLIENT` of the
-library's part of it, installed with `Fix_Lib` (`install_client_and_fixlib`), with what the tests
-of the project's part share (`CLIENT_AND_SUB_FILES`, `LOCAL_WITH_LOCK`, `READS_LOCAL`, the output
-`SHARED_OUTPUT` of a stage that ends with `LIBRARY_VALUES`, and
-`assert_runs_then_reruns_on_an_edit`), the two refusals of an
+events a `pivot repro --json` prints (`stage_complete_events`), the sources of the fixture
+libraries `Fix_Lib` and `fixdep`, the project's part `LOCAL` of the namespace package `company`
+and the module `CLIENT` of the library's part of it (what the tests of that part share besides:
+`tests.shared_namespace`), the two refusals of an
 install Pivot cannot read, word for word, as templates (`DISTRIBUTION_REFUSAL`, and
 `UNLISTED_FILE_REFUSAL`, which `unlisted_refusal` fills; each ends with the fix `REFUSAL_FIX`
 starts) and as those of a broken install of the fixtures, with the start pivot gives each for
@@ -136,26 +132,11 @@ def main():
 # `company.local`, and the module of `company-client`'s namespace portion `company.client`, which
 # imports its package, as a library module that reads a sibling through it does, so
 # `company.client` holds `company`. `CLIENT_FILES` are the files of a `company-client` whose one
-# package is that portion, each path relative to its project (`install_client_and_fixlib`).
+# package is that portion, each path relative to its project
+# (`shared_namespace.install_client_and_fixlib`).
 LOCAL = 'def value():\n    return "local-1"\n'
 CLIENT = 'import company\n\n\ndef value():\n    return "client-1"\n'
 CLIENT_FILES: Mapping[str, str] = {"company/client/__init__.py": CLIENT}
-# The files of a `company-client` whose `company.client` lies beside the portion
-# `company.sub.shared`, so that `company.sub` is a namespace package it shares with the project too.
-CLIENT_AND_SUB_FILES: Mapping[str, str] = {
-    **CLIENT_FILES,
-    "company/sub/shared.py": 'def value():\n    return "shared-1"\n',
-}
-# The project's `company/local.py` of `LOCAL` that also holds a lock no stage reads and that
-# cloudpickle cannot pickle, and a project module that imports `company.local` and reads it through
-# the package's name.
-LOCAL_WITH_LOCK = "import threading\n\n_LOCK = threading.Lock()\n\n\n" + LOCAL
-READS_LOCAL = "import company.local\n\n\ndef value():\n    return company.local.value()\n"
-# What the stage of a test of the project's part of `company` writes (`SHARED_OUTPUT`): the
-# project's `value()`, then `company.client.value()` and `fixlib.value()`, joined, the expression of
-# those two (`LIBRARY_VALUES`) following the project's in the stage (`pipeline_text`).
-SHARED_OUTPUT = "local-1:client-1:value-1"
-LIBRARY_VALUES = ' + ":" + company.client.value() + ":" + fixlib.value()'
 
 # The two refusals pivot gives of an install it cannot read, word for word, each a template for
 # `str.format`, so that a change to the words of either is made here alone: a distribution's
@@ -474,31 +455,6 @@ def install_directory(
         reinstall=reinstall,
         link_mode=link_mode,
     )
-
-
-def install_client_and_fixlib(venv: Venv, src: pathlib.Path, client: Mapping[str, str]) -> None:
-    """Install into the venv from their paths, under `src`, `Fix_Lib` (module `fixlib`,
-    `FIXLIB_ALONE`) and `company-client`, whose files are `client` (each path relative to its
-    project, with its text, as `CLIENT_FILES`), in the import packages of the directories that
-    hold them."""
-    fixlib = write_library(src, "Fix_Lib", "fixlib", FIXLIB_ALONE)
-    packages = sorted(
-        {str(pathlib.PurePosixPath(relative).parent).replace("/", ".") for relative in client}
-    )
-    source = write_setuptools_project(
-        src / "company-client", "company-client", "0.1", packages=packages, files=client
-    )
-    install(venv, str(fixlib), str(source))
-
-
-def pythonpath_entry(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
-    """`tmp_path/extra`, made here, outside the project root, which `PYTHONPATH`, set through
-    `monkeypatch`, puts on the path of every pivot the test runs: a worker imports a module there
-    by name."""
-    extra = tmp_path / "extra"
-    extra.mkdir()
-    monkeypatch.setenv("PYTHONPATH", str(extra), prepend=os.pathsep)
-    return extra
 
 
 def build_wheel(venv: Venv, source: pathlib.Path, wheels: pathlib.Path) -> str:
@@ -858,49 +814,6 @@ def assert_stale_on(project: Project, stage: str, key: str) -> None:
     assert status == "stale", f"`pivot status` must report {stage} stale on {key}:\n{shown}"
     keys, shown = code_changes(project, stage)
     assert keys == [key], f"`pivot status --explain` must name exactly {key} changed:\n{shown}"
-
-
-def assert_runs_then_reruns_on_an_edit(project: Project, edited: pathlib.Path, key: str) -> None:
-    """`pivot repro` runs `STAGE`, which writes `SHARED_OUTPUT`, refusing nothing, and its lock
-    holds the keys of `company-client` and `Fix_Lib` alone and no `submodule:` entry; after one
-    byte of the project's file `edited` changes (`local-1` to `local-2`), the stage is stale on its
-    code entry `key` alone, and `pivot repro` writes the new value."""
-    manifest = assert_runs_with_no_refusal(project, SHARED_OUTPUT)
-    assert dist_keys(manifest) == ["dist:company-client", "dist:fix-lib"], (
-        f"the lock must hold the keys of company-client and Fix_Lib alone: {manifest}"
-    )
-    assert [entry for entry in manifest if "submodule:" in entry] == [], (
-        f"the lock must hold no submodule: entry, which only the coordinator reads: {manifest}"
-    )
-    replace_once(edited, '"local-1"', '"local-2"')
-
-    assert_stale_on(project, STAGE, key)
-    assert_runs_with_no_refusal(project, SHARED_OUTPUT.replace("local-1", "local-2"))
-
-
-def repro_stage_event(
-    project: Project,
-) -> tuple[subprocess.CompletedProcess[str], dict[str, Any], str]:
-    """One `pivot repro --json`, which must refuse and warn of nothing: the command, the one
-    `stage_complete` event of `STAGE` (`stage_complete_events`), and the command's output."""
-    ran = run_pivot(project, "repro", "--json")
-    output = shown(ran)
-    events = [event for event in stage_complete_events(ran) if event["stage"] == STAGE]
-    assert len(events) == 1, f"`pivot repro` must complete {STAGE} once:\n{output}"
-    assert REFUSAL_FIX not in output, f"`pivot repro` must refuse nothing:\n{output}"
-    return ran, events[0], output
-
-
-def repro_stage_outcome(project: Project) -> tuple[tuple[int, str, str], str]:
-    """What one `pivot repro --json` gives of `STAGE` (`repro_stage_event`): its exit code, the
-    status of the stage's `stage_complete` event, and what the stage wrote when it ran, else the
-    last line of the reason the event gives; and the command's output."""
-    ran, event, output = repro_stage_event(project)
-    status = event["status"]
-    detail = (
-        (project.root / OUTPUT).read_text() if status == "ran" else event["reason"].splitlines()[-1]
-    )
-    return (ran.returncode, status, detail), output
 
 
 def assert_marks_nothing(project: Project, stage: str) -> None:

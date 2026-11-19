@@ -59,9 +59,10 @@ class RegistryStageInfo(TypedDict):
         read_submodules: The names of the submodules the stage reads through the library
             packages that hold them, sorted (`fingerprint.read_submodules`), set with the
             fingerprint (`ensure_fingerprint`), for a `@no_fingerprint` stage too: the fingerprint,
-            as a lock records it, leaves out the entries that name them, and the stage's worker
-            imports each by name before the stage runs (`executor.core.prepare_worker_info`).
-            Absent while the fingerprint is not computed.
+            as a lock records it, leaves out the entries that name them, and the coordinator
+            sends with the stage each whose module pickles alone, for its worker to bind on the
+            package (`executor.core.prepare_worker_info`). Absent while the fingerprint is not
+            computed.
     """
 
     func: Callable[..., Any]

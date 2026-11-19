@@ -508,6 +508,32 @@ package whose `__init__` changes its own `__path__`; and a pipeline object run
 again after the program changed `sys.path`, whose fingerprints Pivot keeps (load
 the pipeline again).
 
+### Your Module in a Package a Library Shares
+
+A stage can read your module through a package it shares with an installed
+library: `import company.local`, then `company.local.value()`, where `company`
+also has a directory in `site-packages` (a namespace package, or a library
+package whose `__init__` calls `pkgutil.extend_path`). Pivot sends that module
+with the stage when it can pickle it alone, and the worker puts it on the
+package while the stage runs, so the stage runs as a plain `python` run of your
+code does, and an edit to the module reruns it. Three cases behave as in Pivot
+0.10.4
+([Imports a Stage Makes While It Runs](../architecture/fingerprinting.md#imports-a-stage-makes-while-it-runs)):
+
+- A module that cannot be pickled (one holding a `threading.Lock`) is not
+  sent. A helper outside the project root that reads it through the package
+  finds it only when the helper's module imports it itself
+  (`import company.local`, not `import company` alone); otherwise the stage
+  fails with `AttributeError: module 'company' has no attribute 'local'`. A
+  stage whose own code reads it so fails before it runs, as its call to the
+  worker cannot be pickled.
+- A stage that holds a class of the module (`from company.local import Mode`)
+  while a helper outside the project root imports the module itself holds
+  another copy of it than the helper: `company.local.run(Mode.FAST)` then
+  compares the stage's `Mode.FAST` with the helper's copy of `Mode`.
+- The module's import-time code does not run in the worker: a class it
+  registers with a library as it is imported is not registered there.
+
 ## @pivot.no_fingerprint()
 
 For stages where AST fingerprinting doesn't work (C extensions, generated
@@ -539,13 +565,11 @@ A `@no_fingerprint` stage whose own code reads your module through a package
 it shares with an installed library (`import company.local`, then
 `company.local.value()`, where `company` also has a directory in
 `site-packages`) finds the module there in its worker. A helper module that the
-stage calls is not read for this. A helper under the project root works when its
-function reads the module in its own body (`company.local.value()` there, not
-only in a lambda in it). A helper outside the project root,
-which the worker imports by name, works when it imports the module itself
-(`import company.local`), as that import binds it there; one that imports only
-the package (`import company`) leaves the module missing there, and the stage
-fails with `AttributeError: module 'company' has no attribute 'local'`
+stage calls is not read for this: a module that only the helper reads so is
+missing there, and the stage fails with `AttributeError: module 'company' has
+no attribute 'local'`. A helper outside the project root, which the worker
+imports by name, works when it imports the module itself
+(`import company.local`), as that import binds it there
 ([Imports a Stage Makes While It Runs](../architecture/fingerprinting.md#imports-a-stage-makes-while-it-runs)).
 
 
