@@ -150,10 +150,12 @@ def _get_explanations_in_parallel(
     tracked_trie: pygtrie.Trie[str] | None = None,
     *,
     known: Collection[str] = (),
+    assume_restored: Mapping[str, Collection[ArtifactIdentity]] | None = None,
 ) -> dict[str, StageExplanation]:
     """Compute stage explanations in parallel (I/O-bound: lock file reads, hashing), for each
     stage of ``execution_order`` but ``known``. A known stage's lock is still read: a stage that
-    reads one file of its directory output finds that file's hash in it."""
+    reads one file of its directory output finds that file's hash in it. ``assume_restored``,
+    when given, holds each other stage's ``explain.get_stage_explanation`` argument."""
     default_state_dir = config.locate_state_dir()
     pending = [name for name in execution_order if name not in known]
     max_workers = min(8, len(pending))
@@ -196,6 +198,7 @@ def _get_explanations_in_parallel(
                 producer_hashes=producer_hashes,
                 file_hash_entries=entries,
                 unreadable_listings=unreadable,
+                assume_restored=() if assume_restored is None else assume_restored[stage_name],
             )
             futures[future] = stage_name
 
@@ -243,13 +246,15 @@ def _explanations_for(
     allow_missing: bool,
     known: Mapping[str, StageExplanation] | None,
     restorable: Mapping[str, PvtData] | None = None,
+    assume_restored: Mapping[str, Collection[ArtifactIdentity]] | None = None,
 ) -> dict[str, StageExplanation]:
     """Each stage of ``execution_order``'s own explanation, before its upstream is counted
     (``_compute_explanations_with_upstream``): ``known``'s where it holds one, computed with the
     same ``force``, ``allow_missing`` and ``restorable``, else read now. ``restorable`` holds the
     missing tracked files the cache can restore, with their ``.pvt`` data, which the
     explanations count as present (a dry run with ``--checkout-missing``,
-    ``executor.core.find_missing_tracked_files``)."""
+    ``executor.core.find_missing_tracked_files``). ``assume_restored``: as
+    ``_get_explanations_in_parallel`` takes it."""
     tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
     if tracked_files is None and restorable:
         tracked_files = dict(restorable)
@@ -274,6 +279,7 @@ def _explanations_for(
             tracked_trie=tracked_trie,
             store=_make_workspace_store(pipeline),
             known=reused.keys(),
+            assume_restored=assume_restored,
         ),
     }
 
@@ -346,7 +352,7 @@ def expand_current(
     fetched: Mapping[str, listing.DirListing] | None = None,
     restorable: Mapping[str, PvtData] | None = None,
     refuse: expansion.InstanceRefusal | None = None,
-    waiting: dict[str, str] | None = None,
+    not_current: set[str] | None = None,
 ) -> tuple[expansion.Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage (``Pipeline.map``) of ``pipeline`` whose producer is current,
     as a run would before running its instances (``expansion.expand_current``, which takes a
@@ -358,9 +364,9 @@ def expand_current(
     pullable (``pullable_stages``, by each explanation's ``recovery``): its lock matches, and pull
     restores what it lacks. Every other template stays unexpanded, naming what it waits for.
     ``restorable`` holds the missing tracked files the cache can restore, which the explanations
-    count as present (``_explanations_for``). ``waiting``, when given, receives why each stage of
-    the producers' execution order that is not current is not, by name: a template whose
-    producer it holds waits for that producer, or is mapped over the instances of one that does.
+    count as present (``_explanations_for``). ``not_current``, when given, receives each stage of
+    the producers' execution order that is not current: a template whose producer it holds
+    waits for that producer, or is mapped over the instances of one that does.
 
     Returns the expansion and the explanations it computed, before their upstream is counted,
     for the caller to pass on as ``known`` (computed with ``force``, ``allow_missing`` and
@@ -405,13 +411,13 @@ def expand_current(
                     )
                     for exp in enriched
                 )
-            not_current = {
+            waiting = {
                 exp["stage_name"]: exp["reason"] or "stale"
                 for exp in enriched
                 if exp["stage_name"] not in current
             }
-            if waiting is not None:
-                waiting.update(not_current)
+            if not_current is not None:
+                not_current.update(waiting.keys())
             default_state_dir = config.locate_state_dir()
             files_dir = config.locate_cache_dir() / "files"
             locks = explain.read_locks(
@@ -420,7 +426,7 @@ def expand_current(
             result = expansion.expand_current(
                 pipeline,
                 locks,
-                not_current,
+                waiting,
                 default_state_dir=default_state_dir,
                 cache_dir=files_dir,
                 fetched=fetched,
@@ -450,17 +456,14 @@ def not_expanded_status(
 
 
 class RestoreLimit(NamedTuple):
-    """Why a dry run with ``--checkout-missing`` may show a mapped stage as not yet expanded
-    although the run expands it (``restore_limits``)."""
+    """Why a ``--checkout-missing`` dry run may not expand a mapped stage the run expands."""
 
     reader: str
-    """The stage whose explanation reads ``path`` from the disk: the producer, or a stage
-    upstream of it."""
+    """The producer, or a stage upstream of it, whose explanation reads ``path`` from the disk."""
     path: pathlib.Path
     """The dependency of ``reader`` that the restore changes (absolute normalized)."""
     tracked: str
-    """The restorable missing tracked path whose restore changes ``path`` (absolute
-    normalized)."""
+    """The restorable missing tracked path whose restore changes ``path`` (absolute normalized)."""
 
 
 def restore_limits(
@@ -471,90 +474,69 @@ def restore_limits(
     present: Iterable[tuple[str, ArtifactRef]],
     restorable: Mapping[str, PvtData],
     known: Mapping[str, StageExplanation],
+    force: bool,
+    allow_missing: bool,
 ) -> dict[str, RestoreLimit]:
-    """Each producer of ``producers`` that the run may find current although a dry run with
-    ``--checkout-missing`` explains it as not current, with why: the dry run then shows the
-    producer's mapped stages as not yet expanded, and the run expands them.
-
-    The dry run counts the missing tracked paths of ``restorable`` as present and restores
-    nothing. ``graph`` is its graph of the stages it keeps, ``present`` their dependencies that
-    no stage produces (``_restore_reads``), and ``known`` the explanations its expansion read,
-    before their upstream is counted, of every producer and every stage upstream of one
-    (``expand_current``). ``producers`` are producers that expansion waits for (its
-    ``waiting``), so each of them, or a stage upstream of it, runs by its own explanation. The
-    run restores those paths first. It may then find a producer current when each stage that
-    runs by its own explanation, of the producer and the stages upstream of it, runs only
-    because that explanation reads from the disk a path that the restore changes
-    (``_restore_reads``): the stage has a lock (a stage without one runs whatever its inputs),
-    is not forced, and neither its code nor its params changed. The limit names the last such
-    stage in execution order: the producer itself when it runs by its own explanation. With no
-    restorable path or producer it reads nothing.
-    """
+    """Each producer of ``producers`` (not current, ``expand_current``) that the run may find
+    current although the dry run with ``--checkout-missing`` of the stages in ``graph`` explains
+    it as not current, with why: each stage, of it and its upstream stages, that runs by its own
+    explanation (``known``, ``expand_current``'s, with ``force`` and ``allow_missing``) reads
+    from the disk dependencies the restore of ``restorable`` changes (``_restore_reads``, over
+    ``present``), and explained again with them at the hashes its lock recorded
+    (``explain.get_stage_explanation``'s ``assume_restored``) would not run. The restore may
+    bring back other contents, so the run only MAY find it current. The limit names the last
+    such stage in execution order, with its first such dependency."""
     if not restorable or not producers:
         return {}
     reads = _restore_reads(pipeline, present, restorable)
-    if not reads:
-        return {}
     stage_dag = engine_graph.get_stage_dag(graph)
-    default_state_dir = config.locate_state_dir()
-    files_dir = config.locate_cache_dir() / "files"
-    limits = dict[str, RestoreLimit]()
+    running = dict[str, list[str]]()
     for producer in producers:
-        running = [
+        names = [
             name
             for name in engine_graph.get_execution_order(stage_dag, [producer], single_stage=False)
             if known[name]["will_run"]
         ]
-        assert running, f"'{producer}' waits, so it or a stage upstream of it runs"
-        if any(
-            name not in reads
-            or known[name]["is_forced"]
-            or known[name]["code_changes"]
-            or known[name]["param_changes"]
-            for name in running
-        ):
-            continue
-        locks = explain.read_locks(
-            running,
-            {name: pipeline.get_stage(name) for name in running},
-            default_state_dir,
-            files_dir,
+        assert names, f"'{producer}' waits, so it or a stage upstream of it runs"
+        # A stage that runs with no dependency the restore changes runs after the restore too
+        if all(name in reads for name in names):
+            running[producer] = names
+    if not running:
+        return {}
+    order = engine_graph.get_execution_order(stage_dag, sorted(running), single_stage=False)
+    with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
+        restored = _explanations_for(
+            order,
+            {name: pipeline.get_stage(name) for name in order},
+            pipeline,
+            force=force,
+            allow_missing=allow_missing,
+            known={name: known[name] for name in order if not known[name]["will_run"]},
+            restorable=restorable,
+            assume_restored={name: reads[name].keys() for name in order if known[name]["will_run"]},
         )
-        if any(lock_data is None for lock_data in locks.values()):
-            continue
-        limits[producer] = reads[running[-1]]
-    return limits
+    return {
+        producer: next(iter(reads[names[-1]].values()))
+        for producer, names in running.items()
+        if not any(restored[name]["will_run"] for name in names)
+    }
 
 
 def _restore_reads(
     pipeline: registry.PipelineLike,
     present: Iterable[tuple[str, ArtifactRef]],
     restorable: Mapping[str, PvtData],
-) -> dict[str, RestoreLimit]:
-    """Each stage of ``present`` whose explanation reads from the disk a dependency that the
-    restore of the missing tracked paths of ``restorable`` changes, with its first such
-    dependency (the stage its own ``reader``).
-
-    ``present`` holds dependencies that no stage produces, with their stages, each found on disk
-    or created by the restore (``engine.graph.get_runnable_stages``' ``present``). Their
-    explanation (``_explanations_for``) takes a dependency's hash from a ``.pvt`` only where
-    ``explain.find_tracked_hash`` gives one, read with the explanation's own store and cache
-    (``_make_workspace_store``) and tracked trie (``_tracked_trie``): for a restorable path
-    itself, and for a file of a restorable directory's listing. It reads every other dependency
-    from the disk, which does not hold the restored files yet. So a dependency that is, holds or
-    lies inside a restorable path in either form (``engine.graph.tracked_overlap``), and that
-    ``find_tracked_hash`` gives no hash, is one: a directory on disk that holds a restorable
-    path, a subdirectory of a restorable directory, or a path that reaches a restorable path
-    through a symlink. Its restorable path is the one it is or lies inside, else the first one it
-    holds. Path parts decide containment, never a string prefix.
-    """
+) -> dict[str, dict[ArtifactIdentity, RestoreLimit]]:
+    """Each stage of ``present`` (``engine.graph.get_runnable_stages``') with each dependency, by
+    identity, that the restore of ``restorable`` changes and its explanation reads from the disk:
+    one that is, holds or lies inside a restorable path, by its path or resolved path
+    (``engine.graph.tracked_overlap``, which names that path), and takes no hash from a ``.pvt``
+    (``explain.find_tracked_hash``, with the explanation's store, cache and tracked trie)."""
     store = _make_workspace_store(pipeline)
     tracked_trie = _tracked_trie(restorable)
     overlap = engine_graph.tracked_overlap(restorable)
-    reads = dict[str, RestoreLimit]()
+    reads = dict[str, dict[ArtifactIdentity, RestoreLimit]]()
     for stage_name, dep in present:
-        if stage_name in reads:
-            continue
         path = project.normalize_path(store.checkout(dep))
         tracked = overlap(path)
         if tracked is None:
@@ -562,7 +544,7 @@ def _restore_reads(
         if explain.find_tracked_hash(path, restorable, tracked_trie, store.cache_dir) is not None:
             # The explanation takes its hash from the .pvt, the hash the restore brings back
             continue
-        reads[stage_name] = RestoreLimit(reader=stage_name, path=path, tracked=tracked)
+        reads.setdefault(stage_name, {})[dep.identity] = RestoreLimit(stage_name, path, tracked)
     return reads
 
 

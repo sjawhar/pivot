@@ -27,7 +27,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Collection, Iterable, Mapping
     from pathlib import Path
 
     import pygtrie
@@ -220,6 +220,7 @@ def get_stage_explanation(
     producer_hashes: dict[ArtifactIdentity, HashInfo] | None = None,
     file_hash_entries: list[FileHashEntry] | None = None,
     unreadable_listings: Mapping[ArtifactIdentity, str] | None = None,
+    assume_restored: Collection[ArtifactIdentity] = (),
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
@@ -241,6 +242,10 @@ def get_stage_explanation(
     ``--checkout-missing``), whose ``.pvt`` hash the restore brings back, and a dependency none
     of them tracks stays missing: the lock's own hash would compare with itself and call an
     input the restore changes unchanged.
+
+    ``assume_restored`` names dependencies whose hash is the one ``lock_data`` recorded, as if a
+    restore brought each back to what the stage last read (the dry run's notice,
+    ``status.restore_limits``); every other input is decided as always.
     """
     if lock_data is None:
         return StageExplanation(
@@ -286,6 +291,13 @@ def get_stage_explanation(
 
     with state.open_readonly(state_dir, create=False) as state_db:
         known_hashes = producer_hashes or {}
+        if assume_restored:
+            # A dependency the lock does not record is hashed as always: it changes the stage
+            recorded = lock_data["dep_hashes"]
+            known_hashes = {
+                **known_hashes,
+                **{key: recorded[key] for key in assume_restored if key in recorded},
+            }
         pending_deps = {name: ref for name, ref in deps.items() if ref.identity not in known_hashes}
         str_hashes, missing_deps, unreadable_deps, dep_entries = worker.hash_dependencies(
             pending_deps,

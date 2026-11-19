@@ -44,7 +44,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Collection, Mapping
     from types import FrameType
 
     import networkx as nx
@@ -275,15 +275,19 @@ def _log_restore_limits(
     plan: _LeaveOut,
     graph: nx.DiGraph[str],
     known: Mapping[str, StageExplanation],
-    waiting: Mapping[str, str],
+    not_current: Collection[str],
+    *,
+    force: bool,
+    allow_missing: bool,
 ) -> None:
-    """Log one notice for each mapped stage of ``not_expanded`` (its rows) that waits for its
-    producer (``waiting``, ``status.expand_current``'s) where the run may expand it: the dry
-    run explains the producer as not current only because it, or a stage upstream of it, reads
-    from the disk a path that the ``--checkout-missing`` restore changes
-    (``status.restore_limits``, given the dry run's ``graph`` and the explanations its
-    expansion read, ``known``). The run may restore the path, find the producer current and add
-    its instances. With no restorable file it reads nothing."""
+    """Log one notice for each mapped stage of ``not_expanded`` (its rows) whose producer is not
+    current (``not_current``, ``status.expand_current``'s) where the run may expand it: the
+    explanation of the producer, and of each stage upstream of it that runs by its own, reads
+    from the disk a path that the ``--checkout-missing`` restore changes, and with each such
+    path taken at the hash the stage last read says the stage would not run
+    (``status.restore_limits``, given the dry run's ``graph``, ``force`` and ``allow_missing``,
+    and the explanations its expansion read, ``known``). With no restorable file it reads
+    nothing."""
     from pivot import status as status_mod
 
     if not plan.found.restorable or not not_expanded:
@@ -296,11 +300,13 @@ def _log_restore_limits(
     }
     limits = status_mod.restore_limits(
         pipeline,
-        {producer for producer in producers.values() if producer in waiting},
+        {producer for producer in producers.values() if producer in not_current},
         graph,
         present=plan.present,
         restorable=plan.found.restorable,
         known=known,
+        force=force,
+        allow_missing=allow_missing,
     )
     for template, producer in producers.items():
         if producer not in limits:
@@ -359,8 +365,7 @@ def _get_explanations(
     mapped stage, its not-expanded row and its orphaned instances are not shown, and a left-out
     stage changes no orphan the run would remove (``cli_helpers.eligible_templates`` over the
     stages the run keeps). With ``--checkout-missing``, a notice on stderr names each mapped
-    stage shown as not yet expanded that the run may expand: its producer waits only for a path
-    the restore changes and the dry run reads from the disk (``_log_restore_limits``). Any other
+    stage shown as not yet expanded that the run may expand (``_log_restore_limits``). Any other
     mode leaves out nothing (``_no_leave_out``), and a missing dependency stops it unless
     ``allow_missing``.
 
@@ -377,8 +382,8 @@ def _get_explanations(
         # Every target is left out; no target would explain every stage
         return _Explained([], [], {}, plan.left_out_targets)
     pipeline = cli_helpers.get_pipeline()
-    # Why each stage of the producers' execution order that is not current is not
-    waiting = dict[str, str]()
+    # Each stage of the producers' execution order that is not current
+    not_current = set[str]()
     result, known = cli_helpers.expand_mapped_stages(
         force=force,
         allow_missing=allow_missing,
@@ -390,7 +395,7 @@ def _get_explanations(
             project_root=project.get_project_root(),
             checkout_attempted=checkout_missing,
         ),
-        waiting=waiting,
+        not_current=not_current,
     )
     kept = expansion.Expansion(
         expanded={n: found for n, found in result["expanded"].items() if n not in plan.left_out},
@@ -443,7 +448,15 @@ def _get_explanations(
         restorable=plan.found.restorable,
     )
     not_expanded = status_mod.not_expanded_status(kept, shown_templates)
-    _log_restore_limits(not_expanded, plan, graph, known, waiting)
+    _log_restore_limits(
+        not_expanded,
+        plan,
+        graph,
+        known,
+        not_current,
+        force=force,
+        allow_missing=allow_missing,
+    )
     return _Explained(explanations, not_expanded, orphans, plan.left_out_targets)
 
 
