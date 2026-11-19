@@ -938,67 +938,33 @@ class WorkerStageInfo(TypedDict):
     # carries them again only when the coordinator loaded code after that.
     loaded_sources_token: str
     loaded_sources: NotRequired[dict[str, str]]
-    # The submodules the worker binds on their packages (`sent_submodules`) and those it imports by
-    # name (`imported_submodules`), each set when there is one, before the stage runs
-    # (`submodule_delivery.submodule_delivery`, `_deliver_submodules`). Why:
-    # `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs".
-    sent_submodules: NotRequired[tuple[ModuleType, ...]]
+    # The submodules the stage reads through their packages (`RegistryStageInfo.read_submodules`),
+    # which the worker imports by name before the stage runs (`_import_read_submodules`), set when
+    # there is one. Why: `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It
+    # Runs".
     imported_submodules: NotRequired[tuple[str, ...]]
 
 
-def _bind_sent_submodules(modules: Sequence[ModuleType]) -> None:
-    """Bind each of `modules` (`WorkerStageInfo.sent_submodules`) on its package, where this
-    process holds the package, as the import of a submodule binds it there: code that reads it
-    through the package (`import company.local` in the stage's module, `company.local.f()` in its
-    code) then finds it, as a plain run of that code does. A module that unpickling imported by
-    name is bound there already. Nothing is imported and `sys.modules` is left as it is, so the
-    import checks see what they saw without it. A package this process does not hold is left
-    alone; `_deliver_submodules` binds again after its imports by name, which can import it. A
-    stage body that imports such a package itself gets it without the module, a stated limit that
-    only a library's regular package whose `__init__` extends its `__path__`
-    (`pkgutil.extend_path`) reaches: Pivot refuses a body import of a namespace package with a
-    directory in the project."""
-    for module in modules:
-        package, _, attribute = module.__name__.rpartition(".")
-        parent = sys.modules.get(package)
-        if parent is not None:
-            setattr(parent, attribute, module)
-
-
 def _import_read_submodules(names: Sequence[str]) -> None:
-    """Import each of `names` (`WorkerStageInfo.imported_submodules`) by name, as a plain run
-    imports it, which binds it on its package: the coordinator does not send it
-    (`submodule_delivery.submodule_delivery`). The import goes through this process's import
-    machinery, as every import this worker makes by name does (the import hooks, and discovery's
-    loader while an import session lasts), so the source it loads is recorded and the check of the
-    code the stage used sees it (`_untrusted_modules`); a module this process holds already is not
-    loaded again, as no second import loads it. An import that raises gets a note that names the
-    module, which the stage's failure shows after the error (`_execute_stage`)."""
+    """Import each of `names` (`WorkerStageInfo.imported_submodules`) by name, a package before its
+    submodules, as a plain run of the code that reads it through its package imports it, which
+    binds it there: code that cloudpickle sends by value runs none of its module's imports, and
+    code it sends by reference may import the package alone (`import company`). The import goes
+    through this process's import machinery, as every import this worker makes by name does (the
+    import hooks, and discovery's loader while an import session lasts), so the source it loads is
+    recorded and the check of the code the stage used sees it (`_untrusted_modules`); a module
+    this process holds already is not loaded again, as no second import loads it. An import that
+    raises or exits gets a note that names the module, which the stage's failure shows after the
+    error or the exit's reason (`_execute_stage`)."""
     for name in names:
         try:
             importlib.import_module(name)
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             exc.add_note(
                 f"Pivot imported {name} by name before the stage ran: the stage reads it through "
                 + "its package."
             )
             raise
-
-
-def _deliver_submodules(sent: Sequence[ModuleType], imported: Sequence[str]) -> None:
-    """Give this process the submodules the stage reads through their packages
-    (`WorkerStageInfo.sent_submodules` and `imported_submodules`): bind the sent ones
-    (`_bind_sent_submodules`), import the others by name, a package before its submodules
-    (`_import_read_submodules`), then bind the sent ones again. An import by name can import the
-    package that the first binding found missing for a sent module (`company.sub`, for a sent
-    `company.sub.local`), or load from its file a module of a sent one's name, which that import
-    binds over the sent one (`company/other.py`, imported by name, does `import company.local`):
-    the second binding puts the sent module on each. The first lets an import by name that reads
-    a sent module through its package find it."""
-    _bind_sent_submodules(sent)
-    if imported:
-        _import_read_submodules(imported)
-        _bind_sent_submodules(sent)
 
 
 def _exit_reason(exc: SystemExit) -> str:
@@ -1069,19 +1035,22 @@ def _execute_stage(
     # may have stale cwd from previous execution in different project).
     # _queue_logging captures log messages to the output queue (for TUI display).
     with contextlib.chdir(project_root), _queue_logging(stage_name, output_queue):
-        # The submodules the stage reads through their packages, before anything of the stage
-        # runs: its parameter overrides, input loaders, the stage itself and its output writers
-        # may read such a module through its package. A failure of an import by name fails the
-        # stage as a failure of its code does: its reason is the traceback, which ends with a note
-        # that names the module, or, for an exit, the one an exit of the stage gives.
-        try:
-            _deliver_submodules(
-                stage_info.get("sent_submodules", ()), stage_info.get("imported_submodules", ())
-            )
-        except SystemExit as exc:
-            return _make_result(StageStatus.FAILED, _exit_reason(exc), ring_buffer)
-        except Exception:
-            return _make_result(StageStatus.FAILED, traceback.format_exc(), ring_buffer)
+        # The submodules the stage reads through their packages, imported by name before anything
+        # of the stage runs: its parameter overrides, input loaders, the stage itself and its
+        # output writers may read such a module through its package. A failure of an import fails
+        # the stage as the stage's own handling below fails it: its reason is the traceback, which
+        # ends with a note that names the module; for an exit, the reason an exit of the stage
+        # gives, then that note; for an interrupt, `KeyboardInterrupt`.
+        if "imported_submodules" in stage_info:
+            try:
+                _import_read_submodules(stage_info["imported_submodules"])
+            except SystemExit as exc:
+                reason = "\n".join([_exit_reason(exc), *exc.__notes__])
+                return _make_result(StageStatus.FAILED, reason, ring_buffer)
+            except KeyboardInterrupt:
+                return _make_result(StageStatus.FAILED, "KeyboardInterrupt", ring_buffer)
+            except Exception:
+                return _make_result(StageStatus.FAILED, traceback.format_exc(), ring_buffer)
         no_commit = stage_info["no_commit"]
 
         production_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_info["state_dir"]))

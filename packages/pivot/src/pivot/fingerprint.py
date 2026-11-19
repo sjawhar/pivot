@@ -2400,9 +2400,9 @@ def read_submodules(manifest: Mapping[str, str]) -> tuple[str, ...]:
     (`company.local` in `company.local.f()`, `_process_user_submodules`), sorted, so a package
     comes before its submodules: its `submodule:<name>` keys (`_add_submodule_read`), the stage's
     own and its loaders', which join the stage's without a prefix (`merge_loader_fingerprint`).
-    How the worker gets each: `submodule_delivery.submodule_delivery`. A lock does not record these
-    keys (`as_locked`), so the registry keeps the names beside the stage's fingerprint
-    (`registry.RegistryStageInfo`)."""
+    The worker imports each by name before the stage runs (`executor.core.prepare_worker_info`).
+    A lock does not record these keys (`as_locked`), so the registry keeps the names beside the
+    stage's fingerprint (`registry.RegistryStageInfo`)."""
     return tuple(
         sorted(key.removeprefix("submodule:") for key in manifest if key.startswith("submodule:"))
     )
@@ -2744,13 +2744,13 @@ def _is_submodule(package_name: object, attribute: str, value: object) -> bool:
 
 def bound_submodule(package: types.ModuleType, attribute: str) -> types.ModuleType | None:
     """The submodule `<package>.<attribute>` bound on package `package` under `attribute`, as its
-    import binds it, or None: a plain module (`types.ModuleType` itself, which cloudpickle can send
-    with a stage, not a subclass such as six's lazy `six.moves`) whose own namespace names it so
+    import binds it, or None: a plain module (`types.ModuleType` itself, not a subclass such as
+    six's lazy `six.moves`, whose attributes can run code when read) whose own namespace names it so
     (`_is_submodule`), and which `sys.modules` holds under that name, so one an import session
     removed since (`discovery`) is not. Read through `ModuleType`'s descriptor
     (`_module_namespace`), so no `__getattr__` of the package runs and nothing is imported. The
-    walk follows such a submodule (`_submodules_to_user_code`), and the coordinator sends it or has
-    the worker import it (`submodule_delivery.submodule_delivery`)."""
+    walk follows such a submodule (`_submodules_to_user_code`), and the worker imports it by name
+    before the stage runs (`read_submodules`)."""
     namespace = _module_namespace(package)
     value = namespace.get(attribute)
     name = namespace.get("__name__")

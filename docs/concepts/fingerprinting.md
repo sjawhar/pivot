@@ -538,12 +538,14 @@ in the file triggers a re-run.
 A `@no_fingerprint` stage whose own code reads your module through a package
 it shares with an installed library (`import company.local`, then
 `company.local.value()`, where `company` also has a directory in
-`site-packages`) finds the module there in its worker. A helper module under the
-project root that the stage calls is not read for this: a module that only the
-helper reads so is missing there, and the stage fails with `AttributeError:
-module 'company' has no attribute 'local'`. A helper outside the project root,
+`site-packages`) finds the module there in its worker. A helper module that the
+stage calls is not read for this. A helper under the project root works when its
+function reads the module in its own body (`company.local.value()` there, not
+only in a lambda in it). A helper outside the project root,
 which the worker imports by name, works when it imports the module itself
-(`import company.local`), as that import binds it there
+(`import company.local`), as that import binds it there; one that imports only
+the package (`import company`) leaves the module missing there, and the stage
+fails with `AttributeError: module 'company' has no attribute 'local'`
 ([Imports a Stage Makes While It Runs](../architecture/fingerprinting.md#imports-a-stage-makes-while-it-runs)).
 
 

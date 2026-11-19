@@ -18,17 +18,7 @@ import loky
 import loky.backend.resource_tracker
 import loky.reusable_executor
 
-from pivot import (
-    config,
-    discovery,
-    exceptions,
-    loaded_source,
-    parameters,
-    project,
-    registry,
-    submodule_delivery,
-    types,
-)
+from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, naming, ownership, track
@@ -598,15 +588,10 @@ def prepare_worker_info(
     # The workers started with other digests: the coordinator loaded user code since then.
     if (digests := loaded_source.digests_for_stage()) is not None:
         info["loaded_sources"] = digests
-    # How the worker gets each submodule the stage reads through its package (`read_submodules`):
-    # by what loky's pickler carries of it by value with the call built so far, which holds the
-    # stage; the call's other arguments hold none of its code. A stage that reads none pays nothing.
+    # The worker imports by name each submodule the stage reads through its package
+    # (`read_submodules`) before the stage runs, as a plain run's import binds it there.
     if names := stage_info.get("read_submodules"):
-        delivery = submodule_delivery.submodule_delivery(info, names)
-        if delivery.sent:
-            info["sent_submodules"] = delivery.sent
-        if delivery.imported:
-            info["imported_submodules"] = delivery.imported
+        info["imported_submodules"] = names
     return info
 
 

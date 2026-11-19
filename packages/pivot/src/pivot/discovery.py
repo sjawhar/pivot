@@ -91,7 +91,8 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
 
     Every other file's code comes from source bytes this loader read, and it records those bytes
     (``loaded_source.record``): a stage's fingerprint describes that code, which a worker receives
-    by value, even when the file is edited after the import.
+    by value where discovery registers its module so (``_track_root_modules``), even when the file
+    is edited after the import.
     """
 
     # The bytes the last ``get_data`` call read from this loader's source file.
@@ -512,9 +513,10 @@ def install_user_code_loader(root: str) -> None:
     for ``root`` does while it imports: the initializer of each worker (``executor.core``), for
     the worker's life.
 
-    A worker imports user code by name: a stage's module that discovery could not send by
-    value (one outside the root, or under it in a ``src`` layout) and any module a stage body
-    imports.
+    A worker imports user code by name: a module that discovery did not register by value (one
+    outside the root, under it in a ``src`` layout, or under it in a library's package:
+    ``_track_root_modules``) that the stage's pickle refers to or that the worker imports before
+    the stage runs, and any module a stage body imports.
     """
     _install_path_hook(pathlib.Path(root))
 
@@ -573,7 +575,19 @@ def _module_name_matches_root_path(
 
 
 def _track_root_modules(session: _ImportSession) -> None:
-    """Track all current user imports under root so the next session can remove them."""
+    """Track all current user imports under root so the next session can remove them, and
+    register with cloudpickle by value each one whose name maps to its path under root
+    (`_module_name_matches_root_path`) when it is a top-level module or its package is pickled
+    by value too (`loaded_source.pickled_by_value`), a package before its submodules.
+
+    A module whose package is a library's (a namespace package the project shares with an
+    installed library, a library's regular package whose `__init__` extends its `__path__` over
+    the project's directory), and so each module below it, is not registered: cloudpickle pickles
+    its functions and classes by reference, and a worker imports it by name, as a plain run
+    imports it, so the worker holds one copy of it, whose import-time code ran there. Why:
+    `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs"."""
+    registry = cloudpickle.list_registry_pickle_by_value()
+    candidates = list[tuple[str, _stdlib_types.ModuleType]]()
     for module_name, module in list(sys.modules.items()):
         if not _module_is_under_root(module, session.root, session.file_under_root):
             continue
@@ -584,8 +598,14 @@ def _track_root_modules(session: _ImportSession) -> None:
             and module_name not in session.preexisting_pickle_by_value_modules
             and module_name not in session.pickle_by_value_modules
         ):
-            cloudpickle.register_pickle_by_value(module)
-            session.pickle_by_value_modules[module_name] = module
+            candidates.append((module_name, module))
+    for module_name, module in sorted(candidates, key=lambda candidate: candidate[0].count(".")):
+        package = module_name.rpartition(".")[0]
+        if package and not loaded_source.pickled_by_value(package, registry):
+            continue
+        cloudpickle.register_pickle_by_value(module)
+        registry.add(module_name)
+        session.pickle_by_value_modules[module_name] = module
 
 
 def _module_name_for_path(path: pathlib.Path, root: pathlib.Path) -> str:

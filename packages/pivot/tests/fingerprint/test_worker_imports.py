@@ -9,12 +9,14 @@ other one, and an edit to the project's file would read `cached`. Fingerprinting
 started as a worker starts before it raises.
 
 A submodule the program holds bound on a library package, which a stage reads through the
-package's name, is what the walk follows and records, so that its worker finds it bound there,
-sent with the stage or imported by name as what loky's pickler carries of it with the stage
-decides (`fingerprint.bound_submodule`, `fingerprint.read_submodules`,
-`submodule_delivery.submodule_delivery`): a plain module with a source file, or a namespace
-package of the project's, that `sys.modules` holds under its name, re-read on a manifest cache
-hit, and, for a `@no_fingerprint` stage, found by a scan of the stage's own code.
+package's name, is what the walk follows and records, so that its worker imports it by name
+before the stage runs (`fingerprint.bound_submodule`, `fingerprint.read_submodules`): a plain
+module with a source file, or a namespace package of the project's, that `sys.modules` holds under
+its name, re-read on a manifest cache hit, and, for a `@no_fingerprint` stage, found by a scan of
+the stage's own code. Discovery registers a module under the project root for pickling by value
+only where its package goes by value too, or where it has no package, so that the worker imports
+the project's part of a library's package by name, as a plain run does
+(`discovery._track_root_modules`).
 
 Each test names its modules uniquely: the test process puts `packages/pivot/tests` (with its own
 `helpers.py`) on `sys.path`.
@@ -37,11 +39,12 @@ import types
 import uuid
 from typing import TYPE_CHECKING
 
+import cloudpickle
 import pytest
 import yaml
 from tests import helpers
 
-from pivot import discovery, exceptions, executor, fingerprint, loaded_source, submodule_delivery
+from pivot import discovery, exceptions, executor, fingerprint, loaded_source, project
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
@@ -940,7 +943,7 @@ def _helper_shared_namespace(
     return _held_namespace(name, [tmp_path / "project" / name, site / name], monkeypatch)
 
 
-def test_a_lazy_module_subclass_on_a_library_module_is_neither_walked_nor_sent(
+def test_a_lazy_module_subclass_on_a_library_module_is_neither_walked_nor_imported_by_name(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The program holds the library module `wi_six` from `site-packages`, a package with an
@@ -949,8 +952,8 @@ def test_a_lazy_module_subclass_on_a_library_module_is_neither_walked_nor_sent(
     `reduce` imports a module the first time it is read, as `six.moves.dbm_gnu` imports `_gdbm`,
     which an interpreter may lack. A stage that reads `wi_six.moves.reduce` records `wi_six` by
     name alone, as a stage that reads no submodule of a library package does: the walk reads
-    nothing of `wi_six.moves`, so its import does not run, and records no submodule, so the
-    coordinator sends none, which cloudpickle could not pickle."""
+    nothing of `wi_six.moves`, so its import does not run, and records no submodule, so the worker
+    imports none by name before the stage runs."""
     site = tmp_path / "lib" / "site-packages"
     library = _held("wi_six", site / "wi_six.py", monkeypatch, "__path__ = []\n")
     moves = _LazyModule("wi_six.moves")
@@ -964,7 +967,7 @@ def test_a_lazy_module_subclass_on_a_library_module_is_neither_walked_nor_sent(
     walked = _walk(pipeline)
 
     assert sorted(walked) == ["byname:wi_six", "self:use"], walked
-    assert fingerprint.bound_submodule(library, "moves") is None, "a module subclass is not sent"
+    assert fingerprint.bound_submodule(library, "moves") is None, "a module subclass is not read"
 
 
 def test_a_module_with_no_file_and_no_directory_on_a_library_package_is_not_walked(
@@ -975,8 +978,8 @@ def test_a_module_with_no_file_and_no_directory_on_a_library_package_is_not_walk
     made with no file and an empty `__path__`, as a library makes a module of names it imports on
     demand. A stage that reads `wi_lazy.moves.reduce` records `wi_lazy` by name alone: the module,
     which `is_user_code` takes as code `exec` made, has no source to walk and is no namespace
-    package of the project's, so no submodule is recorded for the coordinator to send, which a
-    worker would import by a name no file has."""
+    package of the project's, so no submodule is recorded for the worker to import by name, a name
+    no file has."""
     site = tmp_path / "lib" / "site-packages"
     library = _held("wi_lazy", site / "wi_lazy.py", monkeypatch, "__path__ = []\n")
     moves = types.ModuleType("wi_lazy.moves")
@@ -1016,17 +1019,16 @@ def test_a_refusal_reached_through_a_submodule_of_a_library_package_names_the_su
     ) in message, message
 
 
-def test_a_submodule_read_in_several_parts_of_a_walk_is_one_name_sent_with_the_stage(
+def test_a_submodule_read_in_several_parts_of_a_walk_is_one_name(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`wi_joined` is a namespace package the program holds with a directory in `site-packages`
     and one in the project root, whose `local.py` `pipeline.py` imports. The stage calls
     `ra.plain()` and `rz.plain()`, two project modules that each read `wi_joined.local` through
     the package's name, and its output writer's `save` reads it so too. The registry keeps its
-    name once beside the stage's fingerprint, whatever part of the walk read it. Discovery sends
-    `ra` and `rz` by value, and cloudpickle sends with each the module it reads through the
-    package, so the coordinator sends the module itself with the stage."""
-    package = _helper_shared_namespace("wi_joined", tmp_path, monkeypatch)
+    name once beside the stage's fingerprint, whatever part of the walk read it: the name the
+    worker imports by name before the stage runs."""
+    _helper_shared_namespace("wi_joined", tmp_path, monkeypatch)
     pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
@@ -1040,15 +1042,11 @@ def test_a_submodule_read_in_several_parts_of_a_walk_is_one_name_sent_with_the_s
 
     pipeline.ensure_fingerprint("p/use")
 
-    stage = pipeline.get_stage("p/use")
-    names = stage.get("read_submodules", ())
+    names = pipeline.get_stage("p/use").get("read_submodules")
     assert names == ("wi_joined.local",), names
-    assert submodule_delivery.submodule_delivery(
-        stage["func"], names
-    ) == submodule_delivery.SubmoduleDelivery(sent=(vars(package)["local"],), imported=())
 
 
-def test_a_submodule_a_later_import_session_removed_is_neither_walked_nor_sent(
+def test_a_submodule_a_later_import_session_removed_is_not_walked(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`wi_gone` is a namespace package the program holds with a directory in `site-packages`
@@ -1056,9 +1054,7 @@ def test_a_submodule_a_later_import_session_removed_is_neither_walked_nor_sent(
     through the package's name, and the walk records it. A later discovery, of a directory with no
     pipeline, ends the project's import session, which takes `wi_gone.local` out of
     `sys.modules` while the package still holds it. The stage's walk then reads nothing of that
-    module, and the coordinator neither sends it nor has the worker import it for what the walk of
-    the session read (`submodule_delivery.submodule_delivery`), as for a submodule no import
-    bound: no module of an ended session reaches a worker."""
+    module, as of a submodule no import bound (`fingerprint.bound_submodule`)."""
     package = _helper_shared_namespace("wi_gone", tmp_path, monkeypatch)
     pipeline = helpers.discover_project(
         tmp_path,
@@ -1068,6 +1064,7 @@ def test_a_submodule_a_later_import_session_removed_is_neither_walked_nor_sent(
     )
     local = vars(package)["local"]
     first = _walk(pipeline)
+    assert fingerprint.read_submodules(first) == ("wi_gone.local",), first
     assert "func:wi_gone.local.plain" in first, "the session's walk must read it"
     (tmp_path / "empty").mkdir()
     assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
@@ -1076,11 +1073,6 @@ def test_a_submodule_a_later_import_session_removed_is_neither_walked_nor_sent(
     walked = _walk(pipeline)
 
     assert [key for key in walked if "wi_gone.local" in key] == [], walked
-    names = fingerprint.read_submodules(first)
-    assert names == ("wi_gone.local",), first
-    assert submodule_delivery.submodule_delivery(
-        pipeline.get_stage("p/use")["func"], names
-    ) == submodule_delivery.SubmoduleDelivery(sent=(), imported=())
 
 
 def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_walk(
@@ -1093,7 +1085,7 @@ def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_w
     `other`. The program then loads `other.py` as `wi_bound.other` bound on the package, which
     changes no file the cache checks. The next fingerprint of the stage walks it, as a cache hit
     re-reads which submodules the package holds; a hit that kept the cached manifest would leave
-    an edit to `other.py` unseen and the module neither sent nor imported by name."""
+    an edit to `other.py` unseen and the module not imported by name in the worker."""
     package = _helper_shared_namespace("wi_bound", tmp_path, monkeypatch)
     pipeline = helpers.discover_project(
         tmp_path,
@@ -1115,71 +1107,122 @@ def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_w
     assert fingerprint.read_submodules(second) == ("wi_bound.local", "wi_bound.other"), second
 
 
+def _helper_library_namespace(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`wi_rn`, a namespace package the program holds with a directory in `site-packages` and one
+    in the project root (`_helper_shared_namespace`)."""
+    _helper_shared_namespace("wi_rn", tmp_path, monkeypatch)
+
+
+def _helper_library_package(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`wi_re`, a regular package the program holds from `site-packages`, whose `__init__` extends
+    its `__path__` over the project root's `wi_re` directory, as `pkgutil.extend_path` does."""
+    extended = tmp_path / "project" / "wi_re"
+    _held(
+        "wi_re",
+        tmp_path / "lib" / "site-packages" / "wi_re" / "__init__.py",
+        monkeypatch,
+        f"__path__.append({str(extended)!r})\n",
+    )
+
+
+def _helper_no_library(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing: each package of the case is the project's alone."""
+
+
 @pytest.mark.parametrize(
-    ("name", "place", "local", "imports", "call", "expected"),
+    ("library", "files", "imports", "registered"),
     [
         pytest.param(
-            "wi_cv",
-            "project",
-            'VALUE = "v"\n',
-            "import wi_cv.local",
-            "wi_cv.local.VALUE",
-            (["wi_cv.local"], list[str]()),
-            id="data-sent-by-value",
+            _helper_library_namespace,
+            {"wi_rn/local.py": _PLAIN, "wi_rn/sub/__init__.py": "", "wi_rn/sub/deep.py": _PLAIN},
+            "import wi_rn.local\nimport wi_rn.sub.deep",
+            {"pipeline": True, "wi_rn.local": False, "wi_rn.sub": False, "wi_rn.sub.deep": False},
+            id="library-namespace-package",
         ),
         pytest.param(
-            "wi_cr",
-            "outside",
-            _PLAIN,
-            "import wi_cr.local\nfrom wi_cr.local import plain",
-            "plain() + wi_cr.local.plain()",
-            (list[str](), ["wi_cr.local"]),
-            id="sent-by-reference",
+            _helper_library_package,
+            {"wi_re/local.py": _PLAIN},
+            "import wi_re.local",
+            {"pipeline": True, "wi_re": False, "wi_re.local": False},
+            id="library-regular-package",
         ),
         pytest.param(
-            "wi_cl",
-            "project",
-            'import threading\n\nLOCK = threading.Lock()\nVALUE = "v"\n',
-            "import wi_cl.local",
-            "wi_cl.local.VALUE",
-            (list[str](), ["wi_cl.local"]),
-            id="cannot-be-pickled",
+            _helper_no_library,
+            {"wi_rp/__init__.py": "", "wi_rp/local.py": _PLAIN},
+            "import wi_rp.local",
+            {"pipeline": True, "wi_rp": True, "wi_rp.local": True},
+            id="project-regular-package",
+        ),
+        pytest.param(
+            _helper_no_library,
+            {"wi_rq/local.py": _PLAIN},
+            "import wi_rq.local",
+            {"pipeline": True, "wi_rq": True, "wi_rq.local": True},
+            id="project-namespace-package",
         ),
     ],
 )
-def test_what_cloudpickle_carries_of_a_submodule_decides_whether_it_is_sent_or_imported(
+def test_discovery_registers_a_root_module_by_value_only_where_its_package_goes_by_value(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    name: str,
-    place: str,
-    local: str,
+    library: Callable[[pathlib.Path, pytest.MonkeyPatch], None],
+    files: dict[str, str],
     imports: str,
-    call: str,
-    expected: tuple[list[str], list[str]],
+    registered: dict[str, bool],
 ) -> None:
-    """`name` is a namespace package the program holds with a directory in `site-packages`, one in
-    the project root and one outside it, and its `local.py` (`local`) lies in the project root,
-    which discovery sends by value, or outside it, which cloudpickle sends by reference. The stage
-    reads it through the package's name. The coordinator sends the module with the stage where
-    pickling the stage carries the module itself by value: a module of data alone, with no
-    function or class of its own that the pickling could carry instead. It has the worker import
-    the module by name where that pickling carries nothing of it by value: a module sent by
-    reference, the stage holding one of its functions too (`from wi_cr.local import plain`), also
-    sent by reference; and where that pickling raises (a lock in the module), as the worker call's
-    own pickling then fails the stage."""
-    site = tmp_path / "lib" / "site-packages"
-    monkeypatch.syspath_prepend(str(site))
-    directories = [tmp_path / "project" / name, site / name, tmp_path / "outside" / name]
-    package = _held_namespace(name, directories, monkeypatch)
-    (tmp_path / place / name / "local.py").write_text(local)
-    pipeline = helpers.discover_project(tmp_path, monkeypatch, {}, _pipeline(imports, call))
-    names = fingerprint.read_submodules(_walk(pipeline))
-    assert names == (f"{name}.local",), names
+    """Modules under the project root that `pipeline.py` imports, in a package that is a library's
+    (a namespace package the program holds with a directory in `site-packages`, also a project
+    package below it, `wi_rn.sub`, and its module; or a library's regular package from
+    `site-packages` whose `__init__` extends its `__path__` over the project's directory) or the
+    project's (a regular package, or a namespace package with its one directory in the root).
+    Discovery registers with cloudpickle by value `pipeline.py` and each module whose package goes
+    by value, and no module whose package is a library's, nor one below such a module, so that
+    cloudpickle pickles its functions and classes by reference and a worker imports it by name,
+    as a plain run does: one copy, whose import-time code runs there. Were every module under the
+    root registered, the project's part of a library's package would go by value, a copy apart
+    from the module a worker's import of it loads."""
+    library(tmp_path, monkeypatch)
+    calls = " + ".join(f"{line.removeprefix('import ')}.plain()" for line in imports.splitlines())
+    helpers.discover_project(tmp_path, monkeypatch, files, _pipeline(imports, calls))
 
-    delivery = submodule_delivery.submodule_delivery(pipeline.get_stage("p/use")["func"], names)
+    by_value = cloudpickle.list_registry_pickle_by_value()
 
-    assert ([module.__name__ for module in delivery.sent], list(delivery.imported)) == expected
-    assert all(module is vars(package)["local"] for module in delivery.sent), delivery
+    assert {name: name in by_value for name in registered} == registered, by_value
+
+
+@pytest.mark.parametrize(
+    ("library", "directory"),
+    [
+        pytest.param(_helper_no_library, "wi_rs", id="project-directory"),
+        pytest.param(_helper_library_namespace, "wi_rn", id="library-package-name"),
+    ],
+)
+def test_a_pipeline_module_discovery_loads_from_a_directory_goes_by_value(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    library: Callable[[pathlib.Path, pytest.MonkeyPatch], None],
+    directory: str,
+) -> None:
+    """Discovery run from the directory `directory` of the project root loads its `pipeline.py`
+    under the name `<directory>.pipeline`, under a package it makes of the directory, also where
+    the program holds a library's namespace package of that name (`wi_rn`), which it puts aside
+    for the import session. It registers both by value, as it registers `pipeline.py` in the
+    root: the pipeline's package is the project's, so the stages it defines reach a worker by
+    value."""
+    library(tmp_path, monkeypatch)
+    root = tmp_path / "project"
+    (root / directory).mkdir(parents=True, exist_ok=True)
+    (root / directory / "pipeline.py").write_text(_pipeline("import os", "os.sep"))
+    (root / ".git").mkdir()
+    (root / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    monkeypatch.chdir(root / directory)
+
+    assert discovery.discover_pipeline(project_root=root) is not None
+
+    by_value = cloudpickle.list_registry_pickle_by_value()
+    names = (directory, f"{directory}.pipeline")
+    assert {name: name in by_value for name in names} == dict.fromkeys(names, True), by_value
 
 
 # What the scan records of a function that reads `wi_scan.local` through its package.

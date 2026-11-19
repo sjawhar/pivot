@@ -204,110 +204,67 @@ before the stage ran (the covered thread rule, `_StageImports`):
   other time is counted, even when a covered import later imports it. The comparison cannot tell
   which thread registered a key, so this part is by time.
 
-Discovery pickles `pipeline.py` and other modules under the project root by value, and importing
-one of them in the worker would run it again there, so a covered module is not imported ahead of
-the stage. There is one exception: a submodule the stage reads through its package that the
-coordinator does not send with the stage, which the worker imports by name before the stage
-runs (below). A plain run makes that import too, in the module of the code that reads the
-submodule, which reaches the worker by reference, or in `pipeline.py`, so it runs nothing a plain
-run does not.
+Discovery pickles `pipeline.py` and the other modules under the project root by value, the
+project's part of a library's package aside (below), and importing one of them in the worker
+would run it again there, so a covered module is not imported ahead of the stage. There is one
+exception: each submodule the stage reads through its package, which the worker imports by name
+before the stage runs (below). A plain run makes that import too, in the module of the code that
+reads the submodule or in `pipeline.py`, so it runs nothing a plain run does not.
 
-The worker imports by name each package cloudpickle sends by reference: a namespace package the
-project shares with an installed library (`company`, with a directory in `site-packages` and one in
-the project root), or a library package whose `__init__` extends its `__path__` over the project's
-directory (`pkgutil.extend_path`). Code that reads the project's module through that package
-(`import company.local`, then `company.local.f()` in a stage, a helper, a loader's `save` or a
-`StageParams` method) finds there only what something bound. A plain run of the module finds
-what its import bound. In the worker, code that cloudpickle sends by value runs none of its
-module's imports, and cloudpickle builds a module it sends by value as a new module object, which
-no package holds.
+Discovery registers a module under the project root for pickling by value only where its package
+is pickled by value too, or where it has no package (`discovery._track_root_modules`). So the
+project's part of a package it shares with an installed library is not: a module under the root
+in a namespace package that also has a directory in `site-packages` (`company`, with
+`company/client` installed and `company/local.py` in the project root), or in a library's regular
+package whose `__init__` extends its `__path__` over the project's directory
+(`pkgutil.extend_path`), and each module below such a module. cloudpickle pickles the functions and
+classes of such a module by reference, and the worker imports it by name, as a plain run does and
+as it imports the project's modules in a `PYTHONPATH` entry or a `src/` layout: the worker holds
+one copy of it, whose import-time code ran there, and every name an import of it binds, the class
+a stage holds (`from company.local import Mode`) and a later stage in the same worker get that
+copy. A module-level value of it that cloudpickle cannot pickle (a `threading.Lock`) does not stop
+the stage. The worker loads the module from the file as it is then, which may be after an edit;
+the check of the modules the stage used reports that edit after the run ([Code Edited After
+Discovery](#code-edited-after-discovery)), and the worker-import check compares the module as any
+module a worker imports by name (`loaded_source.check_worker_imports`).
 
-So the walk records each submodule a stage reads through a library package (`submodule:` keys,
-outside the lock, see [Manifest Key Prefixes](#manifest-key-prefixes)). For a `@no_fingerprint`
-stage, whose code the walk does not read, a scan of the stage function's own code and its nested
-code finds them by the same rules (`fingerprint.submodule_entries`); its loaders are walked as any
-stage's are. The registry keeps their names beside the stage's fingerprint
-(`RegistryStageInfo.read_submodules`).
+Code that reads such a module through its package (`import company.local`, then
+`company.local.f()` in a stage, a helper, a loader's `save` or a `StageParams` method) finds there
+only what an import bound. A plain run finds what the import in the code's module bound. In the
+worker, code that cloudpickle pickles by value runs none of its module's imports, and code it
+pickles by reference can import the package alone (`import company` in a helper in a `PYTHONPATH`
+entry). So the walk records each submodule a stage reads through a library package (`submodule:`
+keys, outside the lock, see [Manifest Key Prefixes](#manifest-key-prefixes)). For a
+`@no_fingerprint` stage, whose code the walk does not read, a scan of the stage function's own code
+and its nested code finds them by the same rules (`fingerprint.submodule_entries`); its loaders
+are walked as any stage's are. The registry keeps their names beside the stage's fingerprint
+(`RegistryStageInfo.read_submodules`), and the worker imports each by name, a package before its
+submodules (`WorkerStageInfo.imported_submodules`, `worker._import_read_submodules`), before
+anything of the stage runs (parameter overrides, input loaders, the stage, output writers) and
+before the stage's import window opens. The import of a module the worker holds already loads
+nothing again. An import by name goes through the worker's import machinery, as every import the
+worker makes by name does, so the worker records the source it loads and the check of the modules
+the stage used compares it with the coordinator's record (below). An import that raises an
+exception fails the stage before anything of it runs, as a failure of the stage's code does: the
+failure's reason is the import's traceback, which ends with a note that names the module. An
+import that exits (`sys.exit(3)` in the module) fails it with the reason an exit of the stage
+gives, `Stage called sys.exit(3)`, then that note, and an interrupt fails it as an interrupt of the
+stage does, `KeyboardInterrupt`.
 
-How each one bound on its package in the coordinator (`fingerprint.bound_submodule`) reaches the
-worker is decided by what the pickling of the worker's call carries of it by value
-(`submodule_delivery.submodule_delivery`). For a stage that reads at least one, the coordinator
-pickles the stage's part of the call (`WorkerStageInfo`) once more, before any submodule is added
-to it and without writing it, with loky's own pickler (`loky.backend.reduction.get_loky_pickler`:
-cloudpickle's, with loky's reducers, so a bound method is reduced as loky reduces it) and a hook
-that records, for each such submodule, whether it pickles by value the module object itself
-(cloudpickle adds to a function it pickles by value each submodule of a package that a global or
-a closure cell of the function holds, where the function's own code names the submodule), or
-only a function or class whose `__module__` names it.
-
-- **The module object carried.** The module is sent with the stage
-  (`WorkerStageInfo.sent_submodules`). The call pickles it anyway, so sending it adds nothing to
-  what loky pickles, and since it travels in the stage's pickle, pickle's memo makes it the module
-  that the carried values belong to. A sent module that cloudpickle pickles by reference
-  (`company/local.py` in a `PYTHONPATH` entry, of which the stage holds a lambda) is imported by
-  name as the worker unpickles the stage, which binds it.
-- **Only a function or class of it carried.** A stage that holds `Mode`
-  (`from company.local import Mode`) and passes `Mode.FAST` to `company.local.run` through a
-  helper must pass the class that `run` compares with. The coordinator pickles the module alone
-  with the same pickler: where that succeeds, the module is sent, as above; where it raises (a
-  module-level `threading.Lock`), the worker imports the module by name, as in the next case (a
-  stated limit, below).
-- **Neither carried.** The code that reads the module reaches the worker by reference (a helper
-  module in a `PYTHONPATH` entry, whatever its function's form: a lambda, a method, a function
-  under a decorator), or reads it only in nested code (a lambda in the stage), whose names
-  cloudpickle does not follow, and the call carries no function or class of it by value. The
-  worker imports the submodule by name, as a plain run's import does
-  (`WorkerStageInfo.imported_submodules`, `worker._import_read_submodules`). Nothing of its values
-  is pickled, so a module-level value that cloudpickle cannot pickle (a `threading.Lock`) does not
-  stop the stage.
-
-A sent module joins what the call carries, and loky pickles the whole namespace of one sent by
-value, which can carry a function or class of another such submodule (`company/local.py` does
-`from company.other import Kind`). What that namespace carries is decided by the same rules,
-until no sent module carries a new one: the extra pickling of the call holds the namespace of a
-module whose object the call carries, and the pickling of a module alone holds that of one sent
-for a function or class of it, so each submodule is pickled alone at most once. This runs on the
-engine's event loop, at each dispatch of a stage that reads such a submodule, before the call
-goes to the pool. It costs one more pickling of the stage's part of the call, without writing
-it, and one pickling of each module of which only a function or class is carried; a stage that
-reads none pays nothing.
-
-When the extra pickling of the call raises, every such submodule is marked to be imported by
-name; the call's own pickling then raises the same error, which fails the stage before a worker
-gets it. A module the stage reaches by other names only (`from company.local import f`) is
-neither sent nor imported.
-
-The worker gets them before anything of the stage runs (parameter overrides, input loaders, the
-stage, output writers) and before the stage's import window opens (`worker._deliver_submodules`):
-it binds each sent module on its package, as an import binds a submodule
-(`worker._bind_sent_submodules`), imports the others by name, a package before its submodules,
-then binds the sent ones again. An import by name can import the package that the first binding
-found missing (`company.sub`, imported by name, for a sent `company.sub.local`), or load from its
-file a module of a sent one's name, which that import binds over the sent one (`company/other.py`,
-imported by name, does `import company.local`): the second binding puts the sent module on each.
-The binding imports nothing and adds nothing to `sys.modules`, and it leaves alone a package the
-worker does not hold. An import by name goes through the worker's import machinery, as every
-import the worker makes by name does, so the worker records the source it loads and the check of
-the modules the stage used compares it with the coordinator's record (below). An import that
-raises an exception fails the stage before anything of it runs, as a failure of the stage's code
-does: the failure's reason is the import's traceback, which ends with a note that names the
-module. An import that exits (`sys.exit(3)` in the module) fails it with the reason an exit of the
-stage gives, `Stage called sys.exit(3)`.
-
-Three stated limits. A stage body that imports such a library package itself (`import company`
+Two stated limits. A stage body that imports such a library package itself (`import company`
 inside the stage, which no function the stage's pickle holds reads as a global) gets it without
 the module. Only a library's regular package whose `__init__` extends its `__path__`
 (`pkgutil.extend_path`) reaches this, since Pivot refuses such a body import of a namespace
-package with a directory in the project. The scan of a `@no_fingerprint` stage does not read a
-helper module the stage calls. A module that only a helper under the project root reads through
-its package reaches the worker neither way, and the stage fails there with
-`AttributeError: module 'company' has no attribute 'local'`. A helper the worker imports by name
-(one in a `PYTHONPATH` entry) works when it imports the module itself, as its own import binds
-it. And a module of which cloudpickle carries only a function or class by value, and that it
-cannot pickle whole (the stage holds `name` of a `company/local.py` that holds a
-`threading.Lock`, and only a helper in a `PYTHONPATH` entry reads the module through its
-package), is imported by name: the function or class the stage holds and the module the worker
-binds are then two copies, as in Pivot 0.10.4.
+package with a directory in the project. And the scan of a `@no_fingerprint` stage does not read
+a helper module the stage calls, so a module that only such a helper reads through its package is
+in the worker only where an import there binds it: the helper's own import of it (`import
+company.local`, in a module the worker imports by name), or cloudpickle's, which imports, with a
+function it pickles by value (a helper under the project root), each submodule of a package the
+function reads as a global where the function's own code names the submodule. A helper under the
+root that reads the module only inside a lambda in its function, and a helper the worker imports
+by name that imports the package alone (`import company`, in a `PYTHONPATH` entry), leave it
+missing, and the stage fails there with
+`AttributeError: module 'company' has no attribute 'local'`.
 
 A recorded module outside the covered set makes the result not reusable: the stage succeeds and
 logs one warning naming the modules; its lock carries an `uncovered-import:<modules>` key no
@@ -360,12 +317,14 @@ a thread native code starts outside `_thread`. Each has a remedy:
 
 A stage's fingerprint describes the code its worker runs, and that code is the code discovery
 loaded, not the files as they are when the stage starts. Discovery pickles `pipeline.py` and the
-other modules under the project root by value, so a worker runs the functions the coordinator
-compiled when it imported them. Fingerprinting reads source through `inspect.getsource`, which
-reads `linecache`, and `linecache` reads a file again when its size or mtime changes. Outside
-watch mode a stage is fingerprinted when it is ready to run, so a file edited after discovery (by
-an upstream stage, or in an editor while the run continues) would be hashed as edited while the
-worker ran the loaded version, and the next run would report the old output as cached.
+other modules under the project root by value, the project's part of a library's package aside
+([Imports a Stage Makes While It Runs](#imports-a-stage-makes-while-it-runs)), so a worker runs
+the functions the coordinator compiled when it imported them. Fingerprinting reads source through
+`inspect.getsource`, which reads `linecache`, and `linecache` reads a file again when its size or
+mtime changes. Outside watch mode a stage is fingerprinted when it is ready to run, so a file
+edited after discovery (by an upstream stage, or in an editor while the run continues) would be
+hashed as edited while the worker ran the loaded version, and the next run would report the old
+output as cached.
 
 So the record is about the module, not the loader. `discovery._ProjectSourceLoader` records the
 bytes each user module was compiled from (`loaded_source.record`). Every other user-code module
@@ -575,13 +534,12 @@ Limits of the comparison:
   program's own imports still search the old one.
 
 A worker imports some user modules itself, from their files: a stage's module discovery does not
-send by value (outside the root, or under it in a `src` layout), a module outside the root that
-one sent by value refers to, a submodule the stage reads through its package that the
-coordinator sends with the stage while cloudpickle pickles it by reference, or does not send,
-which the worker imports by name before the stage runs (`submodule_delivery.submodule_delivery`,
-above), and any module a stage body imports. Such a
-module holds the file as the worker read it, which may be before or after an edit. Each worker
-gets the coordinator's
+send by value (outside the root, or under it in a `src` layout), a module that one sent by value
+refers to and that discovery does not send by value (outside the root, or the project's part of a
+library's package, above), each submodule the stage reads through its package, which the worker
+imports by name before the stage runs (above), and any module a stage body imports. Such a module
+holds the file as the worker read it, which may be before or after an edit. Each worker gets the
+coordinator's
 records (`loaded_source.digests()`: each module's name, resolved path and digest) once, in its
 initializer arguments (`core._init_worker`), and each stage carries only their token
 (`WorkerStageInfo.loaded_sources_token`), plus the records themselves when the coordinator loaded

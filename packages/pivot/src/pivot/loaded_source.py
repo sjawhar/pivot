@@ -1,10 +1,12 @@
 """The source each user module was compiled from, recorded when this process loaded it.
 
 A stage's fingerprint must describe the code its worker runs. The worker receives a project
-module's functions by value: the code this process compiled when discovery imported the module.
-`inspect.getsource` reads a file's current lines through `linecache`, which re-reads a file whose
-size or mtime changed, so a file edited after the import (by an upstream stage, or in an editor
-during a run) would be hashed as edited while the worker runs the version that was loaded.
+module's functions by value: the code this process compiled when discovery imported the module
+(the project's part of a library's package aside, which the worker imports by name:
+`discovery._track_root_modules`). `inspect.getsource` reads a file's current lines through
+`linecache`, which re-reads a file whose size or mtime changed, so a file edited after the import
+(by an upstream stage, or in an editor during a run) would be hashed as edited while the worker
+runs the version that was loaded.
 Fingerprinting therefore reads source and source digests from what this module recorded, and a
 worker compares the modules a stage used against what the coordinator loaded (`check_stage`).
 
