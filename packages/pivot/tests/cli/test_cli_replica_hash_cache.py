@@ -1,4 +1,4 @@
-"""`pivot status` on a replica of a project reads no output it can vouch for (Dispatch BET-263).
+"""`pivot status` on a replica of a project reads no output it can vouch for.
 
 A replica made outside pivot (hard links, copies) carries a byte copy of the state database,
 whose file-hash entries name the original project's paths. A hard-linked output is the same
@@ -153,8 +153,8 @@ def _cp_al(src: pathlib.Path, dst: pathlib.Path) -> None:
     shutil.copytree(src, dst, symlinks=True, copy_function=os.link)
 
 
-def _bet_replica(src: pathlib.Path, dst: pathlib.Path) -> None:
-    """The BET lanes' replica (their make_replica.py): a symlink is recreated, a file with no
+def _link_and_copy_replica(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """A replica as one user's own script makes it: a symlink is recreated, a file with no
     write bit (pivot's outputs and cache objects) is hard-linked, and every other file, the
     state database's included, is copied with `shutil.copy2`."""
     for root, dirs, files in os.walk(src):
@@ -211,7 +211,10 @@ def _skip_if_identity_refused(tmp_path: pathlib.Path) -> None:
 
 @pytest.mark.parametrize(
     "make_replica",
-    [pytest.param(_cp_al, id="cp-al"), pytest.param(_bet_replica, id="bet-replica")],
+    [
+        pytest.param(_cp_al, id="cp-al"),
+        pytest.param(_link_and_copy_replica, id="link-copy-replica"),
+    ],
 )
 def test_a_hard_linked_replicas_first_status_reads_no_output(
     tmp_path: pathlib.Path, make_replica: Callable[[pathlib.Path, pathlib.Path], None]
@@ -332,9 +335,9 @@ def test_status_with_the_fingerprint_caches_to_fill_does_not_wait_for_a_held_loc
 @pytest.mark.parametrize(
     ("make_replica", "lock_writable", "opened"),
     [
-        pytest.param(_bet_replica, True, 0, id="bet-replica-served"),
+        pytest.param(_link_and_copy_replica, True, 0, id="link-copy-replica-served"),
         pytest.param(_rsync_a, True, _OUTPUT_FILES, id="rsync-a-read"),
-        pytest.param(_bet_replica, False, _OUTPUT_FILES, id="lock-read-only-not-used"),
+        pytest.param(_link_and_copy_replica, False, _OUTPUT_FILES, id="lock-read-only-not-used"),
     ],
 )
 def test_status_against_a_read_only_state_db_exits_0_and_leaves_it_unchanged(
@@ -347,7 +350,7 @@ def test_status_against_a_read_only_state_db_exits_0_and_leaves_it_unchanged(
     lets this reader register against writers; with a lock file it cannot write either (another
     user's project), the database is not used and status reads the files. Either way status
     reports, exits 0, and leaves the database as it was."""
-    if opened == 0:  # the bet-replica-served case relies on the hard links being served
+    if opened == 0:  # the link-copy-replica-served case relies on the hard links being served
         _skip_if_identity_refused(tmp_path)
     root = _helper_project(tmp_path / "live")
     replica = tmp_path / "replica"

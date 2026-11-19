@@ -4,9 +4,9 @@
 # does not. This workflow is that marker, and it is alone here for two reasons.
 #
 # It is a commit status, not a failing job: GitHub keeps every check run of a head, one per
-# workflow run, and a newer one does not replace an older failure (measured in
-# theorem-labs/grading-tools on commit b10c94657c, where a later successful check of the same name
-# left the rollup failing), so a failing job here would leave the head red for good, even after it
+# workflow run, and a newer one does not replace an older failure (measured in another
+# repository, where a later successful check of the same name left the rollup failing), so a
+# failing job here would leave the head red for good, even after it
 # is tested. A status overwrites by context, so the lint job of Tests sets this same context to
 # success on every pull-request run whose jobs run.
 #

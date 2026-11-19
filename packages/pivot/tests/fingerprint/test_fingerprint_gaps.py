@@ -927,7 +927,7 @@ _BOUND_CLASS_MEMBER_SHAPES = {
 
 @pytest.mark.parametrize("shape", sorted(_BOUND_CLASS_MEMBER_SHAPES))
 def test_a_held_classmethods_body_edit_reruns_its_stage(tmp_path: pathlib.Path, shape: str) -> None:
-    """BET-299: a method retains its body through another class or an instance's attribute.
+    """A method retains its body through another class or an instance's attribute.
 
     Editing only the defining module must invalidate the warm manifest and run cache; a
     nested class and a static method use the same real CLI path.

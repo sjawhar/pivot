@@ -368,7 +368,7 @@ When only one pipeline is active, pass its name as `strip_prefix`. When multiple
 **Step 1:** Check dep resolution in `--all` mode:
 
 ```bash
-cd /home/sami/eval-pipeline/pivot && uv run --active python3 -c "
+cd <eval-pipeline checkout>/pivot && uv run --active python3 -c "
 from pivot.discovery import _discover_all_pipelines
 from pivot import types
 import pathlib

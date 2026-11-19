@@ -437,7 +437,7 @@ def test_an_incremental_old_lock_stays_cached_and_carries_its_output_on(
 def test_init_keeps_lock_and_listing_files_visible_under_common_root_ignore_patterns(
     tmp_path: pathlib.Path,
 ) -> None:
-    """BET's root .gitignore ignores `build/`, `lib/` and `parts/` anywhere in the tree."""
+    """A root .gitignore may ignore `build/`, `lib/` and `parts/` anywhere in the tree."""
     root = _project(tmp_path, {".gitignore": "build/\nlib/\nparts/\n"})
     committed = [
         ".pivot/stages/lib/s.lock",
@@ -656,7 +656,7 @@ def test_pull_into_a_fresh_clone_restores_a_directory_from_its_committed_listing
 
 
 # =============================================================================
-# A fresh clone, before any pull: one named file of a directory output (BET-58, PR #489)
+# A fresh clone, before any pull: one named file of a directory output (PR #489)
 # =============================================================================
 
 _ONE_FILE_PIPELINE = """\

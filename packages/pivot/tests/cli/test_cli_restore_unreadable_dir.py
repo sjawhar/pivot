@@ -5,8 +5,7 @@ cannot enter may hide a user ``*.pvt`` sidecar, so the walk must not skip it. A 
 cannot prove an output holds no user file refuses, naming the directory it could not read, and
 deletes nothing.
 
-This is the recheck's red test (BET-265 round 5), kept verbatim; only this module docstring is
-this PR's.
+This is a reviewer's red test, kept verbatim apart from this module docstring.
 """
 
 from __future__ import annotations

@@ -1266,7 +1266,7 @@ def test_recorded_file_claim_matches_behavior(tmp_path: pathlib.Path) -> None:
     """A marked helper is recorded by its module and qualified name, and by no file. The
     manifest entry is `ext:<binding> = <module>.<qualname>`, so moving `lib/procs.py` to
     `lib/procs/__init__.py` leaves the stage cached. Neither the decorator's docstring nor the
-    fingerprinting guide says that the file is part of the record. BET's helpers sit outside
+    fingerprinting guide says that the file is part of the record. A helper can sit outside
     the project root, where no project-relative file exists."""
     project = _project(tmp_path, _MOVE)
     assert _status(_run(project, "repro", "--json"), "mv/s")[0] == "ran"
@@ -2961,7 +2961,7 @@ _R6_FORMS = {
 
 
 # A fix the refusal lists must work when a user follows it. Removing the mark does not: without
-# it a library wrapper over the class is accepted with the class's `__call__` unseen (BET-253),
+# it a library wrapper over the class is accepted with the class's `__call__` unseen,
 # and a bare class-based decorator gets main's non-scalar refusal.
 _REMOVE_FIX = re.compile(r"remov\w*[^\n]*fingerprint_by_name|remov\w* the mark", re.IGNORECASE)
 
