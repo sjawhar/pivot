@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import functools
+import itertools
 import logging
 import multiprocessing as mp
 import multiprocessing.resource_tracker
@@ -712,19 +713,27 @@ def verify_tracked_files(
         tolerate_missing: If True, return the tracked files that are still missing after the
             restore, unless one of them overlaps a path of ``outputs``.
         outputs: The ``ownership.normalized`` path of each output of the loaded stages, with
-            the stage that writes it (``ownership.stage_output_paths``). None: no outputs. Used
-            only with ``tolerate_missing``.
+            the stage that writes it (``ownership.stage_output_paths``); an empty mapping for
+            none. Read only with ``tolerate_missing``, which requires it.
 
     Returns:
         With ``tolerate_missing``, the tracked files still missing (the absolute normalized
         paths discovery gives), sorted. Else an empty list.
 
     Raises:
+        ValueError: ``tolerate_missing`` without ``outputs`` (a caller's error), before
+            anything is read.
         TrackedFileMissingError: Without ``tolerate_missing``, for every tracked file still
             missing. With it, for each one that is, lies inside or contains a path of
             ``outputs`` (``ownership.tracked_output_refusal``), and for no other file.
     """
     from pivot import metrics
+
+    if tolerate_missing and outputs is None:
+        raise ValueError(
+            "verify_tracked_files: tolerate_missing needs outputs, the outputs of the loaded "
+            + "stages (an empty mapping for none)"
+        )
 
     tracked_files = track.discover_pvt_files_and_update_memo(project_root, skip=skip)
     if not tracked_files:
@@ -788,13 +797,11 @@ def verify_tracked_files(
         return []
     if not tolerate_missing:
         raise exceptions.TrackedFileMissingError(missing, checkout_attempted=checkout_missing)
+    # Given with tolerate_missing, which the start refuses without it
+    assert outputs is not None
     still_missing = sorted(missing)
     refusal = ownership.tracked_output_refusal(
-        still_missing,
-        # None: the caller gives no outputs, so no missing file can overlap one
-        {} if outputs is None else outputs,
-        project_root,
-        checkout_attempted=checkout_missing,
+        still_missing, outputs, project_root, checkout_attempted=checkout_missing
     )
     if refusal is not None:
         raise refusal
@@ -811,9 +818,10 @@ class MissingTrackedFiles(NamedTuple):
     restorable: dict[str, track.PvtData]
     """Each missing tracked path the local cache can restore, with its ``.pvt`` data, in sorted
     order. Empty without ``checkout_missing``."""
-    restored: list[str]
-    """Every path the restore of ``restorable`` creates: each of those paths and, for a
-    directory, each file and empty directory its listing holds (absolute normalized paths)."""
+    restored: dict[str, set[tuple[str, ...]]]
+    """Each path of ``restorable``, with every path its restore creates inside it, as the parts
+    of that path relative to it (``_created_inside``): for a directory, each file and empty
+    directory its listing holds and each directory on the way to them; for a file, none."""
 
 
 def find_missing_tracked_files(
@@ -839,12 +847,12 @@ def find_missing_tracked_files(
         _refuse_control_restores(project_root, tracked_files)
     found = sorted(path for path in tracked_files if _tracked_path_kind(pathlib.Path(path)) is None)
     if not checkout_missing or not found:
-        return MissingTrackedFiles(missing=found, restorable={}, restored=[])
+        return MissingTrackedFiles(missing=found, restorable={}, restored={})
     cache_dir = config.locate_cache_dir() / "files"
     checkout_modes = config.get_checkout_mode_order()
     missing = list[str]()
     restorable = dict[str, track.PvtData]()
-    restored = list[str]()
+    restored = dict[str, set[tuple[str, ...]]]()
     for path in found:
         source = _restore_source(pathlib.Path(path), tracked_files[path], cache_dir)
         if source is None or cache.missing_cache_objects(
@@ -853,15 +861,25 @@ def find_missing_tracked_files(
             missing.append(path)
             continue
         restorable[path] = tracked_files[path]
-        restored.append(path)
-        if source.members is not None:
-            restored.extend(
-                str(pathlib.Path(path, entry["relpath"])) for entry in source.members["files"]
-            )
-            restored.extend(
-                str(pathlib.Path(path, relpath)) for relpath in source.members["empty_dirs"]
-            )
+        restored[path] = _created_inside(source.members)
     return MissingTrackedFiles(missing=missing, restorable=restorable, restored=restored)
+
+
+def _created_inside(members: listing.DirListing | None) -> set[tuple[str, ...]]:
+    """The paths the restore of a missing tracked path creates inside it, each as its parts
+    relative to it: for a directory with listing ``members``, each file and empty directory the
+    listing holds and each directory on the way to them; for a file (no listing), none."""
+    created = set[tuple[str, ...]]()
+    if members is None:
+        return created
+    files = (entry["relpath"] for entry in members["files"])
+    for relpath in itertools.chain(files, members["empty_dirs"]):
+        parts = pathlib.PurePath(relpath).parts
+        # A path held already came with the directories on the way to it
+        while parts and parts not in created:
+            created.add(parts)
+            parts = parts[:-1]
+    return created
 
 
 def check_uncached_incremental_outputs(

@@ -234,6 +234,13 @@ _READER_SKIPPED = (
     + "(path data/raw/missing.txt), which does not exist"
 )
 
+# A run of target broken/after, downstream of broken/read_0, leaves it out
+_LEFT_OUT_AFTER = (
+    "The run left out 1 target for a missing input:\n"
+    + "  - broken/after: Stage 'broken/read_0' depends on input 'missing.txt' "
+    + "(path data/raw/missing.txt), which does not exist"
+)
+
 
 def _helper_directory_reader_code(input_name: str = "dir") -> str:
     """Pipeline dirs, whose stage dirs/scan reads the directory data/raw/<input_name>/ and lists
@@ -411,11 +418,7 @@ def test_repro_all_keep_going_left_out_target_fails_the_run_after_the_other_targ
 
         assert result.exit_code == 1, result.output
         assert "Unknown stage" not in result.output, result.output
-        assert (
-            "The run left out 1 target for a missing input:\n"
-            + "  - broken/after: Stage 'broken/read_0' depends on input 'missing.txt' "
-            + "(path data/raw/missing.txt), which does not exist"
-        ) in result.output, result.output
+        assert _LEFT_OUT_AFTER in result.output, result.output
         assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
         assert not (cwd / "data" / "broken" / "after.txt").exists()
 
@@ -484,12 +487,6 @@ def test_repro_all_left_out_target_rule_still_refuses_a_target_naming_no_stage(
 # =============================================================================
 
 _DRY_RUN_KEEP_GOING = ["repro", "--all", "--keep-going", "--dry-run", "--jsonl"]
-
-_LEFT_OUT_AFTER = (
-    "The run left out 1 target for a missing input:\n"
-    + "  - broken/after: Stage 'broken/read_0' depends on input 'missing.txt' "
-    + "(path data/raw/missing.txt), which does not exist"
-)
 
 
 def _helper_completed(stdout: str) -> dict[str, dict[str, object]]:
@@ -666,6 +663,55 @@ def test_repro_all_dry_run_keep_going_checkout_missing_follows_the_restored_dire
         }, ran.output
         assert _helper_skipping_lines(ran.stderr) == skipped, ran.output
         assert (cwd / "data" / "dirs" / "scan.txt").read_text() == "b.png"
+
+
+def test_repro_all_dry_run_keep_going_leaves_out_a_restored_directory_holding_a_missing_file(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """A5, D7, R1: data/raw/images is a missing tracked directory the cache can restore, and the
+    hand-edited data/raw/extra.pvt tracks images/extra.bin, which images' listing does not hold
+    and whose object no cache holds. dirs/scan reads images. The run restores images, still
+    finds extra.bin missing inside it and leaves dirs/scan out with the `Skipping:` line of the
+    directory that holds it. The dry run with --checkout-missing counts images as present, finds
+    the same file inside it and leaves dirs/scan out with the same line."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_write_pipeline(cwd, "dirs", _helper_directory_reader_code("images"))
+        _helper_write_pipeline(cwd, "alpha", _helper_pipeline_code("alpha", "stage_a"))
+        images = cwd / "data" / "raw" / "images"
+        images.mkdir(parents=True)
+        (images / "a.png").write_text("a")
+        tracking = runner.invoke(cli.cli, ["track", "data/raw/images"])
+        assert tracking.exit_code == 0, tracking.output
+        shutil.rmtree(images)
+        (cwd / "data" / "raw" / "extra.pvt").write_text(
+            "path: images/extra.bin\nhash: 0123456789abcdef\nsize: 10\n"
+        )
+
+        dry_run = runner.invoke(cli.cli, [*_DRY_RUN_KEEP_GOING, "--checkout-missing"])
+        restored = images.exists()
+        ran = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+        )
+
+        skipped = [
+            "Skipping: Stage 'dirs/scan' depends on directory 'images', which holds tracked file "
+            + "'data/raw/images/extra.bin' that does not exist"
+        ]
+        assert dry_run.exit_code == 0, dry_run.output
+        assert not restored, "a dry run restores nothing"
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
+        }, dry_run.output
+        assert _helper_skipping_lines(dry_run.stderr) == skipped, dry_run.output
+        assert ran.exit_code == 0, ran.output
+        completed = _helper_completed(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "ran"
+        }, ran.output
+        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
+        assert _helper_skipping_lines(ran.stderr) == skipped, ran.output
+        assert (images / "a.png").read_text() == "a", "the run restores images"
+        assert not (cwd / "data" / "dirs" / "scan.txt").exists()
 
 
 def test_repro_all_dry_run_keep_going_target_naming_no_stage_lists_what_the_run_runs(

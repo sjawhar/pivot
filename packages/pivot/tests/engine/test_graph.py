@@ -19,7 +19,7 @@ from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, OnError
 from tests import helpers
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Collection, Mapping
     from pathlib import Path
 
 
@@ -533,7 +533,7 @@ def _helper_runnable(
     stages: dict[str, RegistryStageInfo],
     store: store_mod.WorkspaceStore,
     missing_tracked: list[str],
-    restored_tracked: Collection[str] = (),
+    restored_tracked: Mapping[str, Collection[tuple[str, ...]]] | None = None,
 ) -> graph.RunnableStages:
     """``get_runnable_stages`` of a keep-going run across all pipelines."""
     return graph.get_runnable_stages(
@@ -719,7 +719,9 @@ def test_get_runnable_stages_decides_containment_by_path_parts(set_project_root:
         pytest.param("data/tracked/x.csv", False, id="a-file-of-its-listing"),
         pytest.param("data/tracked/sub", False, id="a-subdirectory-holding-its-files"),
         pytest.param("data/x.csv", False, id="a-restored-file"),
+        pytest.param("data/tracked/inner/deep/z.csv", False, id="a-file-of-a-nested-directory"),
         pytest.param("data/tracked/cat.png", True, id="a-file-its-listing-lacks"),
+        pytest.param("data/tracked/inner/cat.png", True, id="a-file-no-listing-holds"),
         pytest.param("data/x.csv/inner", True, id="inside-a-restored-file"),
     ],
 )
@@ -728,17 +730,17 @@ def test_get_runnable_stages_counts_a_path_the_restore_creates_as_present(
 ) -> None:
     """A dry run with --checkout-missing counts a missing dependency as present when the restore
     creates it: a restorable tracked file or directory, a file the directory's listing holds, or
-    a subdirectory holding such files. Any other missing dependency keeps its error, as the run
+    a subdirectory holding such files, also when a restorable directory lies inside another and
+    its own listing holds the file. Any other missing dependency keeps its error, as the run
     still finds it missing after the restore; a stage reading a missing tracked file the cache
     cannot restore is left out either way."""
     [gone] = _helper_missing_tracked(set_project_root, "data/z.csv")
     tracked = set_project_root / "data" / "tracked"
-    restored = [
-        str(set_project_root / "data" / "x.csv"),
-        str(tracked),
-        str(tracked / "x.csv"),
-        str(tracked / "sub" / "y.csv"),
-    ]
+    restored = {
+        str(set_project_root / "data" / "x.csv"): set[tuple[str, ...]](),
+        str(tracked): {("x.csv",), ("sub",), ("sub", "y.csv")},
+        str(tracked / "inner"): {("deep",), ("deep", "z.csv")},
+    }
     stages = {
         "p/read": _helper_input_stage("p/read", ["x"]),
         "p/other": _helper_input_stage("p/other", ["z"]),
@@ -758,6 +760,46 @@ def test_get_runnable_stages_counts_a_path_the_restore_creates_as_present(
     )
 
 
+def test_get_runnable_stages_leaves_out_a_stage_reading_a_restored_directory_holding_a_missing_file(
+    set_project_root: Path,
+) -> None:
+    """A dry run with --checkout-missing counts the restorable directory images as present, so
+    it finds what the run finds in images once it restored it: extra.bin, which a hand-edited
+    .pvt tracks and neither images' listing nor any cache restores, leaves p/scan out with the
+    error of the directory that holds it. p/scan's errors follow its dependencies' order, as the
+    run's do: images, then the existing other. p/png reads a file the restore creates and is
+    kept."""
+    raw = set_project_root / "data" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "extra.pvt").write_text("path: images/extra.bin\nhash: 0123456789abcdef\nsize: 10\n")
+    missing = _helper_missing_tracked(set_project_root, "data/raw/other/y.bin")
+    assert missing == [str(raw / "images" / "extra.bin"), str(raw / "other" / "y.bin")]
+    stages = {
+        "p/scan": _helper_input_stage("p/scan", ["images", "other"]),
+        "p/png": _helper_input_stage("p/png", ["png"]),
+    }
+    store = _helper_store(
+        set_project_root,
+        {"images": "data/raw/images", "other": "data/raw/other", "png": "data/raw/images/a.png"},
+    )
+
+    found = _helper_runnable(
+        stages, store, missing, restored_tracked={str(raw / "images"): {("a.png",)}}
+    )
+
+    assert found.stages is not None
+    assert set(found.stages) == {"p/png"}
+    assert [(error.stage, error.input_path, error.directory) for error in found.errors] == [
+        ("p/scan", raw / "images" / "extra.bin", raw / "images"),
+        ("p/scan", raw / "other" / "y.bin", raw / "other"),
+    ]
+    assert str(found.errors[0]) == (
+        "Stage 'p/scan' depends on directory 'images', which holds tracked file "
+        + "'data/raw/images/extra.bin' that does not exist"
+    )
+    assert found.left_out == {"p/scan": found.errors[0]}
+
+
 def test_get_runnable_stages_counts_a_restored_path_reached_through_a_symlink_as_present(
     set_project_root: Path,
 ) -> None:
@@ -769,8 +811,8 @@ def test_get_runnable_stages_counts_a_restored_path_reached_through_a_symlink_as
     stages = {"p/read": _helper_input_stage("p/read", ["x"])}
     store = _helper_store(set_project_root, {"x": "data/alias/x"})
 
-    found = _helper_runnable(stages, store, [], restored_tracked=[str(sub / "x")])
-    without = _helper_runnable(stages, store, [], restored_tracked=[str(sub / "y")])
+    found = _helper_runnable(stages, store, [], restored_tracked={str(sub / "x"): set()})
+    without = _helper_runnable(stages, store, [], restored_tracked={str(sub / "y"): set()})
 
     assert found.stages is not None
     assert set(found.stages) == {"p/read"}

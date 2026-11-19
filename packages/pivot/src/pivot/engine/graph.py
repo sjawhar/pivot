@@ -15,7 +15,7 @@ from pivot import types as pivot_types
 from pivot.engine.types import NodeType
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Callable, Collection, Mapping
 
     from pivot.exceptions import DependencyNotFoundError
     from pivot.registry import RegistryStageInfo
@@ -153,6 +153,7 @@ def validate_dependency_sources(
     store: Store | None = None,
     *,
     present: list[tuple[str, pivot_types.ArtifactRef]] | None = None,
+    created: Callable[[pathlib.Path], bool] | None = None,
 ) -> list[DependencyNotFoundError]:
     """Check that every dependency is either produced by a stage or exists on disk.
 
@@ -163,7 +164,9 @@ def validate_dependency_sources(
     output key on a known stage); external-dep existence is silently skipped.
     With *present*, each dependency that no stage produces and that exists on disk is
     appended to it with its stage, in iteration order (``get_runnable_stages`` reads these
-    for the directories that hold a missing tracked file).
+    for the directories that hold a missing tracked file). With *created*, a dependency missing
+    from disk whose path it accepts counts as one that exists: a restore creates that path
+    (``get_runnable_stages``' ``restored_tracked``, a dry run's view of ``--checkout-missing``).
     """
     from pivot import exceptions
 
@@ -197,6 +200,10 @@ def validate_dependency_sources(
                 input_path = None
                 input_path_display = None
             else:
+                if created is not None and created(input_path):
+                    if present is not None:
+                        present.append((stage_name, dep))
+                    continue
                 input_path_display = project.to_relative_path(input_path)
             errors.append(
                 exceptions.DependencyNotFoundError(
@@ -340,7 +347,7 @@ def get_runnable_stages(
     all_pipelines: bool,
     on_error: pivot_types.OnError,
     missing_tracked: Collection[str] = (),
-    restored_tracked: Collection[str] = (),
+    restored_tracked: Mapping[str, Collection[tuple[str, ...]]] | None = None,
 ) -> RunnableStages:
     """Return the stages a run executes, with the missing dependencies found.
 
@@ -351,20 +358,27 @@ def get_runnable_stages(
     ``missing_tracked`` holds the tracked files still missing, as the absolute normalized paths
     discovery gives (``executor.core.verify_tracked_files``). A stage reads such a file when a
     dependency is the file, lies inside it, or is an existing directory that holds it, and it
-    gets one error per such file. ``restored_tracked`` holds every path that a restore of
-    missing tracked files creates (``executor.core.find_missing_tracked_files``, for a dry run
-    with ``--checkout-missing``): a missing dependency at such a path, or holding one, counts as
-    present (``_tracked_file_errors``).
+    gets one error per such file. ``restored_tracked`` maps each missing tracked path that a
+    restore brings back to every path the restore creates inside it, as its parts relative to
+    that path (``executor.core.find_missing_tracked_files``, for a dry run with
+    ``--checkout-missing``): a missing dependency the restore creates, or that holds a path the
+    restore creates, counts as one that exists, as the run finds it after its restore
+    (``_restore_creates``), so a directory among them that holds a missing tracked file leaves
+    its stage out too.
     """
     from pivot import exceptions
 
-    # The dependencies on disk, read for the directories that hold a missing tracked file
+    # The dependencies on disk, or created by the restore, read for the directories that hold a
+    # missing tracked file
     present = list[tuple[str, pivot_types.ArtifactRef]]()
     errors = validate_dependency_sources(
-        stages, store=store, present=present if missing_tracked else None
+        stages,
+        store=store,
+        present=present,
+        created=_restore_creates(restored_tracked) if restored_tracked else None,
     )
-    if missing_tracked or restored_tracked:
-        errors = _tracked_file_errors(errors, present, store, missing_tracked, restored_tracked)
+    if missing_tracked:
+        errors = _tracked_file_errors(errors, present, store, missing_tracked)
     if not errors:
         return RunnableStages(stages, errors, {})
     if not skips_missing_dependencies(all_pipelines=all_pipelines, on_error=on_error):
@@ -372,6 +386,9 @@ def get_runnable_stages(
     graph = build_graph(stages)
     left_out = dict[str, exceptions.DependencyNotFoundError]()
     for error in errors:
+        if error.stage in left_out:
+            # An earlier error left it out, and every stage downstream of it with it
+            continue
         for name in (error.stage, *get_downstream_stages(graph, error.stage)):
             # A stage's cause is the first error that leaves it out
             left_out.setdefault(name, error)
@@ -385,17 +402,15 @@ def _tracked_file_errors(
     present: list[tuple[str, pivot_types.ArtifactRef]],
     store: Store,
     missing_tracked: Collection[str],
-    restored_tracked: Collection[str],
 ) -> list[DependencyNotFoundError]:
     """``validate_dependency_sources``' ``errors`` with the missing tracked files counted, so a
     stage has one error per missing tracked file it reads.
 
     ``validate_dependency_sources`` reports each dependency that is a missing tracked file or
     lies inside one: of a stage's errors for one tracked file, the first stays. A dependency of
-    ``present`` (one no stage produces, found on disk, with its stage) that is a directory
-    holding missing tracked files gets one error per such file the stage has no error for yet.
-    An error for a path that a restore creates (``restored_tracked``), or that holds such a
-    path, is dropped. Each path counts in both its forms, normalized and resolved
+    ``present`` (one no stage produces, found on disk or created by a restore, with its stage)
+    that is a directory holding missing tracked files gets one error per such file the stage has
+    no error for yet. Each path counts in both its forms, normalized and resolved
     (``os.path.realpath``, which resolves a missing path's existing ancestors), as a watch run
     waits for a missing input (``Engine``'s ``_MissingDependencyRun.awaits``): a dependency that
     reaches a missing tracked file through a symlink reads it. Path parts decide containment,
@@ -404,35 +419,32 @@ def _tracked_file_errors(
     from pivot import exceptions
 
     missing = _forms_trie(missing_tracked)
-    restored = _forms_trie(restored_tracked)
     # The stage and missing tracked file of each error kept
     reported = set[tuple[str, str]]()
     kept = list[exceptions.DependencyNotFoundError]()
     for error in errors:
         if error.input_path is not None:
-            forms = _forms(project.normalize_path(error.input_path))
-            if restored is not None and any(
-                form.parts in restored or restored.has_subtrie(form.parts) for form in forms
-            ):
-                continue
-            tracked = _enclosing_path(missing, forms)
+            tracked = _enclosing_path(missing, _forms(project.normalize_path(error.input_path)))
             if tracked is not None:
                 if (error.stage, tracked) in reported:
                     continue
                 reported.add((error.stage, tracked))
         kept.append(error)
-    if missing is None:
-        return kept
 
+    # The missing tracked files each directory holds, sorted, by its normalized path
+    held_by_directory = dict[pathlib.Path, list[str]]()
     for stage_name, dep in present:
         directory = project.normalize_path(store.checkout(dep))
-        held = {
-            tracked
-            for form in _forms(directory)
-            if missing.has_subtrie(form.parts)
-            for tracked in missing.values(prefix=form.parts)
-        }
-        for tracked in sorted(held):
+        if directory not in held_by_directory:
+            held_by_directory[directory] = sorted(
+                {
+                    tracked
+                    for form in _forms(directory)
+                    if missing.has_subtrie(form.parts)
+                    for tracked in missing.values(prefix=form.parts)
+                }
+            )
+        for tracked in held_by_directory[directory]:
             if (stage_name, tracked) in reported:
                 continue
             reported.add((stage_name, tracked))
@@ -450,16 +462,48 @@ def _tracked_file_errors(
     return kept
 
 
+def _restore_creates(
+    restored: Mapping[str, Collection[tuple[str, ...]]],
+) -> Callable[[pathlib.Path], bool]:
+    """Whether the restore of the missing tracked paths of ``restored`` creates a path, or a
+    path inside it. ``restored`` maps each such path to every path its restore creates inside
+    it, as its parts relative to that path (``executor.core.MissingTrackedFiles.restored``).
+
+    A path counts in both its forms (``_forms``), and so does each restored path: nothing under
+    a missing path exists, so a path inside it resolves to the same parts inside its resolved
+    form. The trie of the restored paths is built, resolving each of them once, when the first
+    path is asked about: a dry run with no missing dependency resolves none. Path parts decide
+    containment, never a string prefix.
+    """
+    roots: pygtrie.Trie[str] | None = None
+
+    def creates(path: pathlib.Path) -> bool:
+        nonlocal roots
+        if roots is None:
+            roots = _forms_trie(restored)
+        for form in _forms(project.normalize_path(path)):
+            parts = form.parts
+            # A restored path, or a directory holding one
+            if parts in roots or roots.has_subtrie(parts):
+                return True
+            # A path inside a restored path whose restore creates it
+            for depth in range(1, len(parts)):
+                root = parts[:depth]
+                if root in roots and parts[depth:] in restored[roots[root]]:
+                    return True
+        return False
+
+    return creates
+
+
 def _forms(path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     """Absolute normalized ``path`` and its resolved form (``os.path.realpath``)."""
     return path, pathlib.Path(os.path.realpath(path))
 
 
-def _forms_trie(paths: Collection[str]) -> pygtrie.Trie[str] | None:
+def _forms_trie(paths: Collection[str]) -> pygtrie.Trie[str]:
     """A trie of the absolute normalized ``paths``, each keyed by the parts of both its forms
-    (``_forms``) to the path itself; None for no path."""
-    if not paths:
-        return None
+    (``_forms``) to the path itself."""
     trie: pygtrie.Trie[str] = pygtrie.Trie()
     for path in paths:
         for form in _forms(pathlib.Path(path)):
@@ -467,11 +511,9 @@ def _forms_trie(paths: Collection[str]) -> pygtrie.Trie[str] | None:
     return trie
 
 
-def _enclosing_path(trie: pygtrie.Trie[str] | None, forms: tuple[pathlib.Path, ...]) -> str | None:
+def _enclosing_path(trie: pygtrie.Trie[str], forms: tuple[pathlib.Path, ...]) -> str | None:
     """The outermost path of ``trie`` that is, or holds, a form of ``forms`` (in their order),
     or None."""
-    if trie is None:
-        return None
     for form in forms:
         step = trie.shortest_prefix(form.parts)
         if step is not None and step.is_set:

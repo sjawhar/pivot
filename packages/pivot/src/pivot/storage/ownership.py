@@ -977,14 +977,30 @@ def find_declared_overlap(
             relation = "is inside"
         else:
             relation = "contains"
-        text = (
-            f"it {relation} output '{display_path(pathlib.Path(output), project_root)}' "
-            + f"of stage '{declared['stage']}'"
-        )
+        resolves = None
         if resolved != normalized(path) or out_resolved != pathlib.Path(output):
-            text += f" (the path resolves to '{resolved}'; the output resolves to '{out_resolved}')"
-        return text
+            resolves = (resolved, out_resolved)
+        return _overlap_description(
+            relation, pathlib.Path(output), declared["stage"], project_root, resolves
+        )
     return None
+
+
+def _overlap_description(
+    relation: str,
+    output: pathlib.Path,
+    stage: str,
+    project_root: pathlib.Path,
+    resolves: tuple[pathlib.Path, pathlib.Path] | None,
+) -> str:
+    """How a path overlaps output ``output`` of ``stage``: "it ``relation`` output ...", the
+    relation being "is", "is inside" or "contains", and, with ``resolves``, what the path and
+    the output resolve to. ``find_declared_overlap`` and ``_tracked_output_overlaps`` both say
+    it here."""
+    text = f"it {relation} output '{display_path(output, project_root)}' of stage '{stage}'"
+    if resolves is not None:
+        text += f" (the path resolves to '{resolves[0]}'; the output resolves to '{resolves[1]}')"
+    return text
 
 
 def stage_output_paths(
@@ -1058,20 +1074,16 @@ def _tracked_output_overlaps(
         output = _overlapping_output(lexical, path)
         if output is not None:
             relation = _relation(path, output)
-            resolves = ""
+            resolves = None
         else:
             real_path = pathlib.Path(os.path.realpath(path))
             output = _overlapping_output(resolved, real_path)
             if output is None:
                 continue
             relation = _relation(real_path, real_outputs[output])
-            resolves = (
-                f" (the path resolves to '{real_path}'; the output resolves to "
-                + f"'{real_outputs[output]}')"
-            )
-        overlaps[missing_path] = (
-            f"it {relation} output '{display_path(output, project_root)}' "
-            + f"of stage '{outputs[output]}'{resolves}"
+            resolves = (real_path, real_outputs[output])
+        overlaps[missing_path] = _overlap_description(
+            relation, output, outputs[output], project_root, resolves
         )
     return overlaps
 

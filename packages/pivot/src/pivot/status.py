@@ -47,7 +47,6 @@ import contextvars
 import logging
 import os
 import pathlib
-import types
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, cast
 
@@ -111,9 +110,6 @@ NOT_EXPANDED_REASON_PREFIX = "Not yet expanded"
 ORPHANED_REASON_PREFIX = "Orphaned"
 """Reason prefix for an instance of a mapped stage whose key left its producer's listing."""
 
-_NO_TRACKED_FILES: Mapping[str, PvtData] = types.MappingProxyType({})
-"""No tracked file: the default ``restorable`` (an empty mapping no caller can change)."""
-
 
 def _discover_tracked_files(
     allow_missing: bool, all_stages: dict[str, RegistryStageInfo]
@@ -133,10 +129,13 @@ def _discover_tracked_files(
             config.locate_cache_dir() / "files",
         ),
     )
-    tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
-    for path in tracked_files:
-        tracked_trie[pathlib.Path(path).parts] = path
-    return tracked_files, tracked_trie
+    return tracked_files, _tracked_trie(tracked_files)
+
+
+def _tracked_trie(tracked_files: Iterable[str]) -> pygtrie.Trie[str]:
+    """A trie of the tracked paths ``tracked_files`` (absolute normalized), each keyed by its
+    ``Path.parts`` to the path itself."""
+    return pygtrie.Trie((pathlib.Path(path).parts, path) for path in tracked_files)
 
 
 def _get_explanations_in_parallel(
@@ -242,7 +241,7 @@ def _explanations_for(
     force: bool,
     allow_missing: bool,
     known: Mapping[str, StageExplanation] | None,
-    restorable: Mapping[str, PvtData] = _NO_TRACKED_FILES,
+    restorable: Mapping[str, PvtData] | None = None,
 ) -> dict[str, StageExplanation]:
     """Each stage of ``execution_order``'s own explanation, before its upstream is counted
     (``_compute_explanations_with_upstream``): ``known``'s where it holds one, computed with the
@@ -253,7 +252,7 @@ def _explanations_for(
     tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
     if tracked_files is None and restorable:
         tracked_files = dict(restorable)
-        tracked_trie = pygtrie.Trie((pathlib.Path(path).parts, path) for path in tracked_files)
+        tracked_trie = _tracked_trie(tracked_files)
     with fingerprint_mod.fingerprint_pass():
         for stage_name in execution_order:
             pipeline.ensure_fingerprint(stage_name)
@@ -288,7 +287,7 @@ def get_pipeline_explanations(
     graph: nx.DiGraph[str] | None = None,
     *,
     known: Mapping[str, StageExplanation] | None = None,
-    restorable: Mapping[str, PvtData] = _NO_TRACKED_FILES,
+    restorable: Mapping[str, PvtData] | None = None,
 ) -> list[StageExplanation]:
     """Explain each stage of ``stages``' execution order. ``known`` holds explanations already
     computed with the same ``force``, ``allow_missing`` and ``restorable``
@@ -344,7 +343,7 @@ def expand_current(
     force: bool = False,
     allow_missing: bool = False,
     fetched: Mapping[str, listing.DirListing] | None = None,
-    restorable: Mapping[str, PvtData] = _NO_TRACKED_FILES,
+    restorable: Mapping[str, PvtData] | None = None,
     refuse: expansion.InstanceRefusal | None = None,
 ) -> tuple[expansion.Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage (``Pipeline.map``) of ``pipeline`` whose producer is current,

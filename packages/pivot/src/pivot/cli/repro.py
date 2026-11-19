@@ -314,8 +314,7 @@ def _get_explanations(
         # Every target is left out; no target would explain every stage
         return _Explained([], [], {}, plan.left_out_targets)
     pipeline = cli_helpers.get_pipeline()
-    result, known = status_mod.expand_current(
-        pipeline,
+    result, known = cli_helpers.expand_mapped_stages(
         force=force,
         allow_missing=allow_missing,
         restorable=plan.restorable,
@@ -355,7 +354,8 @@ def _get_explanations(
         name: info for name, info in cli_helpers.get_all_stages().items() if name not in hidden
     }
 
-    # Build graph with validation when allow_missing is False
+    # Build graph, and validate its dependencies unless allow_missing. Leave-out mode skips the
+    # check: ``_leave_out_plan`` already reported each missing dependency and left out its stages
     graph = engine_graph.build_graph(all_stages)
     if not leave_out and not allow_missing:
         ws = cli_helpers.get_workspace_store()
@@ -445,9 +445,9 @@ def _dry_run(
     if quiet and not as_json:
         if leave_out:
             # The run's decisions still fail the command, so the exit code is the run's
-            left_out = _leave_out_plan(stages_list, checkout_missing=checkout_missing)
-            if left_out.left_out_targets:
-                raise exceptions.TargetsLeftOutError(left_out.left_out_targets)
+            plan = _leave_out_plan(stages_list, checkout_missing=checkout_missing)
+            if plan.left_out_targets:
+                raise exceptions.TargetsLeftOutError(plan.left_out_targets)
         return
 
     explained = _get_explanations(
@@ -1194,14 +1194,15 @@ def _run_oneshot_mode(
     "--checkout-missing",
     is_flag=True,
     help="Restore tracked files that don't exist on disk from cache before running. With "
-    + "--all --keep-going, --dry-run and --explain count such a file the cache holds as present "
-    + "and restore nothing.",
+    + "--all --keep-going and without --watch, --dry-run and --explain count such a file the "
+    + "cache holds as present and restore nothing.",
 )
 @click.option(
     "--allow-missing",
     is_flag=True,
     help="Allow missing dep files if tracked (.pvt exists). Only affects --dry-run and "
-    + "--explain. Refused with --all --keep-going unless --watch or --fail-fast is also given.",
+    + "--explain. Refused with --all --keep-going unless --watch is given, or --explain is "
+    + "given with --fail-fast.",
 )
 @click.pass_context
 def repro(
