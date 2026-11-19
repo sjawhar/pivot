@@ -567,8 +567,8 @@ def test_get_runnable_stages_leaves_out_a_stage_reading_a_directory_holding_a_mi
     assert error.input_path == set_project_root / "data" / "dir" / "x.csv"
     assert error.directory == set_project_root / "data" / "dir"
     assert str(error) == (
-        "Stage 'p/read' depends on directory 'dir', which holds tracked file 'data/dir/x.csv' "
-        + "that does not exist"
+        "Stage 'p/read' depends on directory 'dir' (path data/dir), which holds tracked file "
+        + "'data/dir/x.csv' that does not exist"
     )
     assert found.left_out == {"p/read": error}
 
@@ -590,8 +590,8 @@ def test_get_runnable_stages_reports_each_missing_tracked_file_a_directory_holds
     ]
     assert [error.directory for error in found.errors] == [set_project_root / "data" / "dir"] * 2
     assert [str(error) for error in found.errors] == [
-        f"Stage 'p/read' depends on directory 'dir', which holds tracked file 'data/dir/{name}' "
-        + "that does not exist"
+        "Stage 'p/read' depends on directory 'dir' (path data/dir), which holds tracked file "
+        + f"'data/dir/{name}' that does not exist"
         for name in ("x.csv", "y.csv")
     ]
     assert found.left_out == {"p/read": found.errors[0]}
@@ -669,8 +669,8 @@ def test_get_runnable_stages_reports_missing_untracked_inputs_beside_a_missing_t
     assert [str(error) for error in found.errors] == [
         "Stage 'p/read' depends on input 'gone' (path data/gone.csv), which does not exist",
         "Stage 'p/read' depends on input 'lost' (path data/lost.csv), which does not exist",
-        "Stage 'p/read' depends on directory 'dir', which holds tracked file 'data/dir/x.csv' "
-        + "that does not exist",
+        "Stage 'p/read' depends on directory 'dir' (path data/dir), which holds tracked file "
+        + "'data/dir/x.csv' that does not exist",
     ]
     assert found.left_out == {"p/read": found.errors[0]}
 
@@ -795,8 +795,8 @@ def test_get_runnable_stages_leaves_out_a_stage_reading_a_restored_directory_hol
         ("p/scan", raw / "other" / "y.bin", raw / "other"),
     ]
     assert str(found.errors[0]) == (
-        "Stage 'p/scan' depends on directory 'images', which holds tracked file "
-        + "'data/raw/images/extra.bin' that does not exist"
+        "Stage 'p/scan' depends on directory 'images' (path data/raw/images), which holds "
+        + "tracked file 'data/raw/images/extra.bin' that does not exist"
     )
     assert found.left_out == {"p/scan": found.errors[0]}
 
@@ -844,8 +844,8 @@ def test_get_runnable_stages_leaves_out_a_stage_reading_a_symlink_to_a_directory
     assert error.input_path == set_project_root / "data" / "raw" / "real" / "f.txt"
     assert error.directory == set_project_root / "data" / "raw" / "link"
     assert str(error) == (
-        "Stage 'p/scan' depends on directory 'link', which holds tracked file "
-        + "'data/raw/real/f.txt' that does not exist"
+        "Stage 'p/scan' depends on directory 'link' (path data/raw/link), which holds tracked "
+        + "file 'data/raw/real/f.txt' that does not exist"
     )
     assert found.left_out == {"p/scan": error}
 
@@ -921,8 +921,8 @@ def test_dependency_not_found_error_on_a_directory_survives_pickling(
         str(restored)
         == str(original)
         == (
-            "Stage 'p/read' depends on directory 'dir', which holds tracked file 'data/dir/x.csv' "
-            + "that does not exist"
+            "Stage 'p/read' depends on directory 'dir' (path data/dir), which holds tracked file "
+            + "'data/dir/x.csv' that does not exist"
         )
     )
 

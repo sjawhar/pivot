@@ -164,6 +164,13 @@ class Console:
         self._echo(f"  Status: {self._color('NOT YET EXPANDED', 'cyan')}")
         self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
 
+    def explain_refused(self, name: str, reason: str) -> None:
+        """Print a mapped stage (``Pipeline.map``) the run refuses to expand: it fails the stage
+        with ``reason`` and runs none of its instances."""
+        self._echo(f"\nStage: {self._color(name, 'bold')}")
+        self._echo(f"  Status: {self._color('WILL FAIL', 'red')}")
+        self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
+
     def explain_orphaned(self, name: str, reason: str) -> None:
         """Print an orphaned instance of a mapped stage (``Pipeline.map``): its key left its
         producer's listing, and the run that expands its mapped stage removes it."""
@@ -172,7 +179,13 @@ class Console:
         self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
 
     def explain_summary(
-        self, will_run: int, unchanged: int, not_expanded: int = 0, *, orphaned: int = 0
+        self,
+        will_run: int,
+        unchanged: int,
+        not_expanded: int = 0,
+        *,
+        refused: int = 0,
+        orphaned: int = 0,
     ) -> None:
         """Print summary after explain output."""
         self._echo("")
@@ -181,6 +194,8 @@ class Console:
         summary = f"Summary: {run_text} will run, {unchanged_text} unchanged"
         if not_expanded:
             summary += f", {self._color(str(not_expanded), 'cyan')} not yet expanded"
+        if refused:
+            summary += f", {self._color(str(refused), 'red')} will fail"
         if orphaned:
             summary += f", {self._color(str(orphaned), 'red')} orphaned"
         self._echo(summary)

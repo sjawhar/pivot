@@ -5,10 +5,12 @@ from __future__ import annotations
 import contextlib
 import json
 import shutil
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
 
+import pivot_tui.run
 from pivot import cli
 from pivot.storage import lock
 from tests import helpers
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
     import pathlib
 
     from click.testing import CliRunner
+    from pytest_mock import MockerFixture
 
 
 def _setup_multi_pipeline_project(root: pathlib.Path) -> None:
@@ -317,8 +320,8 @@ def test_repro_all_tracked_keep_going_leaves_out_a_stage_reading_a_directory_tha
 
         assert result.exit_code == 0, result.output
         assert helpers.skipping_lines(result.output) == [
-            "Skipping: Stage 'dirs/scan' depends on directory 'dir', which holds tracked file "
-            + f"'data/raw/{holder.name}/f.txt' that does not exist"
+            "Skipping: Stage 'dirs/scan' depends on directory 'dir' (path data/raw/dir), which "
+            + f"holds tracked file 'data/raw/{holder.name}/f.txt' that does not exist"
         ], result.output
         assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
         assert not (cwd / "data" / "dirs" / "scan.txt").exists(), "the stage must not run"
@@ -438,6 +441,56 @@ def test_repro_all_keep_going_left_out_target_names_an_instance_of_a_left_out_ma
         ) in result.output, result.output
         assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
         assert not (cwd / "data" / "m" / "cut@a.txt").exists()
+
+
+class _FakeTuiApp:
+    """Stands for ``pivot_tui.run.PivotApp`` in a one-shot ``repro --tui``: it starts no terminal
+    UI, and its ``run`` returns once the engine thread posts ``TuiShutdown`` at its end, as the
+    real app exits then (``_run_common.run_tui_with_engine``)."""
+
+    shut_down: threading.Event
+    return_code: int | None
+
+    def __init__(self, **_options: object) -> None:
+        self.shut_down = threading.Event()
+        self.return_code = None
+
+    def post_message(self, message: object) -> bool:
+        if isinstance(message, pivot_tui.run.TuiShutdown):
+            self.shut_down.set()
+        return True
+
+    def set_event_poller(self, _poller: object) -> None:
+        return None
+
+    def run(self) -> None:
+        assert self.shut_down.wait(timeout=300), "the engine thread never ended"
+        self.return_code = 0
+
+
+def test_repro_all_keep_going_tui_left_out_target_fails_the_run_after_the_other_target_runs(
+    runner: CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
+) -> None:
+    """A3 (R4) through the one-shot TUI (``cli/repro.py`` ``_run_oneshot_mode``'s TUI branch):
+    of targets broken/after, downstream of the reader of a missing tracked file, and the healthy
+    alpha/stage_a, alpha/stage_a runs; the command then exits 1 naming broken/after and the
+    missing file, and no target is an unknown stage. The TUI app is a stand-in that shows
+    nothing; the engine, its RPC socket and the event poller are the real ones."""
+    tui_app = mocker.patch.object(pivot_tui.run, "PivotApp", autospec=True, side_effect=_FakeTuiApp)
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+        helpers.track_without_data(cwd / "data" / "raw" / "unrelated.txt")
+
+        result = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--tui", "broken/after", "alpha/stage_a"]
+        )
+
+        assert tui_app.call_count == 1, "the run goes through the TUI"
+        assert result.exit_code == 1, result.output
+        assert "Unknown stage" not in result.output, result.output
+        assert _LEFT_OUT_AFTER in result.output, result.output
+        assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
+        assert not (cwd / "data" / "broken" / "after.txt").exists()
 
 
 @pytest.mark.parametrize(
@@ -663,8 +716,8 @@ def test_repro_all_dry_run_keep_going_leaves_out_a_restored_directory_holding_a_
         )
 
         skipped = [
-            "Skipping: Stage 'dirs/scan' depends on directory 'images', which holds tracked file "
-            + "'data/raw/images/extra.bin' that does not exist"
+            "Skipping: Stage 'dirs/scan' depends on directory 'images' (path data/raw/images), "
+            + "which holds tracked file 'data/raw/images/extra.bin' that does not exist"
         ]
         assert dry_run.exit_code == 0, dry_run.output
         assert not restored, "a dry run restores nothing"

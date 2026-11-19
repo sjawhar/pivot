@@ -440,15 +440,17 @@ def output_explain_text(
     show_tracked: bool = False,
     *,
     not_expanded: list[PipelineStatusInfo] | None = None,
+    refused: list[PipelineStatusInfo] | None = None,
     orphaned: list[PipelineStatusInfo] | None = None,
 ) -> None:
     """Output detailed stage explanations as formatted text, then each mapped stage not yet
-    expanded (``not_expanded``) with what it waits for, then each orphaned instance of a mapped
-    stage (``orphaned``), which the run removes."""
+    expanded (``not_expanded``) with what it waits for, then each mapped stage the run refuses to
+    expand (``refused``), which it fails, with the reason, then each orphaned instance of a
+    mapped stage (``orphaned``), which the run removes."""
     sections_printed = 0
 
     # Always show stage explanations section
-    if not explanations and not not_expanded and not orphaned:
+    if not explanations and not not_expanded and not refused and not orphaned:
         click.echo("No stages to run")
     else:
         con = console.Console()
@@ -456,6 +458,8 @@ def output_explain_text(
             con.explain_stage(exp)
         for row in not_expanded or []:
             con.explain_not_expanded(row["name"], row["reason"])
+        for row in refused or []:
+            con.explain_refused(row["name"], row["reason"])
         for row in orphaned or []:
             con.explain_orphaned(row["name"], row["reason"])
 
@@ -464,6 +468,7 @@ def output_explain_text(
             will_run,
             len(explanations) - will_run,
             len(not_expanded or []),
+            refused=len(refused or []),
             orphaned=len(orphaned or []),
         )
     sections_printed += 1

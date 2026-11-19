@@ -292,7 +292,8 @@ def test_repro_all_dry_run_keep_going_checkout_missing_notes_no_refused_mapped_s
     whose object the cache holds; f.txt was tracked after the first run, and .pivotignore leaves
     its .pvt out of the directory's hash, so p/plan stays current. data/p/cut@present.txt, the
     output p/cut@present would write, is a missing tracked file that no cache holds. The dry run
-    with --checkout-missing shows p/cut as one row with the run's reason for refusing it."""
+    with --checkout-missing shows p/cut as one row, which would not run, with the run's reason for
+    refusing it."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         (cwd / ".pivotignore").write_text("*.pvt\n")
         helpers.write_pipeline(cwd, "p", _MAPPED_OVER_A_READ_DIRECTORY_CODE)
@@ -317,6 +318,7 @@ def test_repro_all_dry_run_keep_going_checkout_missing_notes_no_refused_mapped_s
             + "The following tracked files are missing:\n"
         ), dry_run.output
         assert "data/p/cut@present.txt" in stages["p/cut"]["reason"], dry_run.output
+        assert stages["p/cut"]["would_run"] is False, dry_run.output
         assert _helper_notices(dry_run.stderr) == [], dry_run.output
         assert helpers.skipping_lines(dry_run.stderr) == [], dry_run.output
 
@@ -658,3 +660,84 @@ def test_repro_all_dry_run_keep_going_checkout_missing_notice_agrees_with_the_ru
         plan = helpers.completed_stages(ran.stdout)["p/plan"]["status"]
         assert (plan, expanded) == (row.plan, row.expanded), ran.output
         assert bool(notices) == (plan == "cached" and expanded), "the dry run and the run agree"
+
+
+# =============================================================================
+# The notice's limit: trees where it is false, kept out of the agreement table above
+# =============================================================================
+
+
+def _helper_other_file_changed(runner: CliRunner, cwd: pathlib.Path) -> None:
+    """p/plan reads data/raw/dir/, which holds the tracked file f.txt. After the first run
+    present.txt, the other file of dir, changes."""
+    tracked = _helper_restore_limit_project(runner, cwd, _MAPPED_OVER_A_READ_DIRECTORY_CODE)
+    (tracked.parent / "present.txt").write_text("changed")
+
+
+def _helper_file_tracked_again(runner: CliRunner, cwd: pathlib.Path) -> None:
+    """p/plan reads data/raw/dir/. After the first run f.txt gets new contents and is tracked
+    again with the real ``pivot track --force``, then removed: its .pvt and the cache hold the new
+    contents, not the ones p/plan read."""
+    tracked = _helper_restore_limit_project(runner, cwd, _MAPPED_OVER_A_READ_DIRECTORY_CODE)
+    tracked.write_text("g")
+    retracking = runner.invoke(cli.cli, ["track", "--force", "data/raw/dir/f.txt"])
+    assert retracking.exit_code == 0, retracking.output
+    tracked.unlink()
+
+
+def _helper_executable_file_read(runner: CliRunner, cwd: pathlib.Path) -> None:
+    """p/plan reads data/raw/dir/, and the first run reads f.txt executable: after ``pivot track``
+    f.txt is replaced by a file of the same contents with the executable bit. A directory's hash
+    holds each file's executable bit, and a single file's .pvt records none: the restore gives
+    f.txt back from the cache object, which ``pivot track`` stored read-only and not executable.
+    """
+    helpers.write_pipeline(cwd, "p", _MAPPED_OVER_A_READ_DIRECTORY_CODE)
+    helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+    tracked = _helper_track(runner, cwd, "data/raw/dir/f.txt", "f")
+    (tracked.parent / "present.txt").write_text("present")
+    # Unlinked, not written through: it may be a link to the cache object
+    tracked.unlink()
+    tracked.write_text("f")
+    tracked.chmod(0o755)
+    _helper_first_run(runner)
+    tracked.unlink()
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        pytest.param(_helper_other_file_changed, id="another-file-of-the-read-directory-changed"),
+        pytest.param(_helper_file_tracked_again, id="the-file-was-tracked-again-with-new-contents"),
+        pytest.param(_helper_executable_file_read, id="the-restored-file-is-not-executable"),
+    ],
+)
+def test_repro_all_dry_run_keep_going_checkout_missing_notice_limit_restore_differs(
+    runner: CliRunner, tmp_path: pathlib.Path, setup: Callable[[CliRunner, pathlib.Path], object]
+) -> None:
+    """A known false notice, pinned as it is today. The notice explains p/plan again with
+    data/raw/dir/ at the hash p/plan's lock recorded, as if the restore of f.txt gave back
+    exactly what p/plan last read. On each tree it does not: the dry run with --checkout-missing
+    prints the notice, and the run with it restores f.txt, still finds dir changed and runs
+    p/plan again instead of finding it cached. Hashing the read path as the restore leaves it
+    would fix the notice. These trees are not rows of the agreement table, where the notice and
+    the run agree."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        setup(runner, cwd)
+
+        dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
+        ran = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+        )
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": _UNCHANGED, **_helper_waiting("Input dependencies changed")}
+        }, dry_run.output
+        assert _helper_notices(dry_run.stderr) == [_helper_restore_limit_notice("p/plan")], (
+            dry_run.output
+        )
+        assert ran.exit_code == 0, ran.output
+        assert (cwd / "data" / "raw" / "dir" / "f.txt").is_file(), "the run restores f.txt"
+        assert helpers.completed_stages(ran.stdout)["p/plan"]["status"] == "ran", (
+            "the run does not find p/plan cached, so the notice was false"
+        )

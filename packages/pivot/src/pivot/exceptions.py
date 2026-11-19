@@ -89,6 +89,7 @@ class DependencyNotFoundError(DAGError):
     _input_path: pathlib.Path | None
     _input_path_display: str | None
     _directory: pathlib.Path | None
+    _directory_display: str | None
 
     def __init__(
         self,
@@ -98,6 +99,7 @@ class DependencyNotFoundError(DAGError):
         input_path: pathlib.Path | None = None,
         input_path_display: str | None = None,
         directory: pathlib.Path | None = None,
+        directory_display: str | None = None,
     ) -> None:
         self._stage = stage
         self._dep = dep
@@ -105,6 +107,7 @@ class DependencyNotFoundError(DAGError):
         self._input_path = input_path
         self._input_path_display = input_path_display
         self._directory = directory
+        self._directory_display = directory_display
         if input_path is None:
             message = (
                 f"Stage '{stage}' depends on '{dep}' which is not produced by any stage "
@@ -119,7 +122,8 @@ class DependencyNotFoundError(DAGError):
                 )
             else:
                 message = (
-                    f"Stage '{stage}' depends on directory '{dep}', which holds tracked file "
+                    f"Stage '{stage}' depends on directory '{dep}' "
+                    + f"(path {directory_display or directory}), which holds tracked file "
                     + f"'{display_path}' that does not exist"
                 )
         super().__init__(message)
@@ -156,7 +160,15 @@ class DependencyNotFoundError(DAGError):
         self,
     ) -> tuple[
         type,
-        tuple[str, str, list[str], pathlib.Path | None, str | None, pathlib.Path | None],
+        tuple[
+            str,
+            str,
+            list[str],
+            pathlib.Path | None,
+            str | None,
+            pathlib.Path | None,
+            str | None,
+        ],
     ]:
         return (
             self.__class__,
@@ -167,6 +179,7 @@ class DependencyNotFoundError(DAGError):
                 self._input_path,
                 self._input_path_display,
                 self._directory,
+                self._directory_display,
             ),
         )
 

@@ -457,6 +457,7 @@ def _tracked_file_errors(
                     input_path=pathlib.Path(tracked),
                     input_path_display=project.to_relative_path(tracked),
                     directory=directory,
+                    directory_display=project.to_relative_path(directory),
                 )
             )
     return kept

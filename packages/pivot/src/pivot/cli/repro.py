@@ -245,12 +245,14 @@ def _instance_output_refusal(
     missing: list[str],
     project_root: pathlib.Path,
     checkout_attempted: bool,
+    refused: set[str],
 ) -> exceptions.TrackedFileMissingError | None:
     """The run's refusal of ``template``'s instances over missing tracked files
     (``Engine._expand_template``): the instances it would add, of the keys its targets name
     (``wanted``) or every key, checked against ``missing``, the missing tracked files the cache
-    cannot restore (``ownership.tracked_output_refusal``). With no missing file it builds no
-    instance."""
+    cannot restore (``ownership.tracked_output_refusal``). The name of a template it refuses goes
+    into ``refused``: the run fails that template and runs none of its instances. With no missing
+    file it builds no instance."""
     from pivot.storage import ownership
 
     if not missing:
@@ -262,12 +264,15 @@ def _instance_output_refusal(
         info["name"]: info
         for info in (registry.instantiate(template, key, file_key) for key, file_key in keys)
     }
-    return ownership.tracked_output_refusal(
+    refusal = ownership.tracked_output_refusal(
         missing,
         ownership.stage_output_paths(project_root, planned),
         project_root,
         checkout_attempted=checkout_attempted,
     )
+    if refusal is not None:
+        refused.add(name)
+    return refusal
 
 
 def _log_restore_limits(
@@ -333,7 +338,10 @@ class _Explained(NamedTuple):
 
     explanations: list[StageExplanation]
     not_expanded: list[PipelineStatusInfo]
-    """A row for each mapped stage not yet expanded."""
+    """A row for each mapped stage not yet expanded that the run would expand."""
+    refused: list[PipelineStatusInfo]
+    """A row for each mapped stage the run refuses to expand (``_instance_output_refusal``): it
+    fails that stage with the row's reason and runs none of its instances."""
     orphans: dict[str, str]
     """Each orphaned instance the run would remove, mapped to its mapped stage."""
     left_out_targets: dict[str, exceptions.DependencyNotFoundError]
@@ -361,13 +369,13 @@ def _get_explanations(
     were left out and none is left, nothing is explained, as the run runs nothing. The mapped
     stages expand as the run would expand them: the missing tracked files the cache can restore
     count as present, and a template whose instances' outputs overlap a missing tracked file is
-    refused (``_instance_output_refusal``). A left-out stage, every instance of a left-out
-    mapped stage, its not-expanded row and its orphaned instances are not shown, and a left-out
-    stage changes no orphan the run would remove (``cli_helpers.eligible_templates`` over the
-    stages the run keeps). With ``--checkout-missing``, a notice on stderr names each mapped
-    stage shown as not yet expanded that the run may expand (``_log_restore_limits``). Any other
-    mode leaves out nothing (``_no_leave_out``), and a missing dependency stops it unless
-    ``allow_missing``.
+    refused (``_instance_output_refusal``): its row is in ``refused``, not ``not_expanded``, as
+    the run fails it. A left-out stage, every instance of a left-out mapped stage, its
+    not-expanded row and its orphaned instances are not shown, and a left-out stage changes no
+    orphan the run would remove (``cli_helpers.eligible_templates`` over the stages the run
+    keeps). With ``--checkout-missing``, a notice on stderr names each mapped stage shown as not
+    yet expanded that the run may expand (``_log_restore_limits``). Any other mode leaves out
+    nothing (``_no_leave_out``), and a missing dependency stops it unless ``allow_missing``.
 
     Shared by --explain and --dry-run modes.
     """
@@ -380,10 +388,12 @@ def _get_explanations(
     )
     if plan.left_out_targets and not plan.targets:
         # Every target is left out; no target would explain every stage
-        return _Explained([], [], {}, plan.left_out_targets)
+        return _Explained([], [], [], {}, plan.left_out_targets)
     pipeline = cli_helpers.get_pipeline()
     # Each stage of the producers' execution order that is not current
     not_current = set[str]()
+    # Each mapped stage the run refuses to expand, which it fails
+    refused = set[str]()
     result, known = cli_helpers.expand_mapped_stages(
         force=force,
         allow_missing=allow_missing,
@@ -394,6 +404,7 @@ def _get_explanations(
             missing=plan.found.missing,
             project_root=project.get_project_root(),
             checkout_attempted=checkout_missing,
+            refused=refused,
         ),
         not_current=not_current,
     )
@@ -447,7 +458,8 @@ def _get_explanations(
         known=known,
         restorable=plan.found.restorable,
     )
-    not_expanded = status_mod.not_expanded_status(kept, shown_templates)
+    rows = status_mod.not_expanded_status(kept, shown_templates)
+    not_expanded = [row for row in rows if row["name"] not in refused]
     _log_restore_limits(
         not_expanded,
         plan,
@@ -457,7 +469,13 @@ def _get_explanations(
         force=force,
         allow_missing=allow_missing,
     )
-    return _Explained(explanations, not_expanded, orphans, plan.left_out_targets)
+    return _Explained(
+        explanations,
+        not_expanded,
+        [row for row in rows if row["name"] in refused],
+        orphans,
+        plan.left_out_targets,
+    )
 
 
 def _output_explain(
@@ -491,6 +509,7 @@ def _output_explain(
     status_cli.output_explain_text(
         explained.explanations,
         not_expanded=explained.not_expanded,
+        refused=explained.refused,
         orphaned=status_mod.orphaned_status(cli_helpers.get_pipeline(), explained.orphans),
     )
     if explained.left_out_targets:
@@ -510,8 +529,9 @@ def _dry_run(
     checkout_missing: bool = False,
 ) -> None:
     """Show what would run without executing. A mapped stage not yet expanded would run: the
-    run expands it once its producer is current, then runs its instances. An instance whose key
-    left its producer's listing would be removed (``status.orphaned_instances``); nothing is.
+    run expands it once its producer is current, then runs its instances. A mapped stage the run
+    refuses to expand would not run: the run fails it. An instance whose key left its producer's
+    listing would be removed (``status.orphaned_instances``); nothing is.
 
     Raises:
         TargetsLeftOutError: In leave-out mode, after the output, naming each target the run
@@ -535,14 +555,18 @@ def _dry_run(
         leave_out=leave_out,
         checkout_missing=checkout_missing,
     )
-    explanations, not_expanded = explained.explanations, explained.not_expanded
+    explanations, not_expanded, refused = (
+        explained.explanations,
+        explained.not_expanded,
+        explained.refused,
+    )
     pipeline = cli_helpers.get_pipeline()
     removals = {
         instance: expansion.orphan_reason(pipeline.get_template(template))
         for instance, template in explained.orphans.items()
     }
 
-    if not explanations and not not_expanded and not removals:
+    if not explanations and not not_expanded and not refused and not removals:
         if as_json:
             click.echo(display.to_json(_run_common.DryRunJsonOutput(stages={})))
         else:
@@ -559,6 +583,10 @@ def _dry_run(
             (row["name"], _run_common.DryRunJsonStageOutput(would_run=True, reason=row["reason"]))
             for row in not_expanded
         )
+        stages.update(
+            (row["name"], _run_common.DryRunJsonStageOutput(would_run=False, reason=row["reason"]))
+            for row in refused
+        )
         output = _run_common.DryRunJsonOutput(stages=stages)
         if removals:
             output["would_remove"] = removals
@@ -572,6 +600,9 @@ def _dry_run(
         for row in not_expanded:
             reason = display.escape_control(row["reason"], keep_newlines=True)
             click.echo(f"  {row['name']}: would expand ({reason})")
+        for row in refused:
+            reason = display.escape_control(row["reason"], keep_newlines=True)
+            click.echo(f"  {row['name']}: would fail ({reason})")
         if removals:
             click.echo("Would remove:")
             for name, reason in removals.items():

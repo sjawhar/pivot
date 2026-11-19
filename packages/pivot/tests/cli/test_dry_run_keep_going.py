@@ -233,11 +233,14 @@ def test_dry_run_keep_going_refuses_a_mapped_stage_over_a_missing_tracked_file(
     tmp_path: pathlib.Path,
 ) -> None:
     """R3 for instances in the dry run: p/cut's instance p/cut@a would write over the missing
-    tracked file, so p/cut has one row, not yet expanded, with the reason the run fails it with,
-    and no instance is listed."""
+    tracked file, so the run fails p/cut with its refusal and adds no instance. The dry run shows
+    p/cut as one row that would not run, with the reason the run fails it with, and lists no
+    instance; its text says p/cut would fail, and so does --explain."""
     root, home = _refused_mapped_project(tmp_path)
 
     document, stderr = _dry_run(root, home)
+    text = _ok(helpers.run_pivot(root, home, "repro", "--all", "--keep-going", "--dry-run"))
+    explained = _ok(helpers.run_pivot(root, home, "repro", "--all", "--keep-going", "--explain"))
     ran, events = _run(root, home)
 
     stages = document["stages"]
@@ -253,7 +256,12 @@ def test_dry_run_keep_going_refuses_a_mapped_stage_over_a_missing_tracked_file(
         "cannot expand over the files of 'p/plan': The following tracked files are missing:\n"
     ), reason
     assert "data/p/cut@a.txt: it is output 'data/p/cut@a.txt' of stage 'p/cut@a'" in reason
-    assert stages["p/cut"] == {"would_run": True, "reason": f"Not yet expanded: {reason}"}, document
+    shown = f"Not yet expanded: {reason}"
+    assert stages["p/cut"] == {"would_run": False, "reason": shown}, document
+    assert f"  p/cut: would fail ({shown})\n" in text, text
+    assert "p/cut: would expand" not in text, text
+    assert f"Stage: p/cut\n  Status: WILL FAIL\n  Reason: {shown}\n" in explained, explained
+    assert "Summary: 0 will run, 1 unchanged, 1 will fail\n" in explained, explained
 
 
 def test_dry_run_keep_going_checks_only_the_instances_a_target_names(
