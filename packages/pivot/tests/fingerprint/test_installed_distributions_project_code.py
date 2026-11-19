@@ -45,9 +45,6 @@ _MYMOD = (
     'import pivot\n\n\ndef value():\n    return "mine-1"\n\n\n'
     '@pivot.fingerprint_by_name\ndef stamp():\n    return "h1"\n'
 )
-# The project's part of the namespace package `company`, and the installed `company.client`.
-_LOCAL = 'def value():\n    return "local-1"\n'
-_CLIENT = 'def value():\n    return "client-1"\n'
 # The package `foo` of a library's checkout, whose `value()` calls the installed `fixlib`.
 _FOO = 'import fixlib\n\n\ndef value():\n    return "foo-1:" + fixlib.value()\n'
 
@@ -100,7 +97,7 @@ with Pipeline("p") as pipeline:
 
 # What `mymod` and the project's part of `company` hold, each path relative to the directory
 # that holds them, and what the stage that calls them writes.
-_PROJECT_CODE = {"mymod/__init__.py": _MYMOD, "company/local.py": _LOCAL}
+_PROJECT_CODE = {"mymod/__init__.py": _MYMOD, "company/local.py": installed_dists.LOCAL}
 _PROJECT_CODE_OUTPUT = "mine-1:h1:client-1:value-1"
 
 
@@ -114,7 +111,7 @@ def _helper_install_libraries(venv: installed_dists.Venv, src: pathlib.Path) -> 
         "company-client",
         "0.1",
         packages=["company.client"],
-        files={"company/client/__init__.py": _CLIENT},
+        files={"company/client/__init__.py": installed_dists.CLIENT},
     )
     installed_dists.install(venv, str(fixlib), str(client))
 
@@ -278,7 +275,7 @@ def _helper_in_a_pythonpath_entry_with_a_target_install(
         pytest.param(
             _NAMESPACE_PIPELINE,
             [],
-            {"company/local.py": _LOCAL},
+            {"company/local.py": installed_dists.LOCAL},
             "client-1:value-1",
             id="shared-namespace",
         ),
@@ -380,7 +377,7 @@ def _helper_checkout_beside_a_target_install_without_record(
     there, which no RECORD lists beside `fixtarget`."""
     _helper_target_install_without_record(venv, tmp_path / "src", checkout)
     (checkout / "company").mkdir()
-    (checkout / "company" / "checkout.py").write_text(_LOCAL)
+    (checkout / "company" / "checkout.py").write_text(installed_dists.LOCAL)
     return installed_dists.UNLISTED_LOCAL_DIRECTORY_REFUSAL.format(
         module="company", file="company/checkout.py", site=checkout.resolve(), name="fixtarget"
     )

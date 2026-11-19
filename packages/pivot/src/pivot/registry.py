@@ -7,7 +7,7 @@ import json
 import logging
 import pathlib
 import posixpath
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict, runtime_checkable
 
 import pygtrie
 
@@ -48,6 +48,11 @@ class RegistryStageInfo(TypedDict):
         input_paths: Project-relative paths by input artifact identity, for the wiring manifest.
         unsafe_fingerprint: The fingerprint was computed with a refusal downgraded to a
             warning (unsafe fingerprinting), so the run cache neither files nor reuses results.
+        read_submodules: The submodules the stage reads through the library packages that hold
+            them (`fingerprint.read_submodules`), set with the fingerprint when the registry
+            computes it (`ensure_fingerprint`): the fingerprint, as a lock records it, leaves out
+            the entries that name them, and the coordinator sends each with the stage
+            (`executor.core.prepare_worker_info`). Absent while the fingerprint is not computed.
     """
 
     func: Callable[..., Any]
@@ -67,6 +72,7 @@ class RegistryStageInfo(TypedDict):
     code_deps: list[str]
     input_paths: dict[str, str]
     unsafe_fingerprint: bool
+    read_submodules: NotRequired[tuple[str, ...]]
 
 
 class MapTemplate(TypedDict):
@@ -536,9 +542,12 @@ def _check_output_path_free(
 
 
 def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict[str, str], bool]:
-    """Compute a stage fingerprint and whether a refusal in it was downgraded; wrap errors in one
-    that names the stage once, first: a refusal that starts with the stage's name is given without
-    it (`fingerprint.without_stage_prefix`)."""
+    """Compute a stage fingerprint as a lock records it and whether a refusal in it was
+    downgraded, and set `info["read_submodules"]` to the submodules the stage reads through the
+    library packages that hold them (`fingerprint.read_submodules`), read from the whole manifest
+    on a manifest-cache hit or miss alike; wrap errors in one that names the stage once, first: a
+    refusal that starts with the stage's name is given without it
+    (`fingerprint.without_stage_prefix`)."""
     try:
         with fingerprint.stage_fingerprint_scope(stage_name) as scope:
             no_fp = info["no_fingerprint"]
@@ -561,6 +570,7 @@ def _compute_fingerprint(stage_name: str, info: RegistryStageInfo) -> tuple[dict
             # After every loader's `byname:` entries joined the stage's, on a manifest-cache hit or
             # miss alike: a reinstall to the same path changes no file a hit re-checks.
             fingerprint.add_distribution_keys(result)
+        info["read_submodules"] = tuple(sorted(fingerprint.read_submodules(result)))
         return fingerprint.without_by_name(result), scope["unsafe"]
     except Exception as exc:
         message = fingerprint.without_stage_prefix(str(exc), stage_name)

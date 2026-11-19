@@ -889,6 +889,28 @@ class WorkerStageInfo(TypedDict):
     # carries them again only when the coordinator loaded code after that.
     loaded_sources_token: str
     loaded_sources: NotRequired[dict[str, str]]
+    # The submodules the stage reads through the library packages that hold them
+    # (`loaded_source.submodules_to_send`), set when there is one. One cloudpickle sends by value
+    # arrives as a new module object that no package holds, so the worker binds each on its
+    # package before the stage runs (`_bind_sent_submodules`); one it sends by reference is
+    # imported by name as the stage is unpickled, which binds it.
+    sent_submodules: NotRequired[tuple[ModuleType, ...]]
+
+
+def _bind_sent_submodules(modules: Sequence[ModuleType]) -> None:
+    """Bind each of `modules` (`WorkerStageInfo.sent_submodules`) on its package, where this
+    process holds the package, as the import of a submodule binds it there: code that reads it
+    through the package (`import company.local` in the stage's module, `company.local.f()` in its
+    code) then finds it, as a plain run of that code does. A module that unpickling imported by
+    name is bound there already. Nothing is imported and `sys.modules` is left as it is, so the
+    import checks see what they saw without it. A package this process does not hold is left
+    alone: nothing the stage's pickle holds refers to it, and a stage body that imports it imports
+    it without the module (a stated limit)."""
+    for module in modules:
+        package, _, attribute = module.__name__.rpartition(".")
+        parent = sys.modules.get(package)
+        if parent is not None:
+            setattr(parent, attribute, module)
 
 
 def _make_result(
@@ -924,6 +946,10 @@ def _execute_stage(
     """
     # Clear metrics at start - each stage collects its own metrics
     metrics.clear()
+    # Before anything of the stage runs: its parameter overrides, input loaders, the stage itself
+    # and its output writers may read a sent module through its package.
+    if "sent_submodules" in stage_info:
+        _bind_sent_submodules(stage_info["sent_submodules"])
     # ``cache_dir`` is the cache root the engine resolved from config (the directory holding
     # ``files/``), as spelled there: the naming lock lives in it, the same file `pivot gc`
     # locks. The store's object root is resolved, so a ``files`` symlink would move its parent.

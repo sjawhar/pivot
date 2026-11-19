@@ -609,6 +609,37 @@ def _held_suspects(
     return suspects
 
 
+def submodules_to_send(names: Iterable[str]) -> tuple[types.ModuleType, ...]:
+    """The modules a stage's worker must find bound on their packages before the stage runs, sent
+    with the stage: each of `names`, the submodules the stage reads through the library packages
+    that hold them (`fingerprint.read_submodules`, which the registry keeps beside the stage's
+    fingerprint), as this process's package holds it (read through the package's namespace, so no
+    `__getattr__` runs).
+
+    The worker imports such a package by name (a namespace package the project shares with an
+    installed library, or a library package whose `__init__` extends its `__path__` over the
+    project's directory), and code that reads the module through it (`import company.local`, then
+    `company.local.f()`) finds there only what something bound, where a plain run of the same code
+    finds the module its import bound. cloudpickle builds a module it sends by value (the
+    project's, under its root) as a new module object that no package holds, which the worker
+    binds (`worker._bind_sent_submodules`). A module it sends by reference (the project's in a
+    `PYTHONPATH` entry or a `src` layout, or a library's) the worker imports by name as it
+    unpickles the stage, which binds it, also where cloudpickle alone would not: a read only inside
+    a nested function or a lambda, whose names cloudpickle does not follow. The module objects
+    travel in the stage's pickle, so each one sent by value is the one the stage's own functions
+    hold (`from company import local`). A module the stage reaches by other names only
+    (`from company.local import f`) is not sent, so sending adds none of its module-level values,
+    which the stage may not read and cloudpickle may not be able to pickle, to the stage's pickle."""
+    sent = list[types.ModuleType]()
+    for name in sorted(names):
+        package, _, attribute = name.rpartition(".")
+        parent = sys.modules.get(package)
+        module = vars(parent).get(attribute) if isinstance(parent, types.ModuleType) else None
+        if isinstance(module, types.ModuleType) and vars(module).get("__name__") == name:
+            sent.append(module)
+    return tuple(sent)
+
+
 def _pickled_by_value(name: str, registry: set[str]) -> bool:
     """Whether cloudpickle sends module `name` by value: it or one of its packages is
     registered (as `cloudpickle.cloudpickle._is_registered_pickle_by_value` decides)."""

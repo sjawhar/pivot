@@ -560,7 +560,7 @@ def prepare_worker_info(
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
     state_dir_mod.make_state_dir(state_dir)
 
-    # The fingerprint is computed first: it sets `unsafe_fingerprint`.
+    # The fingerprint is computed first: it sets `unsafe_fingerprint` and `read_submodules`.
     fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
     info = worker.WorkerStageInfo(
         func=stage_info["func"],
@@ -588,6 +588,11 @@ def prepare_worker_info(
     # The workers started with other digests: the coordinator loaded user code since then.
     if (digests := loaded_source.digests_for_stage()) is not None:
         info["loaded_sources"] = digests
+    # The submodules the stage reads through the library packages the worker imports by name,
+    # which the worker must find bound there: absent only for a stage whose fingerprint the
+    # registry did not compute.
+    if submodules := loaded_source.submodules_to_send(stage_info.get("read_submodules", ())):
+        info["sent_submodules"] = submodules
     return info
 
 
