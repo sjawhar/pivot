@@ -288,6 +288,41 @@ def test_worker_waits_for_artifact_lock_the_coordinator_holds(
 # here, so a lookup of any line of the module raises it too.
 _LATIN_1_MODULE = "# -*- coding: latin-1 -*-\n# caf\xe9\n{raises}\n"
 
+# The source of a module whose import raises `Raised.Error("boom")`, whose class's `__notes__`
+# property, which describing the error reads, raises `{notes_raise}`.
+_NOTES_RAISE = (
+    "from pivot.executor import worker\n\n"
+    + "class Raised:\n"
+    + "    class Error(Exception):\n"
+    + "        @property\n"
+    + "        def __notes__(self):\n"
+    + "            raise {notes_raise}\n\n"
+    + 'raise Raised.Error("boom")'
+)
+
+
+def _zipped_package(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, raises: str
+) -> ModuleType:
+    """`sent_zipped`, a package in a zip on `sys.path`, held in `sys.modules` as the worker holds a
+    package it imported. Its submodule `sent_zipped.latin`, `_LATIN_1_MODULE` running `raises`, is
+    not in `sys.modules`: were an earlier case's import of it to succeed, the module it left there
+    is removed, so each case imports it afresh."""
+    archive = tmp_path / "lib.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("sent_zipped/__init__.py", "")
+        zf.writestr("sent_zipped/latin.py", _LATIN_1_MODULE.format(raises=raises).encode("latin-1"))
+    # zipimport keeps each archive's directory by its path; the test's archive leaves none there.
+    monkeypatch.setattr(zipimport, "_zip_directory_cache", {})
+    monkeypatch.syspath_prepend(str(archive))
+    spec = importlib.util.find_spec("sent_zipped")
+    assert spec is not None and spec.loader is not None
+    package = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "sent_zipped", package)
+    spec.loader.exec_module(package)
+    monkeypatch.delitem(sys.modules, "sent_zipped.latin", raising=False)
+    return package
+
 
 @pytest.mark.parametrize(
     ("raises", "raised"),
@@ -306,6 +341,11 @@ _LATIN_1_MODULE = "# -*- coding: latin-1 -*-\n# caf\xe9\n{raises}\n"
             "RuntimeError: boom",
             id="raises-while-handling-an-error",
         ),
+        pytest.param(
+            _NOTES_RAISE.format(notes_raise="SystemExit(1)"),
+            "Raised.Error",
+            id="raises-an-error-whose-notes-raise-system-exit",
+        ),
     ],
 )
 def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line(
@@ -320,24 +360,16 @@ def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line
     raises `RuntimeError`: with the message `boom` (`raises`), `boom` and a newline
     (`raises-ending-in-a-newline`) or `boom`, a newline and `  again`
     (`raises-with-an-indented-line`), or with `boom` while it handles a `KeyError` it raised
-    (`raises-while-handling-an-error`). Entering `_sent_submodules_bound` logs one warning, which
-    gives the error's type and message on one line (`RuntimeError: boom`, or
-    `RuntimeError: boom again`), each line of the message stripped and no empty line joined,
-    binds nothing and does not raise. Were the warning's text built with a line of the module
-    looked up, for the error's traceback or for the error it chains, the lookup would raise
-    `UnicodeDecodeError` out of `_sent_submodules_bound`."""
-    archive = tmp_path / "lib.zip"
-    with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("sent_zipped/__init__.py", "")
-        zf.writestr("sent_zipped/latin.py", _LATIN_1_MODULE.format(raises=raises).encode("latin-1"))
-    # zipimport keeps each archive's directory by its path; the test's archive leaves none there.
-    monkeypatch.setattr(zipimport, "_zip_directory_cache", {})
-    monkeypatch.syspath_prepend(str(archive))
-    spec = importlib.util.find_spec("sent_zipped")
-    assert spec is not None and spec.loader is not None
-    package = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, "sent_zipped", package)
-    spec.loader.exec_module(package)
+    (`raises-while-handling-an-error`); or it raises `Raised.Error`, whose class's `__notes__`
+    property raises `SystemExit` (`raises-an-error-whose-notes-raise-system-exit`). Entering
+    `_sent_submodules_bound` logs one warning, which gives the error's type and message on one
+    line (`RuntimeError: boom`, or `RuntimeError: boom again`), each line of the message stripped
+    and no empty line joined, or the type's qualified name alone (`Raised.Error`) where
+    describing the error raises, binds nothing and does not raise. Were the warning's text built
+    with a line of the module looked up, for the error's traceback or for the error it chains,
+    the lookup would raise `UnicodeDecodeError` out of `_sent_submodules_bound`; so would the
+    `SystemExit` that describing `Raised.Error` raises, were it not caught."""
+    package = _zipped_package(tmp_path, monkeypatch, raises)
 
     escaped = None
     with caplog.at_level(logging.WARNING, logger=worker.logger.name):
@@ -346,7 +378,7 @@ def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line
         try:
             with worker._sent_submodules_bound(["sent_zipped.latin"]):
                 pass
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             escaped = f"{type(exc).__name__}: {exc}"
 
     assert (
@@ -367,6 +399,43 @@ def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line
         False,
         False,
     )
+
+
+@pytest.mark.parametrize(
+    "raises",
+    [
+        pytest.param(
+            "from pivot.executor import worker\n\nraise worker.WorkerTerminated", id="import"
+        ),
+        pytest.param(_NOTES_RAISE.format(notes_raise="worker.WorkerTerminated"), id="description"),
+    ],
+)
+def test_an_interrupt_while_a_submodule_sent_by_name_is_imported_or_its_error_described_stays_one(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raises: str,
+) -> None:
+    """`WorkerTerminated`, the interrupt of the stage's run, raised by the import of
+    `sent_zipped.latin`, sent by name (`import`), or by the `__notes__` property of the error that
+    import raises, as the warning's text describes the error (`description`), leaves
+    `_sent_submodules_bound`: no warning is logged and nothing is bound."""
+    package = _zipped_package(tmp_path, monkeypatch, raises)
+
+    escaped = None
+    with caplog.at_level(logging.WARNING, logger=worker.logger.name):
+        try:
+            with worker._sent_submodules_bound(["sent_zipped.latin"]):
+                pass
+        except worker.WorkerTerminated as exc:
+            escaped = type(exc)
+
+    assert (
+        escaped,
+        [(record.levelno, record.getMessage()) for record in caplog.records],
+        "latin" in vars(package),
+        "sent_zipped.latin" in sys.modules,
+    ) == (worker.WorkerTerminated, [], False, False)
 
 
 # =============================================================================

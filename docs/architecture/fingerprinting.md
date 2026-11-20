@@ -255,8 +255,10 @@ else is pickled again, and a stage that reads none pays nothing.
   that cannot run twice, a file broken during the run) logs one warning in the stage's output,
   naming the module and the error's type and message, on one line (`Could not import module
   'company.local', which the stage reads through its package: RuntimeError: a second import. The
-  module is not bound on its package, so code that reads it through the package fails.`), binds
-  nothing for it, and the stage runs. A stage that reads the module then fails with
+  module is not bound on its package, so code that reads it through the package fails.`; the
+  error's type name alone where describing the error itself raises, as for an error class whose
+  `__notes__` property raises `SystemExit`), binds nothing for it, and the stage runs. A stage
+  that reads the module then fails with
   `AttributeError: module 'company' has no attribute 'local'`, as in Pivot 0.10.4, which binds
   nothing on the package, with the warning in its output; a stage that does not read it in that
   run runs, as in 0.10.4. Other stages run on.

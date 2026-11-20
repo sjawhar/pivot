@@ -949,6 +949,31 @@ class WorkerStageInfo(TypedDict):
     sent_submodules: NotRequired[tuple[ModuleType | str, ...]]
 
 
+def _error_on_one_line(exc: BaseException) -> str:
+    """The type and message of `exc` on one line: the last entry of its description (a
+    `SyntaxError`'s follows the lines that place it), its notes left out and the non-empty lines
+    of a message, each stripped, joined by spaces. It is described as
+    `traceback.format_exception_only` describes an error, with no traceback, and with no source
+    line looked up for an error it chains: a lookup can raise (`zipimporter` decodes a module's
+    source as UTF-8 whatever its coding cookie says).
+
+    Describing it runs the error's own code (a `__notes__` property, the `__dir__` it reads for a
+    suggestion), where CPython's description catches only an `Exception`. Where describing it
+    raises anything else, the text is the name of its type (`__qualname__`), except for
+    `WorkerTerminated`, which is raised: an interrupt of the run stays one."""
+    try:
+        described = traceback.TracebackException(
+            type(exc), exc, None, compact=True, lookup_lines=False
+        )
+        described.__notes__ = None
+        entry = list(described.format_exception_only())[-1]
+    except WorkerTerminated:
+        raise
+    except BaseException:
+        return type(exc).__qualname__
+    return " ".join(line.strip() for line in entry.splitlines() if line.strip())
+
+
 @contextlib.contextmanager
 def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[None]:
     """Bind each of `submodules` (`WorkerStageInfo.sent_submodules`, a package before its
@@ -962,15 +987,16 @@ def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[
     package where it loads it; `sys.modules` holds what that import put there, as after any
     import. Where that import raises (any `Exception`, `SystemExit` or `KeyboardInterrupt`), one
     warning, logged into the stage's output (`_queue_logging`), names the module and the error's
-    type and message, on one line, nothing is bound for it, and the stage runs: code that reads
-    the module through its package fails there with `AttributeError`, as in Pivot 0.10.4, which
-    binds nothing on the package; a run that does not read it runs. An interrupt of the run
-    (`WorkerTerminated`) stays one. A module sent by value is bound as it came, with no import,
-    and adds nothing to `sys.modules`. A module is bound only where this process holds its
-    package (`sys.modules`) and the package holds no attribute of that name, read through `vars`
-    so no `__getattr__` runs: a module an import in this process bound there (a helper the worker
-    imports by name that runs `from company.local import Mode`) is the copy that code holds, and
-    stays.
+    type and message, on one line (`_error_on_one_line`: the type's name alone where describing
+    the error raises), nothing is bound for it, and the stage runs: code that reads the module
+    through its package fails there with `AttributeError`, as in Pivot 0.10.4, which binds
+    nothing on the package; a run that does not read it runs. An interrupt of the run
+    (`WorkerTerminated`), raised by the import or while the error is described, stays one. A
+    module sent by value is bound as it came, with no import, and adds nothing to `sys.modules`.
+    A module is bound only where this process holds its package (`sys.modules`) and the package
+    holds no attribute of that name, read through `vars` so no `__getattr__` runs: a module an
+    import in this process bound there (a helper the worker imports by name that runs
+    `from company.local import Mode`) is the copy that code holds, and stays.
 
     On the way out, also when the stage fails or an interrupt leaves before the stage starts, each
     binding made here is removed where the package still holds that module, so no later stage of
@@ -986,26 +1012,12 @@ def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[
                 except WorkerTerminated:
                     raise
                 except (Exception, SystemExit, KeyboardInterrupt) as exc:
-                    # The error's type and message, on one line: the last entry of its
-                    # description (a `SyntaxError`'s follows the lines that place it), its notes
-                    # left out and the non-empty lines of a message, each stripped, joined by
-                    # spaces. It is described as `traceback.format_exception_only` describes an
-                    # error, with no traceback, and with no source line looked up for an error it
-                    # chains: a lookup can raise (`zipimporter` decodes a module's source as UTF-8
-                    # whatever its coding cookie says), and its error would leave here instead of
-                    # this warning.
-                    described = traceback.TracebackException(
-                        type(exc), exc, None, compact=True, lookup_lines=False
-                    )
-                    described.__notes__ = None
-                    entry = list(described.format_exception_only())[-1]
-                    raised = " ".join(line.strip() for line in entry.splitlines() if line.strip())
                     logger.warning(
                         "Could not import module '%s', which the stage reads through its "
                         + "package: %s. The module is not bound on its package, so code that "
                         + "reads it through the package fails.",
                         submodule,
-                        raised,
+                        _error_on_one_line(exc),
                     )
                     continue
             package, _, attribute = module.__name__.rpartition(".")
