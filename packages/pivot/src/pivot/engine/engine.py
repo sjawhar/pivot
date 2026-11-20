@@ -1644,6 +1644,8 @@ class Engine:
             )
             and not self._watches_filesystem()
         )
+        # Each returned path whose restore failed, which the run's refusals name as such
+        restore_failed = set[str]()
         missing_tracked = executor_core.verify_tracked_files(
             project_root,
             checkout_missing=checkout_missing,
@@ -1652,6 +1654,7 @@ class Engine:
             ),
             tolerate_missing=leave_out,
             outputs=ownership.stage_output_paths(project_root, all_stages) if leave_out else None,
+            restore_failed=restore_failed,
         )
 
         # Build bipartite graph (single source of truth). A template is a node of it, reading
@@ -1851,6 +1854,7 @@ class Engine:
                 checks=expansion.InstanceChecks(
                     wanted=wanted,
                     missing_tracked=missing_tracked,
+                    restore_failed=restore_failed,
                     project_root=project_root,
                     checkout_missing=checkout_missing,
                     allow_uncached_incremental=allow_uncached_incremental,

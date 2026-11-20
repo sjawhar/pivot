@@ -1025,6 +1025,7 @@ def tracked_output_refusal(
     project_root: pathlib.Path,
     *,
     checkout_attempted: bool,
+    restore_failed: Collection[str],
 ) -> exceptions.TrackedFileMissingError | None:
     """The refusal of the stages whose outputs ``outputs`` holds, or None: a missing tracked
     path of ``missing`` (absolute normalized paths, as ``track.discover_pvt_files`` gives them)
@@ -1032,7 +1033,9 @@ def tracked_output_refusal(
     path's sidecar. ``outputs`` maps the ``normalized`` path of each output to the stage that
     writes it (``stage_output_paths``). The error names each such path and how it overlaps
     (``_tracked_output_overlaps``); ``checkout_attempted`` says whether a restore
-    (``--checkout-missing``) tried those paths first. Every check of missing tracked files
+    (``--checkout-missing``) tried those paths first, and ``restore_failed`` holds each path of
+    ``missing`` whose restore failed (``executor.restore.Outcome.FAILED``), which the error names
+    as such rather than as one the local cache lacks. Every check of missing tracked files
     against stage outputs builds its refusal here: the run start's check of the loaded stages
     (``executor.core.verify_tracked_files``), the run's check of a mapped stage's planned
     instances (``Engine._expand_template``) and the dry run's check of both
@@ -1043,8 +1046,12 @@ def tracked_output_refusal(
     overlaps = _tracked_output_overlaps(missing, outputs, project_root)
     if not overlaps:
         return None
+    failed = set(restore_failed)
     return exceptions.TrackedFileMissingError(
-        list(overlaps), checkout_attempted=checkout_attempted, overlaps=overlaps
+        list(overlaps),
+        checkout_attempted=checkout_attempted,
+        overlaps=overlaps,
+        restore_failed=[path for path in overlaps if path in failed],
     )
 
 

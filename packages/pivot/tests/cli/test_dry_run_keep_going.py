@@ -10,6 +10,7 @@ run's stages are its `stage_complete` events.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,7 @@ import pytest
 import yaml
 
 from pivot import registry
+from pivot.storage import cache, track
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -242,6 +244,11 @@ def _skipping_lines(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if "Skipping:" in line]
 
 
+def _restore_warnings(stderr: str) -> list[str]:
+    """Each `Cannot restore` warning line of ``stderr``: a tracked path a restore left missing."""
+    return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
+
+
 @pytest.mark.parametrize("mode", ["plain", "uncached-incremental", "stale-producer"])
 def test_dry_run_keep_going_leaves_out_a_mapped_stage_and_its_orphan(
     tmp_path: pathlib.Path, mode: str
@@ -386,6 +393,70 @@ def test_dry_run_keep_going_refuses_a_mapped_stage_over_a_missing_tracked_file(
     assert "Summary: 0 will run, 1 unchanged, 1 will fail, 2 will be blocked\n" in explained, (
         explained
     )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a cache object whatever its mode")
+def test_dry_run_keep_going_names_a_failed_restore_under_a_mapped_stage_as_the_run_does(
+    tmp_path: pathlib.Path,
+) -> None:
+    """R3 for instances with --checkout-missing: data/p/cut@a.txt, the output p/cut@a would
+    write, is a missing tracked file whose cache object this user cannot read (0o000), so the
+    run start's restore fails and leaves it missing. The run fails p/cut with its refusal, which
+    names the file as one whose restore failed, not one the local cache lacks; the dry run on
+    the same tree shows p/cut with that same reason, and each warns once that it cannot restore
+    the file."""
+    root, home = _refused_mapped_project(tmp_path)
+    tracked = root / "data" / "p" / "cut@a.txt"
+    record = track.read_pvt_file(track.get_pvt_path(tracked))
+    assert record is not None
+    cache_object = cache.get_cache_path(root / ".pivot" / "cache" / "files", record["hash"])
+
+    cache_object.chmod(0)
+    try:
+        dry_run = helpers.run_pivot(
+            root,
+            home,
+            "repro",
+            "--all",
+            "--keep-going",
+            "--checkout-missing",
+            "--dry-run",
+            "--jsonl",
+        )
+        ran = helpers.run_pivot(
+            root, home, "repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"
+        )
+    finally:
+        cache_object.chmod(0o444)
+
+    assert ran.returncode == 1, ran.stdout + ran.stderr
+    completed = {
+        event["stage"]: event
+        for event in (json.loads(line) for line in ran.stdout.splitlines())
+        if event["type"] == "stage_complete"
+    }
+    assert {stage: event["status"] for stage, event in completed.items()} == {
+        "p/plan": "cached",
+        "p/cut": "failed",
+    }, ran.stdout
+    reason = completed["p/cut"]["reason"]
+    assert (
+        "data/p/cut@a.txt: it is output 'data/p/cut@a.txt' of stage 'p/cut@a'; its restore "
+        + "failed\n\nTheir restore failed: a 'Cannot restore' warning above names each cause.\n"
+    ) in reason, reason
+    assert "not in local cache" not in reason, reason
+    _ok(dry_run)
+    assert json.loads(dry_run.stdout) == {
+        "stages": {"p/plan": _UNCHANGED, "p/cut": {"would_run": False, "reason": reason}}
+    }, dry_run.stdout
+    # The run's error names the path its checkout opened, which its link modes stage first
+    assert _restore_warnings(dry_run.stderr) == [
+        f"Cannot restore {tracked}: [Errno 13] Permission denied: '{cache_object}'"
+    ], dry_run.stderr
+    run_warnings = _restore_warnings(ran.stderr)
+    assert len(run_warnings) == 1, ran.stderr
+    assert run_warnings[0].startswith(f"Cannot restore {tracked}: [Errno 13] Permission denied: ")
+    assert not tracked.exists()
 
 
 def test_dry_run_keep_going_shows_a_mapped_stage_the_run_fails_for_any_refusal(

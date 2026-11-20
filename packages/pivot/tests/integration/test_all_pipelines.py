@@ -5,12 +5,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import pathlib
 import shutil
 import stat
 import threading
 from typing import TYPE_CHECKING
 
 import pytest
+import xxhash
 
 import pivot_tui.run
 from pivot import cli
@@ -19,9 +21,7 @@ from tests import helpers
 from tests.conftest import isolated_pivot_dir
 
 if TYPE_CHECKING:
-    import pathlib
-
-    from click.testing import CliRunner
+    from click.testing import CliRunner, Result
     from pytest_mock import MockerFixture
 
 
@@ -386,6 +386,67 @@ def _helper_restore_warnings(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
 
 
+def _helper_checkout_missing_dry_run_and_run(runner: CliRunner) -> tuple[Result, Result]:
+    """`pivot repro --all --keep-going --checkout-missing` in the current project, as a dry run
+    (``--dry-run --jsonl``) and then as a run (``--jsonl``), after checking that the dry run
+    restored nothing: the workspace under data/ holds the same entries after it."""
+    before = sorted(pathlib.Path("data").rglob("*"))
+    dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
+    assert sorted(pathlib.Path("data").rglob("*")) == before, "a dry run restores nothing"
+    ran = runner.invoke(
+        cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+    )
+    return dry_run, ran
+
+
+def _helper_assert_only_alpha_runs(dry_run: Result, ran: Result, skipped: list[str]) -> None:
+    """The dry run exits 0 and lists alpha/stage_a alone, the run on the same tree exits 0 and
+    runs alpha/stage_a alone, and each gives exactly the `Skipping:` lines ``skipped``."""
+    assert dry_run.exit_code == 0, dry_run.output
+    assert json.loads(dry_run.stdout) == {
+        "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
+    }, dry_run.output
+    assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
+    assert ran.exit_code == 0, ran.output
+    completed = helpers.completed_stages(ran.stdout)
+    assert {stage: event["status"] for stage, event in completed.items()} == {
+        "alpha/stage_a": "ran"
+    }, ran.output
+    assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
+
+
+# dirs/scan reads data/raw/images, a missing tracked directory
+_IMAGES_SKIPPED = [
+    "Skipping: Stage 'dirs/scan' depends on input 'images' (path data/raw/images), which does "
+    + "not exist"
+]
+
+
+def _helper_tracked_images_project(runner: CliRunner, root: pathlib.Path) -> pathlib.Path:
+    """dirs/scan reads data/raw/images, a directory holding a.png that `pivot track` tracked and
+    that is then removed, and alpha/stage_a is healthy. Returns the path of the listing's object
+    in the cache."""
+    helpers.write_pipeline(root, "dirs", _helper_directory_reader_code("images"))
+    helpers.write_pipeline(root, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+    images = root / "data" / "raw" / "images"
+    images.mkdir(parents=True)
+    (images / "a.png").write_text("a")
+    tracking = runner.invoke(cli.cli, ["track", "data/raw/images"])
+    assert tracking.exit_code == 0, tracking.output
+    shutil.rmtree(images)
+    record = track.read_pvt_file(track.get_pvt_path(images))
+    assert record is not None
+    return cache.get_cache_path(root / ".pivot" / "cache" / "files", record["hash"])
+
+
+def _helper_make_listing_stale(root: pathlib.Path) -> pathlib.Path:
+    """Make data/raw/images' committed listing stale (it no longer hashes to the .pvt's record);
+    return its path."""
+    committed = root / "data" / "raw" / "images.pvt.listing"
+    committed.write_bytes(committed.read_bytes().replace(b"a.png", b"b.png"))
+    return committed
+
+
 @pytest.mark.parametrize("committed", ["stale", "empty"])
 def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_lost_listing(
     runner: CliRunner, tmp_path: pathlib.Path, committed: str
@@ -397,52 +458,136 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_los
     dry run with --checkout-missing exits 0, lists alpha alone, and gives the same warning and
     the same line."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
-        helpers.write_pipeline(cwd, "dirs", _helper_directory_reader_code("images"))
-        helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+        _helper_tracked_images_project(runner, cwd).unlink()
+        if committed == "stale":
+            committed_listing = _helper_make_listing_stale(cwd)
+        else:
+            committed_listing = cwd / "data" / "raw" / "images.pvt.listing"
+            committed_listing.write_bytes(b"")
+
+        dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+
+        _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
         images = cwd / "data" / "raw" / "images"
-        images.mkdir(parents=True)
-        (images / "a.png").write_text("a")
-        tracking = runner.invoke(cli.cli, ["track", "data/raw/images"])
-        assert tracking.exit_code == 0, tracking.output
-        shutil.rmtree(images)
-        committed_listing = cwd / "data" / "raw" / "images.pvt.listing"
-        committed_listing.write_bytes(
-            committed_listing.read_bytes().replace(b"a.png", b"b.png")
-            if committed == "stale"
-            else b""
-        )
-        record = track.read_pvt_file(track.get_pvt_path(images))
-        assert record is not None
-        cache.get_cache_path(cwd / ".pivot" / "cache" / "files", record["hash"]).unlink()
-
-        dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
-        ran = runner.invoke(
-            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
-        )
-
-        skipped = [
-            "Skipping: Stage 'dirs/scan' depends on input 'images' (path data/raw/images), "
-            + "which does not exist"
-        ]
-        assert dry_run.exit_code == 0, dry_run.output
-        assert json.loads(dry_run.stdout) == {
-            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
-        }, dry_run.output
-        assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
         warnings = _helper_restore_warnings(dry_run.stderr)
         assert len(warnings) == 1, dry_run.output
         assert warnings[0].startswith(
             f"Cannot restore {images}: {committed_listing}: its bytes hash to "
         ), dry_run.output
-        assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
-            "alpha/stage_a": "ran"
-        }, ran.output
-        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
-        assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
         assert _helper_restore_warnings(ran.stderr) == warnings, ran.output
         assert not images.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a cache object whatever its mode")
+@pytest.mark.parametrize("committed", ["intact", "stale"])
+@pytest.mark.parametrize("unreadable", ["object", "prefix_directory"])
+def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_an_unreadable_listing(
+    runner: CliRunner, tmp_path: pathlib.Path, committed: str, unreadable: str
+) -> None:
+    """R1, R5: dirs/scan reads data/raw/images, a missing tracked directory whose listing object
+    in the cache this user cannot read: the object's mode, or its prefix directory's, is 0o000.
+    Its committed listing is intact (the restore still reads the cache's copy, to check it for a
+    collision) or stale. The run's --checkout-missing restore cannot read the listing: it warns
+    once, naming the path and the permission error with no listing remedy, leaves dirs/scan out
+    with a `Skipping:` line, runs alpha and exits 0. The dry run with --checkout-missing exits 0,
+    lists alpha alone, and gives the same warning and the same line."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        listing_object = _helper_tracked_images_project(runner, cwd)
+        if committed == "stale":
+            _helper_make_listing_stale(cwd)
+        locked = listing_object if unreadable == "object" else listing_object.parent
+        mode = stat.S_IMODE(locked.stat().st_mode)
+
+        locked.chmod(0)
+        try:
+            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+        finally:
+            locked.chmod(mode)
+
+        _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
+        images = cwd / "data" / "raw" / "images"
+        warning = (
+            f"Cannot restore {images}: {listing_object}: cannot be read ([Errno 13] Permission "
+            + f"denied: '{listing_object}')"
+        )
+        assert _helper_restore_warnings(dry_run.stderr) == [warning], dry_run.output
+        assert _helper_restore_warnings(ran.stderr) == [warning], ran.output
+        assert not images.exists()
+
+
+@pytest.mark.parametrize("committed", ["intact", "stale"])
+def test_tracked_keep_going_and_dry_run_keep_going_stop_on_a_cached_listing_that_does_not_hash(
+    runner: CliRunner, tmp_path: pathlib.Path, committed: str
+) -> None:
+    """R5, D1: data/raw/images is a missing tracked directory whose listing object in the cache
+    holds bytes that do not hash to the .pvt's record, beside an intact or a stale committed
+    listing. That is a corrupt listing, not a lost or unreadable one: the run's
+    --checkout-missing restore stops on it before any stage runs, and so does the dry run, with
+    the same error and no document."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        listing_object = _helper_tracked_images_project(runner, cwd)
+        if committed == "stale":
+            _helper_make_listing_stale(cwd)
+        listing_object.unlink()
+        listing_object.write_bytes(b"junk\n")
+        record = track.read_pvt_file(cwd / "data" / "raw" / "images.pvt")
+        assert record is not None
+
+        dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+
+        problem = (
+            f"Error: {listing_object}: its bytes hash to {xxhash.xxh64(b'junk\n').hexdigest()}, "
+            + f"not to the directory hash {record['hash']} its lock or .pvt records\n"
+        )
+        assert dry_run.exit_code == 1, dry_run.output
+        assert problem in dry_run.stderr, dry_run.output
+        assert dry_run.stdout == "", dry_run.output
+        assert ran.exit_code == 1, ran.output
+        assert problem in ran.stderr, ran.output
+        assert _helper_restore_warnings(dry_run.stderr + ran.stderr) == []
+        assert not (cwd / "data" / "alpha" / "stage_a.txt").exists(), "the run runs no stage"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes in a read-only directory")
+def test_tracked_keep_going_and_dry_run_keep_going_name_a_failed_restore_over_an_output(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R3, R5: data/alpha/stage_a.txt, alpha/stage_a's output, is a missing tracked file whose
+    object the cache holds, in the read-only directory data/alpha. The run's --checkout-missing
+    restore fails, so the file stays missing over an output and the run stops before any stage
+    runs; the dry run stops with the same error. The error names the file as one whose restore
+    failed, not one the local cache lacks, and suggests no pull."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        tracked = cwd / "data" / "alpha" / "stage_a.txt"
+        tracked.parent.mkdir(parents=True)
+        tracked.write_text("tracked bytes")
+        # Tracked before alpha declares the output: `pivot track` refuses a path an output holds
+        tracking = runner.invoke(cli.cli, ["track", "data/alpha/stage_a.txt"])
+        assert tracking.exit_code == 0, tracking.output
+        tracked.unlink()
+        helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+
+        tracked.parent.chmod(0o555)
+        try:
+            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+        finally:
+            tracked.parent.chmod(0o755)
+
+        refusal = (
+            "data/alpha/stage_a.txt: it is output 'data/alpha/stage_a.txt' of stage "
+            + "'alpha/stage_a'; its restore failed\n\n"
+            + "Their restore failed: a 'Cannot restore' warning above names each cause.\n"
+        )
+        tip = "Tip: Fix what each 'Cannot restore' warning above names, then run again"
+        for result in (dry_run, ran):
+            assert result.exit_code == 1, result.output
+            assert refusal in result.stderr, result.output
+            assert tip in result.stderr, result.output
+            assert "not in local cache" not in result.output, result.output
+            assert "pivot pull" not in result.output, result.output
+            assert len(_helper_restore_warnings(result.stderr)) == 1, result.output
+        assert dry_run.stdout == "", dry_run.output
+        assert not tracked.exists()
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes in a read-only directory")
@@ -472,32 +617,21 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_rea
 
         locked.chmod(0o555)
         try:
-            dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
-            ran = runner.invoke(
-                cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
-            )
+            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
         finally:
             locked.chmod(0o755)
 
-        skipped = [
-            "Skipping: Stage 'kept/read_0' depends on input 'locked/cached.txt' "
-            + "(path data/raw/locked/cached.txt), which does not exist"
-        ]
-        assert dry_run.exit_code == 0, dry_run.output
-        assert json.loads(dry_run.stdout) == {
-            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
-        }, dry_run.output
-        assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
+        _helper_assert_only_alpha_runs(
+            dry_run,
+            ran,
+            [
+                "Skipping: Stage 'kept/read_0' depends on input 'locked/cached.txt' "
+                + "(path data/raw/locked/cached.txt), which does not exist"
+            ],
+        )
         assert _helper_restore_warnings(dry_run.stderr) == [
             f"Cannot restore {cached}: this user cannot write in {locked}"
         ], dry_run.output
-        assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
-            "alpha/stage_a": "ran"
-        }, ran.output
-        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
-        assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
         warnings = _helper_restore_warnings(ran.stderr)
         assert len(warnings) == 1, ran.output
         assert warnings[0].startswith(
@@ -537,38 +671,102 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_an_un
 
         locked.chmod(0)
         try:
-            dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
-            ran = runner.invoke(
-                cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
-            )
+            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
         finally:
             locked.chmod(mode)
 
-        skipped = [
-            "Skipping: Stage 'kept/read_0' depends on input 'cached.txt' "
-            + "(path data/raw/cached.txt), which does not exist"
-        ]
-        assert dry_run.exit_code == 0, dry_run.output
-        assert json.loads(dry_run.stdout) == {
-            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
-        }, dry_run.output
-        assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
+        _helper_assert_only_alpha_runs(
+            dry_run,
+            ran,
+            [
+                "Skipping: Stage 'kept/read_0' depends on input 'cached.txt' "
+                + "(path data/raw/cached.txt), which does not exist"
+            ],
+        )
         assert _helper_restore_warnings(dry_run.stderr) == [
             f"Cannot restore {cached}: [Errno 13] Permission denied: '{cache_object}'"
         ], dry_run.output
-        assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
-            "alpha/stage_a": "ran"
-        }, ran.output
-        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
-        assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
         warnings = _helper_restore_warnings(ran.stderr)
         assert len(warnings) == 1, ran.output
         assert warnings[0].startswith(f"Cannot restore {cached}: [Errno 13] Permission denied: "), (
             ran.output
         )
         assert not cached.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a directory whatever its mode")
+def test_tracked_keep_going_and_dry_run_keep_going_read_a_symlink_tree_as_the_restore_does(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R1, R5 (SYMLINK first): data/raw/images is a missing tracked directory whose whole
+    directory tree the cache holds, complete and marked, as a stage output with the same files
+    leaves it; its member object is unreadable (0o000). With the tree searchable, the restore
+    links the directory to the tree and reads no object, so dirs/scan runs, and the dry run
+    lists it. With the tree's directory unsearchable too (0o000), the restore cannot stat the
+    tree's files and restores file by file, which fails on the member object: the run leaves
+    dirs/scan out, and so does the dry run, with the same warning."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        (cwd / ".pivot" / "config.yaml").write_text(
+            "cache:\n  checkout_mode: [symlink, hardlink, copy]\n"
+        )
+        _helper_tracked_images_project(runner, cwd)
+        files = cwd / ".pivot" / "cache" / "files"
+        images = cwd / "data" / "raw" / "images"
+        record = track.read_pvt_file(track.get_pvt_path(images))
+        assert record is not None
+        # A directory with the same files, saved as a SYMLINK commit saves an output
+        twin = cwd / "twin"
+        twin.mkdir()
+        (twin / "a.png").write_text("a")
+        cache.save_to_cache(
+            twin, files, checkout_modes=[cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
+        )
+        twin.unlink()
+        tree = cache.tree_path(files, record["hash"])
+        tree_mode = stat.S_IMODE(tree.stat().st_mode)
+        member_hash = track.tracked_members(images, record, files)["files"][0]["hash"]
+        member_object = cache.get_cache_path(files, member_hash)
+
+        member_object.chmod(0)
+        try:
+            linked_dry_run, linked_run = _helper_checkout_missing_dry_run_and_run(runner)
+            linked = images.is_symlink() and images.resolve() == tree.resolve()
+            images.unlink()
+            tree.chmod(0)
+            try:
+                dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+            finally:
+                tree.chmod(tree_mode)
+        finally:
+            member_object.chmod(0o444)
+
+        assert linked_dry_run.exit_code == 0, linked_dry_run.output
+        assert json.loads(linked_dry_run.stdout)["stages"].keys() == {
+            "alpha/stage_a",
+            "dirs/scan",
+        }, linked_dry_run.output
+        assert linked_run.exit_code == 0, linked_run.output
+        assert {
+            stage: event["status"]
+            for stage, event in helpers.completed_stages(linked_run.stdout).items()
+        } == {"alpha/stage_a": "ran", "dirs/scan": "ran"}, linked_run.output
+        assert linked, "the restore links the directory to the tree"
+        assert (cwd / "data" / "dirs" / "scan.txt").read_text() == "a.png"
+        assert _helper_restore_warnings(linked_dry_run.stderr + linked_run.stderr) == []
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": {"would_run": False, "reason": "unchanged"}}
+        }, dry_run.output
+        assert helpers.skipping_lines(dry_run.stderr) == _IMAGES_SKIPPED, dry_run.output
+        assert ran.exit_code == 0, ran.output
+        assert {
+            stage: event["status"] for stage, event in helpers.completed_stages(ran.stdout).items()
+        } == {"alpha/stage_a": "cached"}, ran.output
+        assert helpers.skipping_lines(ran.stderr) == _IMAGES_SKIPPED, ran.output
+        warning = f"Cannot restore {images}: [Errno 13] Permission denied: '{member_object}'"
+        assert _helper_restore_warnings(dry_run.stderr) == [warning], dry_run.output
+        assert _helper_restore_warnings(ran.stderr) == [warning], ran.output
+        assert not images.exists()
 
 
 class _FakeTuiApp:
@@ -715,17 +913,7 @@ def test_repro_all_dry_run_keep_going_lists_the_stages_the_run_runs(
         dry_run = runner.invoke(cli.cli, helpers.DRY_RUN_KEEP_GOING)
         ran = runner.invoke(cli.cli, ["repro", "--all", "--keep-going", "--jsonl"])
 
-        assert dry_run.exit_code == 0, dry_run.output
-        assert json.loads(dry_run.stdout) == {
-            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
-        }, dry_run.output
-        assert helpers.skipping_lines(dry_run.stderr) == [_READER_SKIPPED], dry_run.output
-        assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
-            "alpha/stage_a": "ran"
-        }, ran.output
-        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
+        _helper_assert_only_alpha_runs(dry_run, ran, [_READER_SKIPPED])
 
 
 def test_repro_all_dry_run_keep_going_checkout_missing_counts_a_cached_file_as_present(
@@ -752,15 +940,10 @@ def test_repro_all_dry_run_keep_going_checkout_missing_counts_a_cached_file_as_p
         assert retracked.exit_code == 0, retracked.output
         cached.unlink()
 
-        dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
-        restored = cached.exists()
         without = runner.invoke(cli.cli, helpers.DRY_RUN_KEEP_GOING)
-        ran = runner.invoke(
-            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
-        )
+        dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
 
         assert dry_run.exit_code == 0, dry_run.output
-        assert not restored, "a dry run restores nothing"
         assert json.loads(dry_run.stdout) == {
             "stages": {
                 "alpha/stage_a": {"would_run": False, "reason": "unchanged"},
@@ -799,10 +982,7 @@ def test_repro_all_dry_run_keep_going_checkout_missing_counts_a_file_reached_thr
         tracked.unlink()
         (cwd / "data" / "raw" / "alias").symlink_to("inputs/sub")
 
-        dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
-        ran = runner.invoke(
-            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
-        )
+        dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
 
         assert dry_run.exit_code == 0, dry_run.output
         assert json.loads(dry_run.stdout) == {
@@ -844,18 +1024,13 @@ def test_repro_all_dry_run_keep_going_checkout_missing_follows_the_restored_dire
         assert tracking.exit_code == 0, tracking.output
         shutil.rmtree(images)
 
-        dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
-        restored = images.exists()
-        ran = runner.invoke(
-            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
-        )
+        dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
 
         skipped = [
             "Skipping: Stage 'cat/read_0' depends on input 'images/cat.png' "
             + "(path data/raw/images/cat.png), which does not exist"
         ]
         assert dry_run.exit_code == 0, dry_run.output
-        assert not restored, "a dry run restores nothing"
         assert json.loads(dry_run.stdout) == {
             "stages": {
                 "alpha/stage_a": {"would_run": True, "reason": "No previous run"},
@@ -895,29 +1070,17 @@ def test_repro_all_dry_run_keep_going_leaves_out_a_restored_directory_holding_a_
             "path: images/extra.bin\nhash: 0123456789abcdef\nsize: 10\n"
         )
 
-        dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
-        restored = images.exists()
-        ran = runner.invoke(
-            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
-        )
+        dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
 
-        skipped = [
-            "Skipping: Stage 'dirs/scan' depends on directory 'images' (path data/raw/images), "
-            + "which holds tracked file 'data/raw/images/extra.bin' that does not exist"
-        ]
-        assert dry_run.exit_code == 0, dry_run.output
-        assert not restored, "a dry run restores nothing"
-        assert json.loads(dry_run.stdout) == {
-            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
-        }, dry_run.output
-        assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
-        assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
-            "alpha/stage_a": "ran"
-        }, ran.output
-        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
-        assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
+        _helper_assert_only_alpha_runs(
+            dry_run,
+            ran,
+            [
+                "Skipping: Stage 'dirs/scan' depends on directory 'images' (path "
+                + "data/raw/images), which holds tracked file 'data/raw/images/extra.bin' that "
+                + "does not exist"
+            ],
+        )
         assert (images / "a.png").read_text() == "a", "the run restores images"
         assert not (cwd / "data" / "dirs" / "scan.txt").exists()
 

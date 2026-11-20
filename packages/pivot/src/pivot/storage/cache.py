@@ -1837,6 +1837,15 @@ def _resolve_checkout_modes(
     return DEFAULT_CHECKOUT_MODE_ORDER.copy()
 
 
+def _tree_file_stats(tree: pathlib.Path, members: listing.DirListing) -> list[os.stat_result]:
+    """The stat of each file of whole-directory SYMLINK tree ``tree`` that ``members`` lists, in
+    listing order: what a symlink restore of a directory to that tree records for each file
+    (``_restore_directory_from_cache``), and the only read it makes of the tree's files once it
+    trusts the tree. An ``OSError`` (a directory of the tree this user cannot search) is raised,
+    on which that restore falls back to restoring file by file."""
+    return [(tree / entry["relpath"]).stat() for entry in members["files"]]
+
+
 def missing_cache_objects(
     output_hash: HashInfo,
     members: listing.DirListing | None,
@@ -1855,7 +1864,9 @@ def missing_cache_objects(
     opens it (a copy reads it, and a link's staged entry is opened through it,
     ``_fstat_staged``), and an ``OSError`` that open gives is raised, as one the lookup gives is
     (``_is_cache_object_path``): the restore would fail on it. A whole-directory tree it trusts
-    is linked as it is, with no object opened.
+    is linked as it is, opening no object, once each of its files is stat'd as a recording
+    restore stats them (``_tree_file_stats``); a file that cannot be stat'd sends that restore
+    file by file, so then each object is looked up and opened as above.
     """
     if is_dir_hash(output_hash):
         assert members is not None, "a directory is restored from its listing"
@@ -1865,7 +1876,15 @@ def missing_cache_objects(
             and tree is not None
             and _ensure_tree_complete(tree, members, cache_dir, repair=False)
         ):
-            return []
+            if not readable:
+                return []
+            try:
+                _ = _tree_file_stats(tree, members)
+            except OSError:
+                # The restore falls back to restoring file by file, reading each object below
+                pass
+            else:
+                return []
         hashes = [entry["hash"] for entry in members["files"]]
     else:
         hashes = [output_hash["hash"]]
@@ -2462,12 +2481,10 @@ def _restore_directory_from_cache(
         try:
             tree_files = (
                 [
-                    (
-                        path / entry["relpath"],
-                        (cache_dir_path / entry["relpath"]).stat(),
-                        entry["hash"],
+                    (path / entry["relpath"], file_stat, entry["hash"])
+                    for entry, file_stat in zip(
+                        members["files"], _tree_file_stats(cache_dir_path, members), strict=True
                     )
-                    for entry in members["files"]
                 ]
                 if recorded is not None
                 else []

@@ -85,6 +85,9 @@ class InstanceChecks(NamedTuple):
     """The tracked files the run start left missing for the stages that read them, absolute and
     normalized (``executor.core.verify_tracked_files``' ``tolerate_missing``); empty in any
     other run, which stops on a missing tracked file."""
+    restore_failed: Collection[str]
+    """Each path of ``missing_tracked`` whose ``--checkout-missing`` restore failed
+    (``executor.core.verify_tracked_files``' ``restore_failed``), which a refusal names as such."""
     project_root: pathlib.Path
     checkout_missing: bool
     """Whether the run start restored the missing tracked files it could
@@ -163,6 +166,7 @@ def plan_instances(
                 ownership.stage_output_paths(checks.project_root, planned),
                 checks.project_root,
                 checkout_attempted=checks.checkout_missing,
+                restore_failed=checks.restore_failed,
             )
             if checks.missing_tracked
             else None

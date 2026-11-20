@@ -158,7 +158,7 @@ def _no_leave_out(stages_list: list[str] | None) -> _LeaveOut:
     from pivot.executor import core as executor_core
 
     return _LeaveOut(
-        found=executor_core.MissingTrackedFiles(missing=[], restorable={}, restored={}),
+        found=executor_core.MissingTrackedFiles(missing=[], restorable={}, restored={}, failed=[]),
         present=[],
         stages=None,
         left_out={},
@@ -207,6 +207,7 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
             ownership.stage_output_paths(project_root, loaded),
             project_root,
             checkout_attempted=checkout_missing,
+            restore_failed=found.failed,
         )
         if refusal is not None:
             raise refusal
@@ -383,6 +384,7 @@ def _get_explanations(
             checks=expansion.InstanceChecks(
                 wanted=plan.wanted,
                 missing_tracked=plan.found.missing,
+                restore_failed=plan.found.failed,
                 project_root=project.get_project_root(),
                 checkout_missing=checkout_missing,
                 allow_uncached_incremental=allow_uncached_incremental,

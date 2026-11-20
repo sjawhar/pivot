@@ -386,6 +386,16 @@ class CorruptListingError(CacheError):
         return f"`pivot pull` fetches the cache's copy of a listing a remote holds. {self.REMEDY}"
 
 
+class ListingUnavailableError(CorruptListingError):
+    """A directory's listing cannot be had from the files that hold it, though none of them was
+    found corrupt: the committed listing file is refused (stale, empty or unreadable) and the
+    cache holds no copy of it to fall back on (it is lost, as in a fresh clone), or the cache's
+    listing object, or its prefix directory, cannot be read (``__cause__`` is the ``OSError``).
+    ``storage.listing`` raises it at those sites alone, with the message a ``CorruptListingError``
+    there gives. A restore in leave-out mode leaves such a directory missing
+    (``executor.restore``); every other reader takes it as any ``CorruptListingError``."""
+
+
 class ListingMissingError(CacheError):
     """Neither the committed listing file nor the cache holds a directory's listing."""
 
@@ -414,33 +424,51 @@ class TrackedFileMissingError(CacheError):
 
     ``overlaps`` maps a missing file to how it overlaps a stage output
     (``ownership.tracked_output_refusal``). Such a file stops a run even when the run tolerates
-    missing files (``executor.core.verify_tracked_files``'s ``tolerate_missing``)."""
+    missing files (``executor.core.verify_tracked_files``'s ``tolerate_missing``).
+    ``restore_failed`` holds each missing file whose ``--checkout-missing`` restore failed, with
+    a ``Cannot restore`` warning naming why (``executor.restore``): the error says so for it,
+    not that the local cache lacks it."""
 
     _missing: list[str]
     _checkout_attempted: bool
     _overlaps: dict[str, str]
+    _restore_failed: list[str]
 
     def __init__(
         self,
         missing_files: list[str],
         checkout_attempted: bool = False,
         overlaps: dict[str, str] | None = None,
+        restore_failed: list[str] | None = None,
     ) -> None:
         self._missing = missing_files
         self._checkout_attempted = checkout_attempted
         # None: no listed file overlaps a stage output
         self._overlaps = {} if overlaps is None else overlaps
+        # None: no listed file's restore failed
+        self._restore_failed = [] if restore_failed is None else restore_failed
         super().__init__(self._format_message())
 
     def _format_message(self) -> str:
-        missing_list = "\n".join(
-            f"  - {p}: {self._overlaps[p]}" if p in self._overlaps else f"  - {p}"
-            for p in self._missing
-        )
-        if self._checkout_attempted:
-            reason = "These files are not in local cache."
-        else:
+        failed = set(self._restore_failed)
+        lines = list[str]()
+        for path in self._missing:
+            notes = [self._overlaps[path]] if path in self._overlaps else []
+            if path in failed:
+                notes.append("its restore failed")
+            lines.append(f"  - {path}: {'; '.join(notes)}" if notes else f"  - {path}")
+        if not self._checkout_attempted:
             reason = "These files are tracked by Pivot but don't exist on disk."
+        elif not failed:
+            reason = "These files are not in local cache."
+        elif failed.issuperset(self._missing):
+            reason = "Their restore failed: a 'Cannot restore' warning above names each cause."
+        else:
+            reason = (
+                "A 'Cannot restore' warning above names the cause of each restore that failed. "
+                + "The other files are not in local cache."
+            )
+        missing_list = "\n".join(lines)
         message = f"The following tracked files are missing:\n{missing_list}\n\n{reason}"
         if self._overlaps:
             message += (
@@ -452,14 +480,19 @@ class TrackedFileMissingError(CacheError):
     @override
     def get_suggestion(self) -> str:
         if self._checkout_attempted:
+            if set(self._restore_failed).issuperset(self._missing):
+                return "Fix what each 'Cannot restore' warning above names, then run again"
             return "Run 'pivot pull' to fetch from remote storage"
         if len(self._missing) == 1:
             return f"Run 'pivot checkout {self._missing[0]}' to restore, or 'pivot checkout --only-missing' to restore all missing files"
         return "Run 'pivot checkout --only-missing' to restore missing files, or 'pivot run --checkout-missing' to restore and run"
 
     @override
-    def __reduce__(self) -> tuple[type, tuple[list[str], bool, dict[str, str]]]:
-        return (self.__class__, (self._missing, self._checkout_attempted, self._overlaps))
+    def __reduce__(self) -> tuple[type, tuple[list[str], bool, dict[str, str], list[str]]]:
+        return (
+            self.__class__,
+            (self._missing, self._checkout_attempted, self._overlaps, self._restore_failed),
+        )
 
 
 class GetError(PivotError):
