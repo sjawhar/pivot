@@ -315,6 +315,22 @@ _QUALNAME_RAISES = (
     + 'raise Raised.Error("boom")'
 )
 
+# The source of a module whose import raises `Raised.Error("boom")`, whose class body stores as
+# its `__qualname__` a `str` subclass whose `__str__` raises `SystemExit`, and whose `__notes__`
+# property raises `SystemExit`, so describing the error raises and its qualified name is the text.
+_QUALNAME_STR_SUBCLASS = (
+    "class Name(str):\n"
+    + "    def __str__(self):\n"
+    + "        raise SystemExit(1)\n\n"
+    + "class Raised:\n"
+    + "    class Error(Exception):\n"
+    + "        __qualname__ = Name('Raised.Error')\n\n"
+    + "        @property\n"
+    + "        def __notes__(self):\n"
+    + "            raise SystemExit(1)\n\n"
+    + 'raise Raised.Error("boom")'
+)
+
 
 def _zipped_package(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, raises: str
@@ -366,6 +382,11 @@ def _zipped_package(
             "Raised.Error",
             id="raises-an-error-whose-metaclass-raises-system-exit-on-its-qualified-name",
         ),
+        pytest.param(
+            _QUALNAME_STR_SUBCLASS,
+            "Raised.Error",
+            id="raises-an-error-whose-qualname-is-a-str-subclass-whose-str-raises-system-exit",
+        ),
     ],
 )
 def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line(
@@ -383,15 +404,20 @@ def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line
     (`raises-while-handling-an-error`); or it raises `Raised.Error`, whose class's `__notes__`
     property raises `SystemExit` (`raises-an-error-whose-notes-raise-system-exit`), or whose
     class's metaclass `__getattribute__` raises `SystemExit` where `__qualname__` is read through
-    it (`raises-an-error-whose-metaclass-raises-system-exit-on-its-qualified-name`). Entering
-    `_sent_submodules_bound` logs one warning, which gives the error's type and message on one
-    line (`RuntimeError: boom`, or `RuntimeError: boom again`), each line of the message stripped
-    and no empty line joined, or the class's qualified name alone, without its module
+    it (`raises-an-error-whose-metaclass-raises-system-exit-on-its-qualified-name`), or whose
+    class body stores as its `__qualname__` a `str` subclass whose `__str__` raises `SystemExit`
+    and whose `__notes__` property raises `SystemExit`
+    (`raises-an-error-whose-qualname-is-a-str-subclass-whose-str-raises-system-exit`).
+    Entering `_sent_submodules_bound` logs one warning, which gives the error's type and message
+    on one line (`RuntimeError: boom`, or `RuntimeError: boom again`), each line of the message
+    stripped and no empty line joined, or the class's qualified name alone, without its module
     (`Raised.Error`), where describing the error raises, binds nothing and does not raise. Were
     the warning's text built with a line of the module looked up, for the error's traceback or for
     the error it chains, the lookup would raise `UnicodeDecodeError` out of
     `_sent_submodules_bound`; so would the `SystemExit` that describing `Raised.Error` raises, were
-    it not caught, and the one its metaclass raises, were the fallback name read through it."""
+    it not caught, and the one its metaclass raises, were the fallback name read through it. Were
+    the fallback name the `str` subclass itself, formatting the warning (its `%s`, as the
+    caplog handler and `record.getMessage()` format it) would raise its `SystemExit`."""
     package = _zipped_package(tmp_path, monkeypatch, raises)
 
     escaped = None

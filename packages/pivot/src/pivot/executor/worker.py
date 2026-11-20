@@ -962,8 +962,11 @@ def _error_on_one_line(exc: BaseException) -> str:
     where CPython's description catches at most an `Exception`. Where describing it raises
     anything but `WorkerTerminated`, the text is the class's qualified name alone, without its
     module (`Outer.Error`, where the line would read `company.local.Outer.Error: boom`), read with
-    `type.__getattribute__`, so no metaclass `__getattribute__` runs. `WorkerTerminated` is
-    raised: an interrupt of the run stays one."""
+    `type.__getattribute__`, so no metaclass `__getattribute__` runs. A class body can store a
+    `str` subclass as its `__qualname__`; the name is copied into a plain `str` with
+    `str.__str__`, which runs none of that subclass's methods, so neither does the warning's `%s`
+    that formats it. The result is always a plain `str`. `WorkerTerminated` is raised: an
+    interrupt of the run stays one."""
     try:
         described = traceback.TracebackException(
             type(exc), exc, None, compact=True, lookup_lines=False
@@ -973,7 +976,7 @@ def _error_on_one_line(exc: BaseException) -> str:
     except WorkerTerminated:
         raise
     except BaseException:
-        return type.__getattribute__(type(exc), "__qualname__")
+        return str.__str__(type.__getattribute__(type(exc), "__qualname__"))
     return " ".join(line.strip() for line in entry.splitlines() if line.strip())
 
 
