@@ -8,6 +8,7 @@ import os
 import pathlib  # noqa: TC003 - compose resolves postponed stage annotations at runtime
 import pickle
 import shutil
+import stat
 from typing import TYPE_CHECKING
 
 import pytest
@@ -874,3 +875,76 @@ def test_a_restore_that_cannot_write_leaves_its_path_missing_in_leave_out_mode_o
         == []
     )
     assert data_file.read_text() == "cached data"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a cache object whatever its mode")
+@pytest.mark.parametrize("kind", ["file", "directory"])
+@pytest.mark.parametrize("unreadable", ["object", "prefix_directory"])
+def test_a_restore_that_cannot_read_its_cache_object_leaves_its_path_missing_in_leave_out_mode_only(
+    pipeline_dir: pathlib.Path,
+    runner: click.testing.CliRunner,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+    unreadable: str,
+) -> None:
+    """With checkout_missing, a missing tracked path whose cache object (a file's, or a member's
+    of a directory) this user cannot read, as its mode or its prefix directory's mode is 0o000,
+    cannot be restored. The dry run's view reads the object as the restore does (the lookup,
+    then an open for reading) and leaves the path missing, with the warning the restore gives
+    for the error; the leave-out restore (tolerate_missing) fails with PermissionError and leaves
+    it missing, with one such warning; a restore outside leave-out mode still raises the error.
+    Once the mode is back, the path is restorable and the restore brings it back."""
+    cache_dir = pipeline_dir / ".pivot" / "cache" / "files"
+    if kind == "file":
+        data_path = pipeline_dir / "cached.csv"
+        data_path.write_text("cached data")
+    else:
+        data_path = pipeline_dir / "images"
+        data_path.mkdir()
+        (data_path / "a.jpg").write_bytes(b"image1")
+    _track_then_remove(runner, pipeline_dir, data_path.name)
+    record = track.read_pvt_file(track.get_pvt_path(data_path))
+    assert record is not None
+    object_hash = (
+        record["hash"]
+        if kind == "file"
+        else track.tracked_members(data_path, record, cache_dir)["files"][0]["hash"]
+    )
+    cache_object = cache.get_cache_path(cache_dir, object_hash)
+    locked = cache_object if unreadable == "object" else cache_object.parent
+    mode = stat.S_IMODE(locked.stat().st_mode)
+
+    locked.chmod(0)
+    try:
+        with _caught_warnings(caplog) as dry_run_warnings:
+            found = executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
+        with _caught_warnings(caplog) as run_warnings:
+            missing = executor_core.verify_tracked_files(
+                pipeline_dir, checkout_missing=True, tolerate_missing=True, outputs={}
+            )
+        with pytest.raises(PermissionError):
+            executor_core.verify_tracked_files(pipeline_dir, checkout_missing=True)
+    finally:
+        locked.chmod(mode)
+    readable = executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
+
+    assert found == executor_core.MissingTrackedFiles(
+        missing=[str(data_path)], restorable={}, restored={}
+    )
+    assert dry_run_warnings == [
+        f"Cannot restore {data_path}: [Errno 13] Permission denied: '{cache_object}'"
+    ]
+    assert missing == [str(data_path)]
+    assert len(run_warnings) == 1, run_warnings
+    assert run_warnings[0].startswith(
+        f"Cannot restore {data_path}: [Errno 13] Permission denied: "
+    ), run_warnings
+    assert not data_path.exists()
+    assert list(readable.restorable) == [str(data_path)]
+    assert (
+        executor_core.verify_tracked_files(
+            pipeline_dir, checkout_missing=True, tolerate_missing=True, outputs={}
+        )
+        == []
+    )
+    assert data_path.exists()

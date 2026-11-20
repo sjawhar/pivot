@@ -351,22 +351,28 @@ def expand_current(
     allow_missing: bool = False,
     fetched: Mapping[str, listing.DirListing] | None = None,
     restorable: Mapping[str, PvtData] | None = None,
-    refuse: expansion.InstanceRefusal | None = None,
+    plan: expansion.InstancePlan | None = None,
+    no_commit: bool = False,
     not_current: set[str] | None = None,
 ) -> tuple[expansion.Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage (``Pipeline.map``) of ``pipeline`` whose producer is current,
     as a run would before running its instances (``expansion.expand_current``, which takes a
-    listing the cache lacks from ``fetched``, and refuses a template ``refuse`` refuses).
+    listing the cache lacks from ``fetched``, and adds the instances ``plan`` plans).
 
     Whether a producer is current is the explain path's decision (``get_pipeline_explanations``
     over the producers and their upstream stages): its explanation, its upstream counted, says it
     would not run; or, with a remote configured, only that it and its stale upstream stages are
     pullable (``pullable_stages``, by each explanation's ``recovery``): its lock matches, and pull
-    restores what it lacks. Every other template stays unexpanded, naming what it waits for.
+    restores what it lacks. A run never pulls, so a refusal of a template whose producer is
+    current only so is not ``refused`` (``expansion.expand_current``'s ``pulled``). Every other
+    template stays unexpanded, naming what it waits for.
     ``restorable`` holds the missing tracked files the cache can restore, which the explanations
-    count as present (``_explanations_for``). ``not_current``, when given, receives each stage of
-    the producers' execution order that is not current: a template whose producer it holds
-    waits for that producer, or is mapped over the instances of one that does.
+    count as present (``_explanations_for``). ``no_commit`` reads the keys a listing gives as a
+    ``--no-commit`` run reads them, from the workspace where neither the committed file nor the
+    cache holds a usable listing (``expansion.expand_current``'s ``workspace``). ``not_current``,
+    when given, receives each stage of the producers' execution order that is not current: a
+    template whose producer it holds waits for that producer, or is mapped over the instances of
+    one that does.
 
     Returns the expansion and the explanations it computed, before their upstream is counted,
     for the caller to pass on as ``known`` (computed with ``force``, ``allow_missing`` and
@@ -375,7 +381,9 @@ def expand_current(
     pipeline.reset_expansions()
     templates = pipeline.list_templates()
     if not templates:
-        return expansion.Expansion(expanded={}, not_expanded={}, listings={}, refused={}), {}
+        return expansion.Expansion(
+            expanded={}, listed={}, not_expanded={}, listings={}, refused={}
+        ), {}
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
@@ -401,7 +409,8 @@ def expand_current(
             enriched = _compute_explanations_with_upstream(
                 [raw[name] for name in order], stage_graph
             )
-            current = {exp["stage_name"] for exp in enriched if not exp["will_run"]}
+            unchanged = {exp["stage_name"] for exp in enriched if not exp["will_run"]}
+            current = set(unchanged)
             if remote_config.list_remotes():
                 current |= pullable_stages(
                     (
@@ -430,7 +439,9 @@ def expand_current(
                 default_state_dir=default_state_dir,
                 cache_dir=files_dir,
                 fetched=fetched,
-                refuse=refuse,
+                plan=plan,
+                pulled=current - unchanged,
+                workspace=_make_workspace_store(pipeline) if no_commit else None,
             )
             return result, raw
     finally:
@@ -555,10 +566,11 @@ def orphaned_instances(
     templates: Iterable[str] | None = None,
 ) -> dict[str, str]:
     """Each instance of a template ``result`` expanded, of ``templates`` (None: every one),
-    whose key left its producer's listing but which still keeps a lock, listing or restart proof
-    (``expansion.orphaned_instances``), mapped to its template: the next run that expands the
-    template removes it with its outputs. A template not expanded has none, since no plan is
-    known for it. In the order the pipeline holds the templates, each one's sorted."""
+    whose key left its producer's listing (``Expansion``'s ``listed``) but which still keeps a
+    lock, listing or restart proof (``expansion.orphaned_instances``), mapped to its template:
+    the next run that expands the template removes it with its outputs. A template not expanded
+    has none, since no plan is known for it. In the order the pipeline holds the templates, each
+    one's sorted."""
     wanted = None if templates is None else set(templates)
     default_state_dir = config.locate_state_dir()
     found = dict[str, str]()
@@ -569,7 +581,7 @@ def orphaned_instances(
             (instance, name)
             for instance in expansion.orphaned_instances(
                 pipeline.get_template(name),
-                result["expanded"][name],
+                result["listed"][name],
                 default_state_dir=default_state_dir,
             )
         )

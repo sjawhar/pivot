@@ -101,6 +101,7 @@ def test_a_current_producer_expands_every_template(
 
     assert result == expansion.Expansion(
         expanded={"p/_stage_cut": _CUTS, "p/_stage_build": _BUILDS},
+        listed={"p/_stage_cut": _CUTS, "p/_stage_build": _BUILDS},
         not_expanded={},
         listings={},
         refused={},
@@ -322,7 +323,7 @@ def test_a_pipeline_without_templates_reads_nothing(
     monkeypatch.setattr(status, "_explanations_for", _no_explanation)
 
     assert status.expand_current(pipeline) == (
-        expansion.Expansion(expanded={}, not_expanded={}, listings={}, refused={}),
+        expansion.Expansion(expanded={}, listed={}, not_expanded={}, listings={}, refused={}),
         {},
     )
 

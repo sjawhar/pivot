@@ -104,7 +104,9 @@ def status(
 
     # Mapped stages expand first, as a run would expand them, so the stages shown hold their
     # instances and a target may name a mapped stage or one of its instances.
-    expansion_result = expansion.Expansion(expanded={}, not_expanded={}, listings={}, refused={})
+    expansion_result = expansion.Expansion(
+        expanded={}, listed={}, not_expanded={}, listings={}, refused={}
+    )
     known = dict[str, StageExplanation]()
     shown_templates: list[str] | None = None
     given_targets = stages_list

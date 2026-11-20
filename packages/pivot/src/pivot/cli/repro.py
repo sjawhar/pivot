@@ -237,39 +237,6 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     )
 
 
-def _instance_output_refusal(
-    template: registry.MapTemplate,
-    keys: list[tuple[str, str]],
-    *,
-    wanted: dict[str, dict[str, set[str]]],
-    missing: list[str],
-    project_root: pathlib.Path,
-    checkout_attempted: bool,
-) -> exceptions.TrackedFileMissingError | None:
-    """The run's refusal of ``template``'s instances over missing tracked files
-    (``Engine._expand_template``): the instances it would add, of the keys its targets name
-    (``wanted``) or every key, checked against ``missing``, the missing tracked files the cache
-    cannot restore (``ownership.tracked_output_refusal``). With no missing file it builds no
-    instance."""
-    from pivot.storage import ownership
-
-    if not missing:
-        return None
-    name = template["info"]["name"]
-    if name in wanted:
-        keys = [(key, file_key) for key, file_key in keys if key in wanted[name]]
-    planned = {
-        info["name"]: info
-        for info in (registry.instantiate(template, key, file_key) for key, file_key in keys)
-    }
-    return ownership.tracked_output_refusal(
-        missing,
-        ownership.stage_output_paths(project_root, planned),
-        project_root,
-        checkout_attempted=checkout_attempted,
-    )
-
-
 def _refused_upstream(
     template: str, refused: Collection[str], pipeline: registry.PipelineLike
 ) -> str | None:
@@ -373,16 +340,20 @@ def _get_explanations(
     decisions before it expands (``_leave_out_plan``) leave out stages and targets; when targets
     were left out and none is left, nothing is explained, as the run runs nothing. The mapped
     stages expand as the run would expand them: the missing tracked files the cache can restore
-    count as present, and a template whose instances' outputs overlap a missing tracked file is
-    refused (``_instance_output_refusal``). A template that any refusal leaves unexpanded is in
-    ``refused``, not ``not_expanded``, as the run fails it, and each template mapped over its
-    instances is in ``blocked``, as the run blocks it. A left-out stage, every instance of a
+    count as present, each template's instances are planned by the run's own checks
+    (``expansion.plan_instances``: the keys its targets name, the outputs over missing tracked
+    files, the incremental outputs it would lose), and with ``no_commit`` the keys are read as
+    that run reads them. A template the run fails (``expansion.Expansion``'s ``refused``: a
+    refusal over a producer current by its own explanation) is in ``refused``, not
+    ``not_expanded``, and each template mapped over its instances, directly or through other
+    mapped stages, is in ``blocked``, as the run blocks it. A left-out stage, every instance of a
     left-out mapped stage, its not-expanded row and its orphaned instances are not shown, and a
     left-out stage changes no orphan the run would remove (``cli_helpers.eligible_templates``
     over the stages the run keeps). With ``--checkout-missing``, a notice on stderr names each
     mapped stage shown as not yet expanded that the run may expand (``_log_restore_limits``).
-    Any other mode leaves out nothing (``_no_leave_out``), shows each refused mapped stage as not
-    yet expanded, as 0.10.4 does, and stops on a missing dependency unless ``allow_missing``.
+    Any other mode leaves out nothing (``_no_leave_out``), expands every key with none of those
+    checks and shows each refused mapped stage as not yet expanded, as 0.10.4 does, and stops on
+    a missing dependency unless ``allow_missing``.
 
     Shared by --explain and --dry-run modes.
     """
@@ -406,21 +377,32 @@ def _get_explanations(
     pipeline = cli_helpers.get_pipeline()
     # Each stage of the producers' execution order that is not current
     not_current = set[str]()
+    planner = (
+        functools.partial(
+            expansion.plan_instances,
+            checks=expansion.InstanceChecks(
+                wanted=plan.wanted,
+                missing_tracked=plan.found.missing,
+                project_root=project.get_project_root(),
+                checkout_missing=checkout_missing,
+                allow_uncached_incremental=allow_uncached_incremental,
+                force=force,
+            ),
+        )
+        if leave_out
+        else None
+    )
     result, known = cli_helpers.expand_mapped_stages(
         force=force,
         allow_missing=allow_missing,
         restorable=plan.found.restorable,
-        refuse=functools.partial(
-            _instance_output_refusal,
-            wanted=plan.wanted,
-            missing=plan.found.missing,
-            project_root=project.get_project_root(),
-            checkout_attempted=checkout_missing,
-        ),
+        plan=planner,
+        no_commit=no_commit and leave_out,
         not_current=not_current,
     )
     kept = expansion.Expansion(
         expanded={n: found for n, found in result["expanded"].items() if n not in plan.left_out},
+        listed={n: found for n, found in result["listed"].items() if n not in plan.left_out},
         not_expanded={
             n: why for n, why in result["not_expanded"].items() if n not in plan.left_out
         },

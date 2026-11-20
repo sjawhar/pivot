@@ -20,22 +20,24 @@ it. A template that does not expand removes nothing, since no plan is known for 
 from __future__ import annotations
 
 import pathlib
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 import lmdb
 
-from pivot import exceptions, registry, types
+from pivot import exceptions, project, registry, types
 from pivot import state_dir as state_dir_mod
-from pivot.storage import listing, lock
+from pivot.storage import cache, listing, lock, ownership
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterable, Mapping
 
-# Why a template cannot add the instance of each (key, file key), or None (``expand_current``'s
-# ``refuse``)
-type InstanceRefusal = Callable[
-    [registry.MapTemplate, list[tuple[str, str]]], exceptions.PivotError | None
+    from pivot.storage import store as store_mod
+
+# The (key, file key) of each instance a template adds, given the template and the (key, file
+# key) of each file of its source, or why it cannot expand (``expand_current``'s ``plan``)
+type InstancePlan = Callable[
+    [registry.MapTemplate, list[tuple[str, str]]], list[tuple[str, str]] | str
 ]
 
 
@@ -44,19 +46,51 @@ class Expansion(TypedDict):
 
     Attributes:
         expanded: Each expanded template's instances, in key order.
+        listed: Each template of ``expanded`` with the instance of each key its producer's
+            listing holds, in key order: an instance of the template that is not one of them is
+            orphaned (``orphaned_instances``). ``expanded`` holds the same instances unless a
+            ``plan`` kept some keys alone (a run whose targets name instances adds those alone).
         not_expanded: Each template left unexpanded, with why.
         listings: For a template whose producer is current but whose listing neither the
             committed file nor the cache holds, the record of that listing: the cache object a
             pull fetches from the remote before it expands again.
-        refused: Each template of ``not_expanded`` that a refusal left unexpanded, with that
-            refusal, its ``not_expanded`` reason (``refusal_reason``): a run that finds its
-            producer current fails it with the same reason.
+        refused: Each template of ``not_expanded`` that a refusal left unexpanded (a listing
+            that cannot be read, a file whose key cannot name a stage, a refusal of ``plan``, an
+            instance another stage's name or output path holds), with its ``not_expanded``
+            reason, unless its producer is current only because a pull would bring it up to date
+            (``pulled``), which a run runs again.
+            With a run's ``plan`` (``plan_instances`` over the run's checks) and, for a
+            ``--no-commit`` run, its ``workspace``, these are the templates that run fails, with
+            the reasons it gives: it skips the same producers, reads the keys read here, and
+            plans and adds the instances as here. A template mapped over the instances of one
+            of them is not in it: the run blocks that one.
     """
 
     expanded: dict[str, list[str]]
+    listed: dict[str, list[str]]
     not_expanded: dict[str, str]
     listings: dict[str, types.DirHash]
     refused: dict[str, str]
+
+
+class InstanceChecks(NamedTuple):
+    """What a run checks a template's instances against before it adds them
+    (``plan_instances``). The run (``engine``) builds one from its targets and its start, and
+    its dry run (``pivot repro --all --keep-going --dry-run``) builds the same from the same."""
+
+    wanted: dict[str, dict[str, set[str]]]
+    """The keys each template expands when the run's targets name instances, each with the
+    targets that need it (``mapped_targets``); a template it does not hold expands every key."""
+    missing_tracked: list[str]
+    """The tracked files the run start left missing for the stages that read them, absolute and
+    normalized (``executor.core.verify_tracked_files``' ``tolerate_missing``); empty in any
+    other run, which stops on a missing tracked file."""
+    project_root: pathlib.Path
+    checkout_missing: bool
+    """Whether the run start restored the missing tracked files it could
+    (``--checkout-missing``)."""
+    allow_uncached_incremental: bool
+    force: bool
 
 
 def single_stage_refusal(
@@ -78,7 +112,8 @@ def refusal_reason(source: types.ArtifactIdentity, error: exceptions.PivotError)
     wording a run and every command use: a listing that is missing names the commands that
     bring it back, and any other refusal (a file whose key cannot name a stage, an unusable
     listing, an instance another stage's name or output path holds, an instance output over a
-    missing tracked file) is given as it is."""
+    missing tracked file, an instance's incremental output a run would lose) is given as it
+    is."""
     shown = types.identity_key(source)
     if isinstance(error, exceptions.ListingMissingError):
         return (
@@ -86,6 +121,99 @@ def refusal_reason(source: types.ArtifactIdentity, error: exceptions.PivotError)
             + f"remote that holds it, and `pivot repro --force {source.producer}` writes it again"
         )
     return f"cannot expand over the files of '{shown}': {error}"
+
+
+def plan_instances(
+    template: registry.MapTemplate, keys: list[tuple[str, str]], checks: InstanceChecks
+) -> list[tuple[str, str]] | str:
+    """The (key, file key) of each instance a run adds for ``template``, of the (key, file key)
+    ``keys`` of each file of its source, or why the run fails the template, in the words the run
+    gives. The one owner of what a run checks before it adds a template's instances: the run
+    (``engine``) calls it for each template it expands, and its dry run passes it to
+    ``expand_current`` as ``plan``, over the same ``checks``, so both fail the same templates.
+
+    When the run's targets name instances of ``template`` (``checks.wanted``), only their keys
+    are kept, and a named key no file has fails the template, as `pivot status` refuses the
+    instance's name. The instances of the keys kept (``registry.instantiate``) fail it when an
+    output is, lies inside or contains a missing tracked file, whose sidecar its write would
+    delete (``ownership.tracked_output_refusal``), and when an incremental output on disk is not
+    in the cache or was restarted by an older pivot (``executor.core.incremental_refusal``),
+    each given by ``refusal_reason``. Adding the instances can still fail, on a name or an
+    output path another stage holds (``registry.StageRegistry.expand``).
+    """
+    # executor.core imports this module (through executor.worker and pivot.remote.sync)
+    from pivot.executor import core as executor_core
+
+    name = template["info"]["name"]
+    if name in checks.wanted:
+        wanted = checks.wanted[name]
+        unknown = sorted(wanted.keys() - {key for key, _ in keys})
+        if unknown:
+            return _unknown_keys_reason(name, unknown, wanted)
+        keys = [(key, file_key) for key, file_key in keys if key in wanted]
+    planned = {
+        info["name"]: info
+        for info in (registry.instantiate(template, key, file_key) for key, file_key in keys)
+    }
+    refusal: exceptions.PivotError | None
+    try:
+        refusal = (
+            ownership.tracked_output_refusal(
+                checks.missing_tracked,
+                ownership.stage_output_paths(checks.project_root, planned),
+                checks.project_root,
+                checkout_attempted=checks.checkout_missing,
+            )
+            if checks.missing_tracked
+            else None
+        )
+        if refusal is None:
+            refusal = executor_core.incremental_refusal(
+                list(planned),
+                planned,
+                allow_uncached_incremental=checks.allow_uncached_incremental,
+                force=checks.force,
+            )
+    except exceptions.PivotError as error:
+        # An error a check raises fails the template with it, as a refusal does
+        refusal = error
+    return keys if refusal is None else refusal_reason(template["source"], refusal)
+
+
+def _unknown_keys_reason(template: str, missing: list[str], wanted: dict[str, set[str]]) -> str:
+    """Why a run whose targets name keys ``missing`` of ``template`` fails it: those instances,
+    as `pivot status` refuses their names, and each target further down the chain that needs
+    them."""
+    unknown = [f"{template}@{key}" for key in missing]
+    reason = str(exceptions.StageNotFoundError(unknown))
+    needing = sorted({target for key in missing for target in wanted[key]}.difference(unknown))
+    if needing:
+        noun = "target" if len(needing) == 1 else "targets"
+        reason += f", needed by the {noun} {', '.join(needing)}"
+    return reason
+
+
+def workspace_keys(
+    directory: pathlib.Path, *, project_root: pathlib.Path, cache_dir: pathlib.Path | None
+) -> list[tuple[str, str]]:
+    """The (instance key, file key) of each file of a template's source directory as the
+    workspace holds it at ``directory``, hashed as recording a listing hashes it
+    (``cache.hash_directory``, ``cache_dir`` the object root). A ``--no-commit`` run writes no
+    listing, so once the producer has finished it reads the keys here, holding the READ lock on
+    the directory (``engine``); its dry run reads here, with no lock, the keys of a directory
+    whose listing neither the committed file nor the cache holds in a usable form
+    (``expand_current``'s ``workspace``).
+
+    Raises:
+        ListingMissingError: The directory is missing.
+        PipelineConfigError: A file's key cannot name a stage, or two files share a key.
+    """
+    try:
+        hashed = cache.hash_directory(directory, cache_dir=cache_dir)
+    except FileNotFoundError:
+        shown = project.to_relative_path(directory, project_root)
+        raise exceptions.ListingMissingError(f"the directory {shown} is missing") from None
+    return keys_of(hashed["listing"])
 
 
 def mapped_targets(
@@ -221,7 +349,9 @@ def expand_current(
     default_state_dir: pathlib.Path,
     cache_dir: pathlib.Path | None,
     fetched: Mapping[str, listing.DirListing] | None = None,
-    refuse: InstanceRefusal | None = None,
+    plan: InstancePlan | None = None,
+    pulled: Collection[str] = (),
+    workspace: store_mod.WorkspaceStore | None = None,
 ) -> Expansion:
     """Expand afresh each template of ``pipeline`` whose source's producer is current.
 
@@ -231,18 +361,24 @@ def expand_current(
     stands. A template mapped over an upstream template's instances expands with it, over the
     same keys, and stays unexpanded when that one does. Each template expands all or nothing
     (``registry.StageRegistry.expand``); a refusal leaves it unexpanded with the reason, and
-    names it in ``refused``.
+    names it in ``refused`` unless its producer is in ``pulled``.
     ``fetched`` holds listings read from the remote, by directory hash, already checked against
     their records: a listing neither committed nor cached is taken from it (a dry run's read,
     which writes nothing to the cache). A listing neither holds is named in ``listings`` for
-    every template mapped over that source, the ones that reuse its read included. ``refuse``,
-    when given, may refuse a template before its instances are added: given the template and
-    the (key, file key) of each instance, it returns why the template cannot expand, or None. Its
-    refusal is recorded as any other (a dry run of ``pivot repro`` passes the run's check of the
-    instances' outputs over missing tracked files, ``ownership.tracked_output_refusal``).
+    every template mapped over that source, the ones that reuse its read included. ``plan``,
+    when given, decides a template's instances before they are added: given the template and
+    the (key, file key) of each file, it returns the keys to add, or why the template cannot
+    expand, recorded as any other refusal (the dry run of ``pivot repro --all --keep-going``
+    passes the run's own, ``plan_instances``). ``pulled`` names the producers of ``locks``
+    current only because a pull would bring them up to date: a run, which never pulls, runs
+    each again and expands its templates from what it writes. ``workspace``, when given (that
+    dry run of a ``--no-commit`` run), reads a listing that neither the committed file nor the
+    cache holds, or that cannot be used, as that run reads its keys: from the directory in the
+    workspace (``workspace_keys``). The run hashes the directory its producer's skip leaves at
+    the lock's record, so a listing either holds lists the same files.
     """
     pipeline.reset_expansions()
-    result = Expansion(expanded={}, not_expanded={}, listings={}, refused={})
+    result = Expansion(expanded={}, listed={}, not_expanded={}, listings={}, refused={})
     keys_by_source = dict[types.ArtifactIdentity, list[tuple[str, str]] | str]()
     # The record of each source's listing that is neither committed, cached nor fetched
     missing_by_source = dict[types.ArtifactIdentity, types.DirHash]()
@@ -265,45 +401,83 @@ def expand_current(
             continue
         keys = keys_by_source.get(source)
         if keys is None:
-            try:
-                keys = read_keys(
-                    source,
-                    pipeline.get_stage(producer),
-                    locks[producer],
-                    default_state_dir=default_state_dir,
-                    cache_dir=cache_dir,
-                )
-            except exceptions.ListingMissingError as e:
-                record = recorded_directory(source, locks[producer])
-                members = None if record is None or fetched is None else fetched.get(record["hash"])
-                if members is not None:
-                    try:
-                        keys = keys_of(members)
-                    except exceptions.PipelineConfigError as error:
-                        keys = refusal_reason(source, error)
-                else:
-                    if record is not None:
-                        missing_by_source[source] = record
-                    keys = refusal_reason(source, e)
-            except (exceptions.CorruptListingError, exceptions.PipelineConfigError) as e:
-                keys = refusal_reason(source, e)
+            keys = _source_keys(
+                source,
+                pipeline.get_stage(producer),
+                locks[producer],
+                default_state_dir=default_state_dir,
+                cache_dir=cache_dir,
+                fetched=fetched,
+                workspace=workspace,
+                missing_by_source=missing_by_source,
+            )
             keys_by_source[source] = keys
         if source in missing_by_source:
             result["listings"][name] = missing_by_source[source]
         if isinstance(keys, str):
             reason = keys
         else:
-            refusal = None if refuse is None else refuse(template, keys)
-            if refusal is None:
+            planned = keys if plan is None else plan(template, keys)
+            if isinstance(planned, str):
+                reason = planned
+            else:
                 try:
-                    result["expanded"][name] = pipeline.expand_template(name, keys)
+                    result["expanded"][name] = pipeline.expand_template(name, planned)
+                    result["listed"][name] = [f"{name}@{key}" for key, _ in keys]
                     continue
                 except exceptions.PivotError as e:
-                    refusal = e
-            reason = refusal_reason(source, refusal)
+                    reason = refusal_reason(source, e)
         result["not_expanded"][name] = reason
-        result["refused"][name] = reason
+        if producer not in pulled:
+            result["refused"][name] = reason
     return result
+
+
+def _source_keys(
+    source: types.ArtifactIdentity,
+    producer: registry.RegistryStageInfo,
+    lock_data: types.LockData | None,
+    *,
+    default_state_dir: pathlib.Path,
+    cache_dir: pathlib.Path | None,
+    fetched: Mapping[str, listing.DirListing] | None,
+    workspace: store_mod.WorkspaceStore | None,
+    missing_by_source: dict[types.ArtifactIdentity, types.DirHash],
+) -> list[tuple[str, str]] | str:
+    """The (key, file key) of each file of directory output ``source`` of ``producer``, whose
+    lock is ``lock_data``, as ``expand_current`` reads them (``read_keys``, then ``workspace``
+    or ``fetched``), or why its templates cannot expand (``refusal_reason``). A listing that
+    neither the committed file, the cache nor ``fetched`` holds puts its record in
+    ``missing_by_source``."""
+    try:
+        return read_keys(
+            source, producer, lock_data, default_state_dir=default_state_dir, cache_dir=cache_dir
+        )
+    except (exceptions.ListingMissingError, exceptions.CorruptListingError) as e:
+        if workspace is not None:
+            output = next(out for out in producer["outs"] if out.identity == source)
+            try:
+                return workspace_keys(
+                    workspace.resolve_display_path(output),
+                    project_root=project.get_project_root(),
+                    cache_dir=cache_dir,
+                )
+            except (exceptions.ListingMissingError, exceptions.PipelineConfigError) as error:
+                return refusal_reason(source, error)
+        if isinstance(e, exceptions.CorruptListingError):
+            return refusal_reason(source, e)
+        record = recorded_directory(source, lock_data)
+        members = None if record is None or fetched is None else fetched.get(record["hash"])
+        if members is None:
+            if record is not None:
+                missing_by_source[source] = record
+            return refusal_reason(source, e)
+        try:
+            return keys_of(members)
+        except exceptions.PipelineConfigError as error:
+            return refusal_reason(source, error)
+    except exceptions.PipelineConfigError as e:
+        return refusal_reason(source, e)
 
 
 def instance_files(

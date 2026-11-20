@@ -704,8 +704,15 @@ def _restore_tracked_file(
     except OSError as e:
         if not tolerate_missing:
             raise
-        logger.warning("Cannot restore %s: %s", path, e)
+        _warn_restore_failed(path, e)
         return False
+
+
+def _warn_restore_failed(path: pathlib.Path, error: OSError) -> None:
+    """Warn that the restore of missing tracked path ``path`` failed with ``error``, in the one
+    wording the leave-out restore (``_restore_tracked_file``) and the dry run's view of it
+    (``_restore_can_read``) give."""
+    logger.warning("Cannot restore %s: %s", path, error)
 
 
 def _tracked_path_kind(path: pathlib.Path) -> Literal["file", "directory"] | None:
@@ -866,8 +873,8 @@ class MissingTrackedFiles(NamedTuple):
     discovery gives), sorted: without ``checkout_missing``, every missing one."""
     restorable: dict[str, track.PvtData]
     """Each missing tracked path the restore brings back, with its ``.pvt`` data, in sorted
-    order: the local cache holds it, and the restore can write it. Empty without
-    ``checkout_missing``."""
+    order: the local cache holds it, the restore can read each cache object it links, and the
+    restore can write it. Empty without ``checkout_missing``."""
     restored: dict[str, set[tuple[str, ...]]]
     """Each path of ``restorable``, with every path its restore creates inside it, as the parts
     of that path relative to it (``_created_inside``): for a directory, each file and empty
@@ -886,13 +893,13 @@ def find_missing_tracked_files(
     Finds the tracked files the pre-flight finds missing, with its existence rule
     (``_tracked_path_kind``), and with ``checkout_missing`` splits off those its restore brings
     back: the restore's own source (``_restore_source``) is readable, a lost listing leaving the
-    path missing as in that mode; ``cache.missing_cache_objects``, the rule a forced checkout
-    uses, finds none of its objects absent for the configured checkout modes; and the restore
-    can write the path (``_restore_can_write``). It discovers with ``track.discover_pvt_files``,
-    which never writes the memo. It restores nothing, registers in no cache and writes no state
-    database or workspace file. With ``checkout_missing`` it raises where the pre-flight raises:
-    the refusal of a control path, and ``CorruptListingError`` for a missing directory whose
-    listing is corrupt but not lost. ``skip`` is as for ``verify_tracked_files``.
+    path missing as in that mode; the restore can read every cache object it links
+    (``_restore_can_read``); and the restore can write the path (``_restore_can_write``). It
+    discovers with ``track.discover_pvt_files``, which never writes the memo. It restores
+    nothing, registers in no cache and writes no state database or workspace file. With
+    ``checkout_missing`` it raises where the pre-flight raises: the refusal of a control path,
+    and ``CorruptListingError`` for a missing directory whose listing is corrupt but not lost.
+    ``skip`` is as for ``verify_tracked_files``.
     """
     tracked_files = track.discover_pvt_files(project_root, skip=skip)
     if checkout_missing and tracked_files:
@@ -907,10 +914,11 @@ def find_missing_tracked_files(
     restored = dict[str, set[tuple[str, ...]]]()
     for path in found:
         data_path = pathlib.Path(path)
+        # Outside the read check, as the restore reads it outside its OSError handling
         source = _restore_source(data_path, tracked_files[path], cache_dir, tolerate_missing=True)
         if (
             source is None
-            or cache.missing_cache_objects(source.hash, source.members, cache_dir, checkout_modes)
+            or not _restore_can_read(data_path, source, cache_dir, checkout_modes)
             or not _restore_can_write(data_path)
         ):
             missing.append(path)
@@ -918,6 +926,27 @@ def find_missing_tracked_files(
         restorable[path] = tracked_files[path]
         restored[path] = _created_inside(source.members)
     return MissingTrackedFiles(missing=missing, restorable=restorable, restored=restored)
+
+
+def _restore_can_read(
+    path: pathlib.Path,
+    source: _RestoreSource,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+) -> bool:
+    """Whether the restore of missing tracked path ``path`` from ``source`` can read each cache
+    object it links: ``cache.missing_cache_objects``, the rule a forced checkout uses, finds none
+    absent for ``checkout_modes``, and opens each one for reading, as the restore's checkout
+    opens it. An ``OSError`` from that lookup or open (an object or a directory of the cache
+    this user cannot read) fails the restore, which in leave-out mode leaves the path missing
+    (``_restore_tracked_file``): this warns as it does and returns False."""
+    try:
+        return not cache.missing_cache_objects(
+            source.hash, source.members, cache_dir, checkout_modes, readable=True
+        )
+    except OSError as e:
+        _warn_restore_failed(path, e)
+        return False
 
 
 def _restore_can_write(path: pathlib.Path) -> bool:

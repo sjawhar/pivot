@@ -65,7 +65,7 @@ from pivot.engine.types import (
 )
 from pivot.executor import core as executor_core
 from pivot.executor import worker
-from pivot.storage import artifact_lock, cache, lock, member_skip, naming, ownership
+from pivot.storage import artifact_lock, lock, member_skip, naming, ownership
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import (
@@ -186,10 +186,11 @@ class _MapRun:
 
     A template is a node of the run's schedule with no resources. When its upstream stages
     have finished, its producer among them, the engine reads the producer's recorded listing of
-    the directory and adds one instance per file, or, for a template in ``wanted``, the instance
-    of each key it names. ``stage_order``, ``all_stages`` and ``committed_before`` are the run's
-    own records, which each expansion extends. No instance is added whose output is, lies inside
-    or contains a file of ``missing_tracked``.
+    the directory and adds the instances ``expansion.plan_instances`` plans over ``checks``: one
+    per file, or, for a template in ``checks.wanted``, the instance of each key it names; none
+    whose output is, lies inside or contains a file of ``checks.missing_tracked``, or whose
+    incremental output the run would lose. ``stage_order``, ``all_stages`` and
+    ``committed_before`` are the run's own records, which each expansion extends.
     """
 
     templates: set[str]
@@ -197,10 +198,9 @@ class _MapRun:
     # expand over the same keys; the engine's own record, kept after the run
     # (``Engine.expansion_keys``)
     keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
-    # The keys a template expands when the run's targets name instances
-    # (``expansion.mapped_targets``), each with the targets that need it; a template it does not
-    # hold expands every key
-    wanted: dict[str, dict[str, set[str]]]
+    # What each template's instances are checked against before they are added: the keys the
+    # run's targets name, the tracked files the run start left missing, and the run's flags
+    checks: expansion.InstanceChecks
     stage_order: list[str]
     all_stages: dict[str, RegistryStageInfo]
     committed_before: dict[pathlib.Path, tuple[int, int, int] | None]
@@ -209,18 +209,10 @@ class _MapRun:
     cache_dir: pathlib.Path
     default_state_dir: pathlib.Path
     project_root: pathlib.Path
-    force: bool
     no_commit: bool
-    allow_uncached_incremental: bool
     # Whether the run starts no stage after its first failure, a template's included
     # (``OnError.FAIL``)
     fail_fast: bool
-    # The tracked files the run start found missing and left to the stages that read them
-    # (``executor.core.verify_tracked_files``' ``tolerate_missing``), absolute and normalized;
-    # empty in any other run, which stops on a missing tracked file
-    missing_tracked: list[str]
-    # Whether the run start restored the missing tracked files it could (``--checkout-missing``)
-    checkout_missing: bool
 
 
 def _file_identity(path: pathlib.Path) -> tuple[int, int, int] | None:
@@ -365,19 +357,6 @@ def _refuse_single_stage_templates(
             raise expansion.single_stage_refusal(name, templates[name])
 
 
-def _unknown_keys_reason(template: str, missing: list[str], wanted: dict[str, set[str]]) -> str:
-    """Why a run whose targets name keys ``missing`` of ``template`` fails it: those instances,
-    as `pivot status` refuses their names, and each target further down the chain that needs
-    them."""
-    unknown = [f"{template}@{key}" for key in missing]
-    reason = str(exceptions.StageNotFoundError(unknown))
-    needing = sorted({target for key in missing for target in wanted[key]}.difference(unknown))
-    if needing:
-        noun = "target" if len(needing) == 1 else "targets"
-        reason += f", needed by the {noun} {', '.join(needing)}"
-    return reason
-
-
 def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tuple[str, str]]:
     """The (key, file key) of each file of directory output ``source``, whose producer has
     finished in this run, by the listing the producer recorded for it
@@ -385,7 +364,7 @@ def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tup
 
     A ``--no-commit`` run writes no lock, listing or cache object, so its producer's listing is
     the directory it left in the workspace, hashed as recording a listing hashes it
-    (``cache.hash_directory``). That hash holds READ on the directory, the lock every stage
+    (``expansion.workspace_keys``). That hash holds READ on the directory, the lock every stage
     reading it as a dependency takes, so another pivot run cannot rewrite it mid-walk.
 
     Raises:
@@ -406,16 +385,14 @@ def _read_map_keys(source: types.ArtifactIdentity, map_run: _MapRun) -> list[tup
             cache_dir=files_dir,
         )
     output = next(out for out in producer["outs"] if out.identity == source)
-    directory = map_run.store.resolve_display_path(output)
     lock_dir = registry.get_stage_state_dir(producer, default_state_dir) / "locks"
     requests = artifact_lock.expand_lock_requests({"source": output}, [], map_run.project_root)
-    try:
-        with artifact_lock.LocalFlockLockService(lock_dir).acquire_many(requests):
-            hashed = cache.hash_directory(directory, cache_dir=files_dir)
-    except FileNotFoundError:
-        shown = project.to_relative_path(directory, map_run.project_root)
-        raise exceptions.ListingMissingError(f"the directory {shown} is missing") from None
-    return expansion.keys_of(hashed["listing"])
+    with artifact_lock.LocalFlockLockService(lock_dir).acquire_many(requests):
+        return expansion.workspace_keys(
+            map_run.store.resolve_display_path(output),
+            project_root=map_run.project_root,
+            cache_dir=files_dir,
+        )
 
 
 _OUTPUT_ROOTS = ("data", "metrics", "plots")
@@ -1871,7 +1848,14 @@ class Engine:
             _MapRun(
                 templates=set(run_templates),
                 keys=self._expansion_keys,
-                wanted=wanted,
+                checks=expansion.InstanceChecks(
+                    wanted=wanted,
+                    missing_tracked=missing_tracked,
+                    project_root=project_root,
+                    checkout_missing=checkout_missing,
+                    allow_uncached_incremental=allow_uncached_incremental,
+                    force=force,
+                ),
                 stage_order=stage_order,
                 all_stages=all_stages,
                 committed_before=committed_before,
@@ -1880,12 +1864,8 @@ class Engine:
                 cache_dir=cache_dir,
                 default_state_dir=default_state_dir,
                 project_root=project_root,
-                force=force,
                 no_commit=no_commit,
-                allow_uncached_incremental=allow_uncached_incremental,
                 fail_fast=on_error == OnError.FAIL,
-                missing_tracked=missing_tracked,
-                checkout_missing=checkout_missing,
             )
             if run_templates
             else None
@@ -2538,14 +2518,14 @@ class Engine:
         """Add template ``name``'s instances to the run (``Pipeline.map``), then complete it.
 
         Its upstream stages have finished, its producer among them, so the producer's directory
-        holds what the producer wrote or restored. Each file becomes one instance
-        (``registry.map_instance_keys``), or, when the run's targets name instances, each file of
-        a key they name (``_MapRun.wanted``); each is added to the registry, the run's graph and
-        its schedule. The template then completes, so a template mapped over its instances can
-        expand next. A refusal (a file whose key cannot name a stage, a named key no file has,
-        an instance whose name or output path another stage holds, an instance's output that is,
-        lies inside or contains a missing tracked file, an instance's incremental output the run
-        would lose) fails the template with the reason and adds none of its instances. When the
+        holds what the producer wrote or restored. The instances are those
+        ``expansion.plan_instances`` plans over the run's checks (``_MapRun.checks``): one per
+        file (``registry.map_instance_keys``), or, when the run's targets name instances, one per
+        file of a key they name; each is added to the registry, the run's graph and its schedule.
+        The template then completes, so a template mapped over its instances can expand next. A
+        refusal (a listing that cannot be read, a file whose key cannot name a stage, a refusal
+        of ``expansion.plan_instances``, an instance whose name or output path another stage
+        holds) fails the template with the reason and adds none of its instances. When the
         expansion succeeds, each instance whose key left the producer's listing is removed
         (``_remove_orphans``) before the new instances are scheduled, unless the run commits
         nothing; a refused expansion removes nothing.
@@ -2561,45 +2541,15 @@ class Engine:
             if keys is None:
                 keys = await anyio.to_thread.run_sync(_read_map_keys, source, map_run)
                 map_run.keys[source] = keys
-            if name in map_run.wanted:
-                wanted = map_run.wanted[name]
-                # A named key no file has reads as `pivot status` reads its target
-                missing = sorted(wanted.keys() - {key for key, _ in keys})
-                if missing:
-                    reason = _unknown_keys_reason(name, missing, wanted)
-                keys = [(key, file_key) for key, file_key in keys if key in wanted]
-            if reason is None:
-                planned = {
-                    info["name"]: info
-                    for info in (registry.instantiate(template, key, file) for key, file in keys)
-                }
-                # An instance output that is, lies inside or contains a missing tracked file
-                # refuses the expansion, as the run start refuses a loaded stage's: the
-                # instance's write would delete that file's sidecar
-                if map_run.missing_tracked:
-                    overlap = await anyio.to_thread.run_sync(
-                        lambda: ownership.tracked_output_refusal(
-                            map_run.missing_tracked,
-                            ownership.stage_output_paths(map_run.project_root, planned),
-                            map_run.project_root,
-                            checkout_attempted=map_run.checkout_missing,
-                        )
-                    )
-                    if overlap is not None:
-                        raise overlap
-                problem = await anyio.to_thread.run_sync(
-                    lambda: executor_core.incremental_refusal(
-                        list(planned),
-                        planned,
-                        allow_uncached_incremental=map_run.allow_uncached_incremental,
-                        force=map_run.force,
-                    )
-                )
-                if problem is not None:
-                    raise problem
+            planned = await anyio.to_thread.run_sync(
+                expansion.plan_instances, template, keys, map_run.checks
+            )
+            if isinstance(planned, str):
+                reason = planned
+            else:
                 # Adding instances waits for a thread reading the registry, as a run start does
                 await self._wait_for_registry_readers()
-                added = pipeline.expand_template(name, keys)
+                added = pipeline.expand_template(name, planned)
         except exceptions.PivotError as exc:
             reason = expansion.refusal_reason(source, exc)
         if reason is not None:

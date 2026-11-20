@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import shutil
+import stat
 import threading
 from typing import TYPE_CHECKING
 
@@ -502,6 +503,71 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_rea
         assert warnings[0].startswith(
             f"Cannot restore {cached}: [Errno 13] Permission denied: '{locked}/"
         ), ran.output
+        assert not cached.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a cache object whatever its mode")
+@pytest.mark.parametrize("unreadable", ["object", "prefix_directory"])
+def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_an_unreadable_object(
+    runner: CliRunner, tmp_path: pathlib.Path, unreadable: str
+) -> None:
+    """R1, R5: kept/read_0 reads data/raw/cached.txt, which is missing and whose object the cache
+    holds, but which this user cannot read: the object's mode, or its prefix directory's in the
+    cache, is 0o000. The run's --checkout-missing restore fails with PermissionError: the run
+    warns once, naming the path and the error, leaves kept/read_0 out with a `Skipping:` line,
+    runs alpha and exits 0. The dry run with --checkout-missing reads the object as the restore
+    does, so it does not count the file as present: it lists alpha alone and leaves kept/read_0
+    out with the same line, warning that the object cannot be read."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        helpers.write_pipeline(
+            cwd, "kept", _helper_broken_pipeline_code(1, name="kept", input_name="cached.txt")
+        )
+        helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+        cached = cwd / "data" / "raw" / "cached.txt"
+        cached.parent.mkdir(parents=True)
+        cached.write_text("cached bytes")
+        tracking = runner.invoke(cli.cli, ["track", "data/raw/cached.txt"])
+        assert tracking.exit_code == 0, tracking.output
+        cached.unlink()
+        record = track.read_pvt_file(track.get_pvt_path(cached))
+        assert record is not None
+        cache_object = cache.get_cache_path(cwd / ".pivot" / "cache" / "files", record["hash"])
+        locked = cache_object if unreadable == "object" else cache_object.parent
+        mode = stat.S_IMODE(locked.stat().st_mode)
+
+        locked.chmod(0)
+        try:
+            dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
+            ran = runner.invoke(
+                cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+            )
+        finally:
+            locked.chmod(mode)
+
+        skipped = [
+            "Skipping: Stage 'kept/read_0' depends on input 'cached.txt' "
+            + "(path data/raw/cached.txt), which does not exist"
+        ]
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
+        }, dry_run.output
+        assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
+        assert _helper_restore_warnings(dry_run.stderr) == [
+            f"Cannot restore {cached}: [Errno 13] Permission denied: '{cache_object}'"
+        ], dry_run.output
+        assert ran.exit_code == 0, ran.output
+        completed = helpers.completed_stages(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "ran"
+        }, ran.output
+        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
+        assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
+        warnings = _helper_restore_warnings(ran.stderr)
+        assert len(warnings) == 1, ran.output
+        assert warnings[0].startswith(f"Cannot restore {cached}: [Errno 13] Permission denied: "), (
+            ran.output
+        )
         assert not cached.exists()
 
 

@@ -1842,12 +1842,20 @@ def missing_cache_objects(
     members: listing.DirListing | None,
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
+    *,
+    readable: bool = False,
 ) -> list[str]:
     """Return hashes required to restore an output that are absent from the cache.
 
     ``members`` is a directory's listing (None for a file). With SYMLINK first, an existing
     whole-directory tree for a directory output is checked but never repaired here: a supplied
     listing must match its canonical mark byte-for-byte before the tree is trusted.
+
+    With ``readable``, each object found is also opened for reading, as every checkout of it
+    opens it (a copy reads it, and a link's staged entry is opened through it,
+    ``_fstat_staged``), and an ``OSError`` that open gives is raised, as one the lookup gives is
+    (``_is_cache_object_path``): the restore would fail on it. A whole-directory tree it trusts
+    is linked as it is, with no object opened.
     """
     if is_dir_hash(output_hash):
         assert members is not None, "a directory is restored from its listing"
@@ -1861,9 +1869,14 @@ def missing_cache_objects(
         hashes = [entry["hash"] for entry in members["files"]]
     else:
         hashes = [output_hash["hash"]]
-    return [
-        file_hash for file_hash in hashes if resolve_cache_object_path(cache_dir, file_hash) is None
-    ]
+    missing = list[str]()
+    for file_hash in hashes:
+        found = resolve_cache_object_path(cache_dir, file_hash)
+        if found is None:
+            missing.append(file_hash)
+        elif readable:
+            os.close(os.open(found, os.O_RDONLY))
+    return missing
 
 
 def save_to_cache(

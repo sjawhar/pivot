@@ -10,11 +10,13 @@ run's stages are its `stage_complete` events.
 from __future__ import annotations
 
 import json
+import shutil
 from typing import TYPE_CHECKING, Any
 
 import pytest
 import yaml
 
+from pivot import registry
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -114,6 +116,71 @@ with Pipeline("p") as pipeline:
 
 _UNCHANGED = {"would_run": False, "reason": "unchanged"}
 _BLOCKED = {"would_run": False, "reason": "upstream 'p/cut' would fail"}
+
+# p/cut is mapped over p/plan's files and writes one field, y: instance p/cut@<key> writes
+# data/p/cut@<key>/y.txt
+_FIELDS_PIPELINE = """\
+from typing import Annotated, TypedDict
+
+from pivot import Pipeline, directory, stage
+
+
+class Fields(TypedDict):
+    y: str
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str) -> Fields:
+    return {"y": entry}
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan()))
+"""
+
+# Pipeline p/cut@b's stage p/cut@b/y writes data/p/cut@b/y.txt, the output p/cut@b would write
+_CLASHING_PIPELINE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def y() -> str:
+    return "static"
+
+
+with Pipeline("p/cut@b") as pipeline:
+    y()
+"""
+
+# helpers.MAPPED_FILE_PIPELINE with p/cut's output incremental: p/cut@<key> keeps
+# data/p/cut@<key>.txt from its last run
+_INCREMENTAL_MAPPED_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, incremental, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str, previous: str) -> Annotated[str, incremental]:
+    return previous + entry
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan()), pipeline.previous())
+"""
+
+# _CHAIN_PIPELINE's mapped stages, each standing for its instances while not expanded
+_CHAIN_TEMPLATES = ["p/cut", "p/build", "p/final"]
 
 
 def _ok(proc: subprocess.CompletedProcess[str]) -> str:
@@ -398,3 +465,207 @@ def test_dry_run_keep_going_checks_only_the_instances_a_target_names(
     assert statuses.keys() == document["stages"].keys()
     assert (root / "data" / "p" / "cut@b.txt").read_text() == "b"
     assert not (root / "data" / "p" / "cut@a.txt").exists(), "the tracked file stays missing"
+
+
+def test_dry_run_keep_going_plans_only_the_keys_an_instance_target_names(
+    tmp_path: pathlib.Path,
+) -> None:
+    """p/cut@b's output data/p/cut@b/y.txt is also the output of pipeline p/cut@b's stage y, so
+    a run over every key fails p/cut for the clash, and its dry run says p/cut would fail. With
+    target p/cut@a the run plans key a alone (``expansion.plan_instances``), adds p/cut@a, runs
+    it and exits 0; the dry run plans the same key and lists p/cut@a, not p/cut."""
+    root, home = _git_project(tmp_path)
+    _write(root / "p" / "pipeline.py", _FIELDS_PIPELINE)
+    _write(root / "q" / "pipeline.py", _CLASHING_PIPELINE)
+    first, first_events = _run(root, home)
+
+    every, _ = _dry_run(root, home)
+    document, stderr = _dry_run(root, home, "p/cut@a")
+    ran, events = _run(root, home, "p/cut@a")
+
+    assert first.returncode == 1, first.stdout + first.stderr
+    clash = (
+        "cannot expand over the files of 'p/plan': Output path conflict: 'p/cut@b:y' and "
+        + "'p/cut@b/y' both write data/p/cut@b/y.txt."
+    )
+    assert {
+        event["stage"]: (event["status"], event["reason"])
+        for event in first_events
+        if event["type"] == "stage_complete" and event["stage"] == "p/cut"
+    } == {"p/cut": ("failed", clash)}, first.stdout
+    assert every == {
+        "stages": {
+            "p/plan": _UNCHANGED,
+            "p/cut@b/y": _UNCHANGED,
+            "p/cut": {"would_run": False, "reason": clash},
+        }
+    }, every
+    assert document == {
+        "stages": {
+            "p/plan": _UNCHANGED,
+            "p/cut@a": {"would_run": True, "reason": "No previous run"},
+        }
+    }, stderr
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    statuses = _statuses(events)
+    assert statuses == {"p/plan": "cached", "p/cut@a": "ran"}, ran.stdout
+    assert statuses.keys() == document["stages"].keys()
+
+
+def test_dry_run_keep_going_removes_no_instance_of_a_key_its_targets_leave_out(
+    tmp_path: pathlib.Path,
+) -> None:
+    """p/cut@a and p/cut@b both ran, and p/plan's listing still holds both keys. With target
+    p/cut@a the run adds p/cut@a alone and removes no instance: p/cut@b's key is still listed.
+    The dry run, which also adds p/cut@a alone, would remove nothing either: an orphan is an
+    instance of no key the listing holds (``Expansion``'s ``listed``), not one it did not add."""
+    root, home = _git_project(tmp_path)
+    (root / "pipeline.py").write_text(helpers.MAPPED_FILE_PIPELINE)
+    _ok(helpers.run_pivot(root, home, "repro"))
+
+    document, stderr = _dry_run(root, home, "p/cut@a")
+    ran, events = _run(root, home, "p/cut@a")
+
+    assert document == {"stages": {"p/plan": _UNCHANGED, "p/cut@a": _UNCHANGED}}, stderr
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert _statuses(events) == {"p/plan": "cached", "p/cut@a": "cached"}, ran.stdout
+    assert [event for event in events if event["type"] == "stages_expanded"] == [
+        {"type": "stages_expanded", "template": "p/cut", "stages": ["p/cut@a"]}
+    ], ran.stdout
+    assert (root / ".pivot" / "stages" / "p" / "cut@b.lock").is_file(), "p/cut@b is kept"
+
+
+@pytest.mark.parametrize("allow", [False, True], ids=["refused", "allowed"])
+def test_dry_run_keep_going_fails_a_mapped_stage_whose_incremental_output_is_not_cached(
+    tmp_path: pathlib.Path, allow: bool
+) -> None:
+    """p/cut's instances keep an incremental output. Once p/cut@a's lock is gone, its output
+    data/p/cut@a.txt is on disk but not in the cache: the run fails p/cut with the refusal
+    ``executor.core.incremental_refusal`` gives, runs no instance and exits 1, and the dry run
+    shows p/cut as a stage that would fail, with that reason, and no instance. With
+    --allow-uncached-incremental the run expands p/cut, runs p/cut@a and skips p/cut@b, and the
+    dry run lists them so."""
+    root, home = _git_project(tmp_path)
+    (root / "pipeline.py").write_text(_INCREMENTAL_MAPPED_PIPELINE)
+    _ok(helpers.run_pivot(root, home, "repro"))
+    (root / ".pivot" / "stages" / "p" / "cut@a.lock").unlink()
+    flags = ["--allow-uncached-incremental"] if allow else []
+
+    document, stderr = _dry_run(root, home, *flags)
+    ran, events = _run(root, home, *flags)
+
+    statuses = _statuses(events)
+    if allow:
+        assert ran.returncode == 0, ran.stdout + ran.stderr
+        assert statuses == {"p/plan": "cached", "p/cut@a": "ran", "p/cut@b": "cached"}
+        assert document == {
+            "stages": {
+                "p/plan": _UNCHANGED,
+                "p/cut@a": {"would_run": True, "reason": "No previous run"},
+                "p/cut@b": _UNCHANGED,
+            }
+        }, stderr
+    else:
+        assert ran.returncode == 1, ran.stdout + ran.stderr
+        assert statuses == {"p/plan": "cached", "p/cut": "failed"}, ran.stdout
+        reason = next(
+            event["reason"]
+            for event in events
+            if event["type"] == "stage_complete" and event["stage"] == "p/cut"
+        )
+        assert reason.startswith(
+            "cannot expand over the files of 'p/plan': The following incremental output files "
+            + "exist but are not in cache:\n  - p/cut@a: "
+        ), reason
+        assert "cut@a.txt\n\nRunning the pipeline will DELETE these files" in reason, reason
+        assert document == {
+            "stages": {"p/plan": _UNCHANGED, "p/cut": {"would_run": False, "reason": reason}}
+        }, stderr
+    assert statuses.keys() == document["stages"].keys()
+
+
+def _lose_plan_listing(root: pathlib.Path) -> None:
+    """Remove every cache object and p/plan's committed listing, as a clone that never pulled
+    holds neither."""
+    for entry in (root / ".pivot" / "cache" / "files").iterdir():
+        shutil.rmtree(entry)
+    (root / ".pivot" / "stages" / "p" / "plan=.listing").unlink()
+
+
+def test_dry_run_keep_going_leaves_a_mapped_stage_not_expanded_over_a_producer_only_pullable(
+    tmp_path: pathlib.Path,
+) -> None:
+    """p/plan's lock matches, but its directory, its cache objects and its committed listing
+    are gone. A remote is configured, so the dry run counts p/plan current, as a pull would
+    bring it up to date, and cannot read its listing. The run never pulls: it runs p/plan again,
+    expands p/cut, p/build and p/final from what p/plan writes, and exits 0. So the dry run shows
+    p/plan as a stage that would run, and p/cut, p/build and p/final as mapped stages not yet
+    expanded, as 0.10.4 does, each a row for the instances the run adds; none would fail or be
+    blocked."""
+    root, home = _git_project(tmp_path)
+    (root / "pipeline.py").write_text(_CHAIN_PIPELINE)
+    _ok(helpers.run_pivot(root, home, "repro"))
+    _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", "s3://bucket/x"))
+    _lose_plan_listing(root)
+    shutil.rmtree(root / "data" / "p" / "plan")
+
+    document, stderr = _dry_run(root, home)
+    ran, events = _run(root, home)
+
+    stages = document["stages"]
+    assert stages.keys() == {"p/plan", *_CHAIN_TEMPLATES}, document
+    assert stages["p/plan"] == {"would_run": True, "reason": "Outputs missing from cache"}
+    cut = stages["p/cut"]["reason"]
+    assert cut.startswith("Not yet expanded: the listing of 'p/plan' is missing"), cut
+    assert cut.endswith("and `pivot repro --force p/plan` writes it again"), cut
+    for chained, over in (("p/build", "p/cut"), ("p/final", "p/build")):
+        assert stages[chained] == {
+            "would_run": True,
+            "reason": f"Not yet expanded: mapped over the instances of '{over}', which is not "
+            + "expanded",
+        }, stderr
+    assert all(row["would_run"] for row in stages.values()), document
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    statuses = _statuses(events)
+    assert statuses == {
+        "p/plan": "ran",
+        **{f"{template}@{key}": "cached" for template in _CHAIN_TEMPLATES for key in "ab"},
+    }, ran.stdout
+    assert {registry.template_of(stage, _CHAIN_TEMPLATES) or stage for stage in statuses} == (
+        stages.keys()
+    )
+
+
+@pytest.mark.parametrize("tree", ["listing_lost", "file_added"])
+def test_dry_run_keep_going_reads_the_keys_a_no_commit_run_reads(
+    tmp_path: pathlib.Path, tree: str
+) -> None:
+    """--no-commit: the run reads p/plan's keys from the directory its skip leaves in the
+    workspace at its lock's record (``expansion.workspace_keys``). In `listing_lost` the cache
+    objects and the committed listing of data/p/plan/ are gone and the directory stays: the run
+    expands p/cut, p/build and p/final from the directory and exits 0, and the dry run reads the
+    directory as the run does, listing every instance, none that would fail. In `file_added`,
+    data/p/plan/c.txt was added after the last run: the run's skip restores data/p/plan/ to the
+    lock's record, so the run expands keys a and b alone, and the dry run reads the listing the
+    lock records, not the directory on disk."""
+    root, home = _git_project(tmp_path)
+    (root / "pipeline.py").write_text(_CHAIN_PIPELINE)
+    _ok(helpers.run_pivot(root, home, "repro"))
+    added = root / "data" / "p" / "plan" / "c.txt"
+    if tree == "listing_lost":
+        _lose_plan_listing(root)
+    else:
+        added.write_text("c")
+
+    document, stderr = _dry_run(root, home, "--no-commit")
+    ran, events = _run(root, home, "--no-commit")
+
+    instances = [f"{template}@{key}" for template in _CHAIN_TEMPLATES for key in "ab"]
+    assert document == {"stages": {"p/plan": _UNCHANGED, **dict.fromkeys(instances, _UNCHANGED)}}, (
+        stderr
+    )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    statuses = _statuses(events)
+    assert statuses == dict.fromkeys(["p/plan", *instances], "cached"), ran.stdout
+    assert statuses.keys() == document["stages"].keys()
+    assert not added.exists(), "the skip restores the directory to its lock's record"
