@@ -371,7 +371,8 @@ def _links_to_object(link: pathlib.Path, cache_path: pathlib.Path, cache_root: C
 # check that would restore over the link) does not catch it. They test errno themselves, not
 # through pathlib: from Python 3.14 ``Path.is_file()`` is ``os.path.isfile``, which hides every
 # error: https://github.com/python/cpython/blob/v3.14.0/Lib/pathlib/__init__.py#L690-L696
-# ``track.present_kind`` reads the same errors as "a tracked path is missing".
+# Outside this module, ``track._followed_mode`` alone reads them, as "nothing stands at a tracked
+# path" (``track.present_kind``, ``track.occupant``).
 NO_FILE_ERRNO = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
 _NOT_A_LINK_ERRNO = NO_FILE_ERRNO | {errno.EINVAL}
 

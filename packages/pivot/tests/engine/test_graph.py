@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import pickle
 import random
 from typing import TYPE_CHECKING
@@ -880,10 +879,11 @@ def test_get_runnable_stages_reports_a_missing_tracked_file_a_fifo_stands_in_onc
     path. Neither the pre-flight's view nor the check opens the FIFO."""
     fifo = set_project_root / "data" / "dir" / "x.csv"
     helpers.track_without_data(fifo)
-    os.mkfifo(fifo)
+    helpers.occupy(fifo, "fifo")
     (set_project_root / "data" / "alias").symlink_to("dir/x.csv")
     missing = helpers.call_without_waiting(
-        lambda: executor_core.find_missing_tracked_files(set_project_root).missing.paths, fifo
+        lambda: executor_core.find_missing_tracked_files(set_project_root).missing.paths,
+        lambda: helpers.free_fifo(fifo),
     )
     stages = {
         "ok/a": _create_stage("ok/a", [], [_output("ok/a")]),
@@ -894,7 +894,9 @@ def test_get_runnable_stages_reports_a_missing_tracked_file_a_fifo_stands_in_onc
         set_project_root, {"x": "data/dir/x.csv", "dir": "data/dir", "alias": "data/alias"}
     )
 
-    found = helpers.call_without_waiting(lambda: _helper_runnable(stages, store, missing), fifo)
+    found = helpers.call_without_waiting(
+        lambda: _helper_runnable(stages, store, missing), lambda: helpers.free_fifo(fifo)
+    )
 
     assert missing == [str(fifo)]
     assert found.stages is not None

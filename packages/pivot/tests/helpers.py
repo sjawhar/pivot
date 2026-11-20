@@ -2,8 +2,8 @@
 pipeline.py text, tracked files with no data or removed once tracked, a cache's whole-directory
 trees and a cache register on a read-only mount, git projects that the installed `pivot` runs in,
 the output of `pivot repro --jsonl` and its restore warnings, the dry run and the run of `pivot
-repro --all --keep-going`, sockets, a call that must not wait on a FIFO, and venvs that CI-only
-tests install with uv."""
+repro --all --keep-going`, sockets, a call that must not wait on a FIFO or a lock, an entry of
+each kind where a path belongs, and venvs that CI-only tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -298,10 +299,13 @@ def restore_warnings(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
 
 
-def call_without_waiting[T](call: Callable[[], T], fifo: pathlib.Path, timeout: float = 120) -> T:
+def call_without_waiting[T](
+    call: Callable[[], T], release: Callable[[], None], timeout: float = 120
+) -> T:
     """``call()``, run in a thread, and what it returns or raises. When it is still running
-    after ``timeout`` seconds, as an open of a FIFO for reading waits for a writer, the FIFO that
-    ``fifo`` leads to is freed (``_free_fifo``), and the test fails instead of hanging."""
+    after ``timeout`` seconds, as an open of a FIFO for reading waits for a writer or a lock
+    waits for its holder, ``release()`` frees what it waits on (``free_fifo`` for a FIFO), the
+    thread has ``timeout`` seconds more to end, and the test fails instead of hanging."""
     outcome = list[T | BaseException]()
 
     def _run() -> None:
@@ -315,7 +319,7 @@ def call_without_waiting[T](call: Callable[[], T], fifo: pathlib.Path, timeout: 
     thread.join(timeout)
     waited = thread.is_alive()
     if waited:
-        _free_fifo(fifo)
+        release()
         thread.join(timeout)
     assert not waited, f"the call was still running after {timeout} s"
     (result,) = outcome
@@ -324,7 +328,7 @@ def call_without_waiting[T](call: Callable[[], T], fifo: pathlib.Path, timeout: 
     return result
 
 
-def _free_fifo(path: pathlib.Path) -> None:
+def free_fifo(path: pathlib.Path) -> None:
     """Free each open for reading that waits on the FIFO ``path`` leads to (symlinks followed),
     and put an empty regular file in its place, so that no later open waits either (a stage's
     worker hashes an input, then opens it again to load it). Nothing where ``path`` leads to no
@@ -348,6 +352,59 @@ def _free_fifo(path: pathlib.Path) -> None:
     finally:
         if writer is not None:
             os.close(writer)
+
+
+def occupy(path: pathlib.Path, kind: str) -> None:
+    """Put an entry of ``kind`` at ``path``, where none is, and check with ``os.lstat`` that it
+    is there, of its type (for "nothing", that no entry is), so no test passes on an entry made
+    elsewhere: "nothing"; a "regular_file"; a "directory" (mode 0o700); a "socket"; a "fifo"
+    (mode 0o600); a symlink to the file target.txt ("symlink_to_file"), the directory somedir
+    ("symlink_to_directory") or the FIFO pipe ("symlink_to_fifo"), each made beside it; a
+    symlink to nothing ("dangling_symlink"); or a symlink to itself ("symlink_loop"). The modes
+    are fixed, so a test may name them (``stat.filemode``).
+
+    A socket is bound by ``os.path.relpath(path)``, which works from any working directory at or
+    above the directory holding ``path``: an address holds at most 108 bytes, which an absolute
+    path under a test's temporary directory may pass. Its file stays once the socket is closed.
+    """
+    match kind:
+        case "nothing":
+            assert not os.path.lexists(path), path
+            return
+        case "regular_file":
+            path.write_text("data")
+            made = stat.S_IFREG
+        case "directory":
+            path.mkdir(mode=0o700)
+            made = stat.S_IFDIR
+        case "socket":
+            with socket.socket(socket.AF_UNIX) as bound:
+                bound.bind(os.path.relpath(path))
+            made = stat.S_IFSOCK
+        case "fifo":
+            os.mkfifo(path, 0o600)
+            made = stat.S_IFIFO
+        case "symlink_to_file":
+            (path.parent / "target.txt").write_text("target")
+            path.symlink_to("target.txt")
+            made = stat.S_IFLNK
+        case "symlink_to_directory":
+            (path.parent / "somedir").mkdir()
+            path.symlink_to("somedir")
+            made = stat.S_IFLNK
+        case "symlink_to_fifo":
+            os.mkfifo(path.parent / "pipe", 0o600)
+            path.symlink_to("pipe")
+            made = stat.S_IFLNK
+        case "dangling_symlink":
+            path.symlink_to("nowhere")
+            made = stat.S_IFLNK
+        case "symlink_loop":
+            path.symlink_to(path.name)
+            made = stat.S_IFLNK
+        case _:
+            raise ValueError(f"no entry kind {kind!r}")
+    assert stat.S_IFMT(os.lstat(path).st_mode) == made, f"{path} is no {kind}"
 
 
 def completed_stages(stdout: str) -> dict[str, dict[str, object]]:

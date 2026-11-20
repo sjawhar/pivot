@@ -1354,9 +1354,9 @@ def _run_oneshot_mode(
     + "--all --keep-going, and neither --watch nor --fail-fast, --dry-run and --explain restore "
     + "nothing and count such a file as present when the cache holds every object its restore "
     + "needs, unless the restore could not write it or read its cache objects, a socket, a FIFO "
-    + "or a device stands in its place, or it lies in a tracked directory whose committed "
-    + "listing is stale, empty or unreadable with no cached copy; the run warns for each such "
-    + "file and leaves out the stages that read it.",
+    + "or a device, or a symlink to one, stands in its place, or it lies in a tracked directory "
+    + "whose committed listing is stale, empty or unreadable with no cached copy; the run warns "
+    + "for each such file and leaves out the stages that read it.",
 )
 @click.option(
     "--allow-missing",

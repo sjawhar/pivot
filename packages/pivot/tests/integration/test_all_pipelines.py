@@ -408,54 +408,42 @@ def test_repro_all_tracked_keep_going_leaves_out_the_reader_of_a_tracked_path_th
         assert not (cwd / "data" / "broken" / "read_0.txt").exists(), "the reader must not run"
 
 
-def _helper_occupy(path: pathlib.Path, occupant: str) -> None:
-    """Put ``occupant`` at ``path``, the place of a tracked file in data/raw under the working
-    directory: a socket, bound by its path from there (an address holds at most 108 bytes; its
-    file stays once the socket is closed); a FIFO; a symlink to the FIFO data/raw/pipe; a
-    symlink to nothing; or a symlink to the empty directory data/raw/somedir."""
-    match occupant:
-        case "socket":
-            with socket.socket(socket.AF_UNIX) as bound:
-                bound.bind(os.path.relpath(path))
-        case "fifo":
-            os.mkfifo(path)
-        case "symlink_to_fifo":
-            os.mkfifo(path.parent / "pipe")
-            path.symlink_to("pipe")
-        case "dangling_symlink":
-            path.symlink_to("nowhere")
-        case _:
-            assert occupant == "symlink_to_directory", occupant
-            (path.parent / "somedir").mkdir()
-            path.symlink_to("somedir")
-
-
-# What the run reports of each stage when the reader of data/raw/missing.txt is left out, when it
-# and its downstream stage run, and when the reader runs and fails
-_ALPHA_ALONE = {"alpha/stage_a": "ran"}
-_EVERY_STAGE = {"alpha/stage_a": "ran", "broken/read_0": "ran", "broken/after": "ran"}
-_READER_FAILS = {"alpha/stage_a": "ran", "broken/read_0": "failed", "broken/after": "blocked"}
+# What the run does with the reader of data/raw/missing.txt, by outcome: the status it reports of
+# each stage, its `Skipping:` lines and its exit code. "left_out": the reader is left out;
+# "restored": the restore brings the file back, and the reader and its downstream stage run;
+# "reader_fails": the reader runs and fails, and its downstream stage is blocked
+_OUTCOMES: dict[str, tuple[dict[str, str], list[str], int]] = {
+    "left_out": ({"alpha/stage_a": "ran"}, [_READER_SKIPPED], 0),
+    "restored": ({"alpha/stage_a": "ran", "broken/read_0": "ran", "broken/after": "ran"}, [], 0),
+    "reader_fails": (
+        {"alpha/stage_a": "ran", "broken/read_0": "failed", "broken/after": "blocked"},
+        [],
+        1,
+    ),
+}
 
 
 @pytest.mark.parametrize(
-    ("occupant", "checkout_missing", "statuses", "kept"),
+    ("occupant", "checkout_missing", "outcome", "kept"),
     [
-        pytest.param("socket", False, _ALPHA_ALONE, None, id="socket"),
-        pytest.param("socket", True, _ALPHA_ALONE, "a socket", id="socket-checkout"),
-        pytest.param("fifo", False, _ALPHA_ALONE, None, id="fifo"),
-        pytest.param("fifo", True, _ALPHA_ALONE, "a FIFO", id="fifo-checkout"),
+        pytest.param("socket", False, "left_out", None, id="socket"),
+        pytest.param("socket", True, "left_out", "a socket", id="socket-checkout"),
+        pytest.param("fifo", False, "left_out", None, id="fifo"),
+        pytest.param("fifo", True, "left_out", "a FIFO", id="fifo-checkout"),
         pytest.param(
             "symlink_to_fifo",
             True,
-            _ALPHA_ALONE,
+            "left_out",
             "a symlink to a FIFO",
             id="symlink_to_fifo-checkout",
         ),
-        pytest.param("dangling_symlink", False, _ALPHA_ALONE, None, id="dangling_symlink"),
-        pytest.param("dangling_symlink", True, _EVERY_STAGE, None, id="dangling_symlink-checkout"),
-        pytest.param("symlink_to_directory", False, _READER_FAILS, None, id="symlink_to_directory"),
+        pytest.param("dangling_symlink", False, "left_out", None, id="dangling_symlink"),
+        pytest.param("dangling_symlink", True, "restored", None, id="dangling_symlink-checkout"),
         pytest.param(
-            "symlink_to_directory", True, _READER_FAILS, None, id="symlink_to_directory-checkout"
+            "symlink_to_directory", False, "reader_fails", None, id="symlink_to_directory"
+        ),
+        pytest.param(
+            "symlink_to_directory", True, "reader_fails", None, id="symlink_to_directory-checkout"
         ),
     ],
 )
@@ -464,13 +452,14 @@ def test_repro_all_tracked_keep_going_and_its_dry_run_agree_on_what_stands_at_a_
     tmp_path: pathlib.Path,
     occupant: str,
     checkout_missing: bool,
-    statuses: dict[str, str],
+    outcome: str,
     kept: str | None,
 ) -> None:
     """R1, R2, R5: data/raw/missing.txt, which broken/read_0 reads, is tracked with its object in
-    the cache, and ``occupant`` stands in its place. The run and the dry run on the same tree
-    agree, by the one rule for whether a tracked path is present (``track.present_kind``: a
-    regular file or a directory, symlinks followed).
+    the cache, and ``occupant`` (``helpers.occupy``) stands in its place. The run and the dry run
+    on the same tree agree, by the one rule for whether a tracked path is present
+    (``track.present_kind``: a regular file or a directory, symlinks followed), on ``outcome``
+    (``_OUTCOMES``).
 
     A socket, a FIFO and a symlink to nothing are missing: the reader is left out with one
     `Skipping:` line, alpha runs, exit 0, and the dry run lists alpha alone. With
@@ -481,26 +470,27 @@ def test_repro_all_tracked_keep_going_and_its_dry_run_agree_on_what_stands_at_a_
     text input that is a directory does, so the stage downstream of it is blocked and the run
     exits 1. No command opens a FIFO: each must finish within the hard timeout of
     ``helpers.call_without_waiting``, which frees a reader of one and fails the test."""
+    statuses, skipped, exit_code = _OUTCOMES[outcome]
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _helper_reader_project(cwd, tracked=False)
         tracked = cwd / "data" / "raw" / "missing.txt"
         tracked.parent.mkdir(parents=True)
         tracked.write_text("tracked bytes")
         helpers.track_then_remove(runner, cwd, "data/raw/missing.txt")
-        _helper_occupy(tracked, occupant)
+        helpers.occupy(tracked, occupant)
         entry = stat.S_IFMT(os.lstat(tracked).st_mode)
         options = ["--checkout-missing"] if checkout_missing else []
 
         dry_run = helpers.call_without_waiting(
-            lambda: runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, *options]), tracked
+            lambda: runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, *options]),
+            lambda: helpers.free_fifo(tracked),
         )
         stays = stat.S_IFMT(os.lstat(tracked).st_mode) == entry
         ran = helpers.call_without_waiting(
             lambda: runner.invoke(cli.cli, ["repro", "--all", "--keep-going", "--jsonl", *options]),
-            tracked,
+            lambda: helpers.free_fifo(tracked),
         )
 
-        skipped = [_READER_SKIPPED] if statuses == _ALPHA_ALONE else []
         warnings = (
             []
             if kept is None
@@ -516,11 +506,11 @@ def test_repro_all_tracked_keep_going_and_its_dry_run_agree_on_what_stands_at_a_
         assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
         assert helpers.restore_warnings(dry_run.stderr) == warnings, dry_run.output
         assert stays, "a dry run restores nothing"
-        assert ran.exit_code == (1 if "failed" in statuses.values() else 0), ran.output
+        assert ran.exit_code == exit_code, ran.output
         assert helpers.stage_statuses(ran.stdout) == statuses, ran.output
         assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
         assert helpers.restore_warnings(ran.stderr) == warnings, ran.output
-        if statuses == _EVERY_STAGE:
+        if outcome == "restored":
             assert tracked.read_text() == "tracked bytes"
         else:
             assert stat.S_IFMT(os.lstat(tracked).st_mode) == entry, "the entry stays"

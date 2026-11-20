@@ -421,15 +421,15 @@ def _tracked_file_errors(
     stays. A dependency of ``present`` (one no stage produces, found on disk or created by a
     restore, with its stage) that is a missing tracked file or lies inside one (an entry is
     there, but neither a regular file nor a directory, so ``storage.track.present_kind`` counts
-    the file missing: a socket, a FIFO) gets the error ``validate_dependency_sources`` gives a
-    missing one, unless the stage has one for that file; and one that is a directory holding
-    missing tracked files gets one error per such file the stage has no error for yet. Each path
-    counts in both its forms, normalized and resolved (``os.path.realpath``, which resolves a
-    missing path's existing ancestors), as a watch run waits for a missing input (``Engine``'s
+    the file missing: a socket, a FIFO) gets the message ``validate_dependency_sources`` gives a
+    missing one, without an output suggestion (the tracked file's data is the fix), unless the
+    stage has one for that file; and one that is a directory holding missing tracked files gets
+    one error per such file the stage has no error for yet. Each path counts in both its forms,
+    normalized and resolved (``os.path.realpath``, which resolves a missing path's existing
+    ancestors), as a watch run waits for a missing input (``Engine``'s
     ``_MissingDependencyRun.awaits``): a dependency that reaches a missing tracked file through a
     symlink reads it. Path parts decide containment, never a string prefix: ``data-backup/x`` is
-    not inside ``data``.
-    """
+    not inside ``data``."""
     from pivot import exceptions
 
     missing = _forms_trie(missing_tracked)

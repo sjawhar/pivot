@@ -1,7 +1,6 @@
 import logging
 import os
 import pathlib
-import socket
 
 import pytest
 import xxhash
@@ -323,33 +322,7 @@ def test_get_data_path_invalid_suffix_raises() -> None:
         track.get_data_path(not_pvt)
 
 
-# present_kind
-
-
-def _helper_make_entry(kind: str, path: pathlib.Path) -> None:
-    """Put an entry of ``kind`` at ``path``, a name in the working directory beside the file
-    target.txt and the directory target_dir. A socket is bound by its name: an address holds at
-    most 108 bytes, and its file stays once the socket is closed."""
-    match kind:
-        case "regular_file":
-            path.write_text("data")
-        case "directory":
-            path.mkdir()
-        case "symlink_to_file":
-            path.symlink_to("target.txt")
-        case "symlink_to_directory":
-            path.symlink_to("target_dir")
-        case "dangling_symlink":
-            path.symlink_to("nowhere")
-        case "symlink_loop":
-            path.symlink_to(path.name)
-        case "socket":
-            with socket.socket(socket.AF_UNIX) as bound:
-                bound.bind(path.name)
-        case "fifo":
-            os.mkfifo(path)
-        case _:
-            assert kind == "nothing", kind
+# present_kind, occupant
 
 
 @pytest.mark.parametrize(
@@ -363,6 +336,7 @@ def _helper_make_entry(kind: str, path: pathlib.Path) -> None:
         ("symlink_loop", None),
         ("socket", None),
         ("fifo", None),
+        ("symlink_to_fifo", None),
         ("nothing", None),
     ],
 )
@@ -370,26 +344,62 @@ def test_present_kind_counts_only_a_regular_file_or_a_directory_as_present(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str, expected: str | None
 ) -> None:
     """The one rule for whether a tracked path is present: a regular file or a directory,
-    symlinks followed, and nothing else. A symlink to nothing or to itself, a socket, a FIFO or
-    no entry at all is missing. It never opens the path: on a FIFO, whose open for reading
-    waits for a writer, it returns at once."""
+    symlinks followed, and nothing else. A symlink to nothing or to itself, a socket, a FIFO, a
+    symlink to one or no entry at all is missing. It never opens the path: on a FIFO, whose
+    open for reading waits for a writer, it returns at once."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "target.txt").write_text("target")
-    (tmp_path / "target_dir").mkdir()
     path = tmp_path / "tracked"
-    _helper_make_entry(kind, path)
+    helpers.occupy(path, kind)
 
-    found = helpers.call_without_waiting(lambda: track.present_kind(path), path, timeout=10)
+    found = helpers.call_without_waiting(
+        lambda: track.present_kind(path), lambda: helpers.free_fifo(path), timeout=10
+    )
+
+    assert found == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("regular_file", None),
+        ("directory", None),
+        ("symlink_to_file", None),
+        ("symlink_to_directory", None),
+        ("dangling_symlink", None),
+        ("symlink_loop", None),
+        ("nothing", None),
+        ("socket", "a socket"),
+        ("fifo", "a FIFO"),
+        ("symlink_to_fifo", "a symlink to a FIFO"),
+    ],
+)
+def test_occupant_names_an_entry_at_a_tracked_path_that_is_neither_file_nor_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str, expected: str | None
+) -> None:
+    """What stands at a tracked path that ``present_kind`` counts missing, and that a restore
+    does not replace, named for its warning: a socket, a FIFO, or a symlink to one. Nothing, a
+    symlink to nothing or to itself, a regular file and a directory, symlinks followed, are
+    None. It never opens the path: on a FIFO it returns at once."""
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "tracked"
+    helpers.occupy(path, kind)
+
+    found = helpers.call_without_waiting(
+        lambda: track.occupant(path), lambda: helpers.free_fifo(path), timeout=10
+    )
 
     assert found == expected
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root searches a directory whatever its mode")
-def test_present_kind_raises_a_stat_error_other_than_no_such_file(tmp_path: pathlib.Path) -> None:
+def test_present_kind_and_occupant_raise_a_stat_error_other_than_no_such_file(
+    tmp_path: pathlib.Path,
+) -> None:
     """A tracked path whose ``stat`` fails for another reason than "no such file" is neither
     present nor missing: below a directory this user cannot search, ``PermissionError`` is
     raised, as ``Path.is_file()`` raises it on Python 3.13, so the pre-flight stops there
-    rather than count the file missing and leave its readers out."""
+    rather than count the file missing and leave its readers out. ``occupant`` raises it too,
+    and the restore then warns that it fails (``tracked_restore._occupied``)."""
     locked = tmp_path / "locked"
     locked.mkdir()
     (locked / "data.csv").write_text("data")
@@ -398,6 +408,8 @@ def test_present_kind_raises_a_stat_error_other_than_no_such_file(tmp_path: path
     try:
         with pytest.raises(PermissionError):
             track.present_kind(locked / "data.csv")
+        with pytest.raises(PermissionError):
+            track.occupant(locked / "data.csv")
     finally:
         locked.chmod(0o755)
 

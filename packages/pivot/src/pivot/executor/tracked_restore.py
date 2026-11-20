@@ -3,8 +3,8 @@
 The pre-flight's ``--checkout-missing`` restore (``executor.core.verify_tracked_files``) restores
 through ``restore_tracked``. The dry run in leave-out mode
 (``executor.core.find_missing_tracked_files``) asks ``check_tracked``, which writes nothing. Both
-find, through one read, ``_occupied``, an entry at the path that the restore in leave-out mode
-does not replace, and what the restore links, through another, ``_source``. ``check_tracked``
+find an entry at the path that the restore in leave-out mode does not replace through one check,
+``_occupied``, and what the restore links through one read, ``_source``. ``check_tracked``
 predicts the rest of the restore (how it checks each cache object out, which objects it reads,
 whether it can write the path, and where it refuses to link from a cache it could not register
 in) from reads alone; the agreement tests, which give a dry run and a run the same tree, guard
@@ -16,9 +16,7 @@ from __future__ import annotations
 import enum
 import itertools
 import logging
-import os
 import pathlib
-import stat
 from typing import TYPE_CHECKING, NamedTuple
 
 from pivot import config, exceptions, types
@@ -26,6 +24,8 @@ from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, ownership, track
 
 if TYPE_CHECKING:
+    import os
+
     from pivot.storage import listing
 
 logger = logging.getLogger(__name__)
@@ -364,36 +364,24 @@ def _write_failure(path: pathlib.Path) -> Check | None:
 
 def _occupied(path: pathlib.Path) -> bool:
     """Whether the restore of missing tracked path ``path`` in leave-out mode fails before it
-    reads the cache, warning that it fails (``_warn_failed``): an entry stands at the path,
-    symlinks followed, that is neither a regular file nor a directory, so the pre-flight counts
-    the path missing (``track.present_kind``): a socket, a FIFO or a device, or a symlink to one.
-    The restore never replaces such an entry, which another program may be using, and never
-    opens it; the run leaves its readers out. Where nothing is at the path, or a symlink to
-    nothing (a symlink checkout whose cache object is gone leaves one), the restore goes on and
-    replaces it. One ``stat`` decides; an ``OSError`` of it other than "no such file"
-    (``cache.NO_FILE_ERRNO``) fails the restore too."""
+    reads the cache, warning that it fails (``_warn_failed``): an entry stands at the path that
+    makes the pre-flight count it missing and that the restore does not replace
+    (``track.occupant``: a socket, a FIFO or a device, or a symlink to one). The restore never
+    replaces such an entry, which another program may be using, and never opens it; the run
+    leaves its readers out. Where nothing is at the path, or a symlink to nothing (a symlink
+    checkout whose cache object is gone leaves one), the restore goes on and replaces it. Where a
+    regular file or a directory landed after the pre-flight found the path missing, it goes on
+    too, and its own check at its swap meets that entry (``ownership.swap_refusal``). One
+    ``stat`` decides, and an ``OSError`` of it other than "no such file" fails the restore too;
+    an ``lstat`` only words the warning ("a symlink to ...")."""
     try:
-        mode = os.stat(path).st_mode
+        occupant = track.occupant(path)
     except OSError as e:
-        if e.errno in cache.NO_FILE_ERRNO:
-            return False
         _warn_failed(path, e)
         return True
-    if stat.S_ISREG(mode) or stat.S_ISDIR(mode):
-        # A file or directory that landed after the pre-flight found the path missing: the
-        # restore's own check at its swap meets it (``ownership.swap_refusal``)
+    if occupant is None:
         return False
-    if stat.S_ISSOCK(mode):
-        kind = "a socket"
-    elif stat.S_ISFIFO(mode):
-        kind = "a FIFO"
-    elif stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
-        kind = "a device"
-    else:
-        kind = "an entry that is neither a file nor a directory"
-    if os.path.islink(path):
-        kind = f"a symlink to {kind}"
-    _warn_failed(path, f"{kind} is in its place, which the restore does not replace")
+    _warn_failed(path, f"{occupant} is in its place, which the restore does not replace")
     return True
 
 

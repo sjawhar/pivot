@@ -3,17 +3,15 @@ generated at random, the dry run (`--dry-run --jsonl`) on one copy of a tree and
 (`--jsonl`) on another copy of it must agree, as spec R5 says
 (``keep_going_agreement.disagreements``).
 
-A seed gives one case (``_generate``): a project of one or two pipelines of plain stages,
-directory producers and mapped stages over them (``Pipeline.map``, and chains of them), reading
-raw files and directories, some tracked with `pivot track`, and of two pipelines the first may
-read the second's stages through their handles (``_compose_across``); the changes made after a
-first full run (``_Change``), among them a FIFO where a deleted tracked path was (``_occupy``);
-and the run's options and targets. A failure names the seed and prints the case and its
-pipelines, and the seed alone builds the same case again. Not
-generated: a cache whose object store is a mount of its own, which takes a mount the test
-cannot make for a command it starts (`test_tracked_keep_going_and_dry_run_keep_going_refuse_a_
-cache_whose_store_is_its_own_mount` in tests/integration/test_all_pipelines.py fakes the mount
-table in process).
+A seed gives one case (``keep_going_cases.generate``): a project of one or two pipelines of
+plain stages, directory producers and mapped stages over them, reading raw files and
+directories, some tracked with `pivot track`, which may compose across pipelines; the changes
+made after a first full run, among them a FIFO where a deleted tracked path was; and the run's
+options and targets. A failure names the seed and prints the case and its pipelines, and the
+seed alone builds the same case again. Not generated: a cache whose object store is a mount of
+its own, which takes a mount the test cannot make for a command it starts
+(`test_tracked_keep_going_and_dry_run_keep_going_refuse_a_cache_whose_store_is_its_own_mount`
+in tests/integration/test_all_pipelines.py fakes the mount table in process).
 
 The fixed seeds run in the normal test job. ``PIVOT_DIFFERENTIAL_SEEDS=N`` runs seeds 0 to N-1
 instead, and ``PIVOT_DIFFERENTIAL_SEEDS=A:B`` seeds A to B-1, for a long run.
@@ -23,21 +21,23 @@ from __future__ import annotations
 
 import os
 import pathlib
-import random
 import shutil
 import stat
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING
 
 import pytest
 import yaml
 
 from pivot.storage import cache, listing, track
 from tests import helpers
-from tests.cli import keep_going_agreement
+from tests.cli import keep_going_agreement, keep_going_cases
 
 if TYPE_CHECKING:
     import subprocess
     from collections.abc import Callable, Collection
+
+    from tests.cli.keep_going_cases import Case, Change, ChangeKind, Input, Project
+
 
 _SEEDS_VARIABLE = "PIVOT_DIFFERENTIAL_SEEDS"
 
@@ -47,12 +47,12 @@ _SEEDS_VARIABLE = "PIVOT_DIFFERENTIAL_SEEDS"
 # directory that it brings back among them
 # (``test_dry_run_keep_going_fixed_seeds_cover_every_kind``), with the seeds that found the
 # disagreements this test was written for. Since cases compose across pipelines
-# (``_compose_across``), seeds 14, 76, 80 and 1126 generate composed cases, not the ones they were
-# pinned for. 14, 76 and 80 were pinned for kinds of case that the coverage test still requires
-# of these seeds between them, so it fails if no seed generates one any more. 1126 was pinned,
-# with 435 and 480, for the pulled producer below; after cases composed, each of the three was
-# run again with the dry run's fix for that disagreement undone and still disagreed, so 1126
-# still pins it
+# (``keep_going_cases._compose_across``), seeds 14, 76, 80 and 1126 generate composed
+# cases, not the ones they were pinned for. 14, 76 and 80 were pinned for kinds of case that the
+# coverage test still requires of these seeds between them, so it fails if no seed generates one
+# any more. 1126 was pinned, with 435 and 480, for the pulled producer below; after cases
+# composed, each of the three was run again with the dry run's fix for that disagreement undone
+# and still disagreed, so 1126 still pins it
 _FIXED_SEEDS = (
     *(4, 13, 14, 18, 39, 48, 52, 61, 76, 80, 106, 117, 193, 380, 522, 729),
     # A pulled producer whose directory a --no-commit dry run read
@@ -73,101 +73,7 @@ _FIXED_SEEDS = (
     1647,
 )
 
-# The keys every producer writes, and the key a dropping producer wrote in the first run alone
-_KEYS = ("a", "b")
-_DROPPED_KEY = "z"
-
 _REMOTE = "s3://bucket/differential"
-
-
-class _Input(NamedTuple):
-    """A raw input under data/raw/."""
-
-    path: str
-    """Project-relative: data/raw/f<i>.txt, or data/raw/d<i> for a directory of x.txt and y.txt."""
-    directory: bool
-    tracked: str
-    """"no"; "whole": `pivot track` of the path; "member": of the directory's file x.txt."""
-
-
-def _tracked_path(item: _Input) -> str:
-    """The path `pivot track` tracks for input ``item`` (one that is tracked): the input itself,
-    or, for a "member", its directory's file x.txt."""
-    return f"{item.path}/x.txt" if item.tracked == "member" else item.path
-
-
-_StageKind = Literal["plain", "producer", "mapped", "chained"]
-
-
-class _Stage(NamedTuple):
-    """A stage of a generated pipeline."""
-
-    name: str
-    """``<pipeline>/<function>``."""
-    pipeline: str
-    function: str
-    kind: _StageKind
-    """"plain" (one text output), "producer" (a directory output of one file per key),
-    "mapped" (over a producer's files) or "chained" (over the instances of a mapped or chained
-    stage)."""
-    reads: tuple[str, ...]
-    """Input paths, and names of plain stages of its pipeline or, for a stage of p0 composed
-    across pipelines (``_compose_across``), of p1, that it reads."""
-    over: str
-    """The stage it is mapped over, of its pipeline or, composed across pipelines, of p1; "" for
-    a plain stage or a producer."""
-    params: bool
-    """Whether it takes a StageParams, whose field ``k`` params.yaml can set."""
-
-
-class _Project(NamedTuple):
-    inputs: tuple[_Input, ...]
-    stages: tuple[_Stage, ...]
-    remote: bool
-    """Whether a remote is configured: a stage whose outputs the cache lost is then one a pull
-    brings up to date."""
-    dropping: tuple[str, ...]
-    """Producers that also wrote key z in the first run, and then ran alone without it, so the
-    instances of key z are orphans."""
-
-
-# Each kind of change a case makes after the first run (``_APPLY`` makes it)
-_ChangeKind = Literal[
-    "lose_outputs",
-    "empty_cache",
-    "delete_listing",
-    "edit_listed",
-    "delete_output",
-    "track_output",
-    "delete_lock",
-    "delete_tracked",
-    "delete_input",
-    "change_input",
-    "change_code",
-    "change_params",
-]
-
-
-class _Change(NamedTuple):
-    """One change made to the tree after the first run (``_APPLY``)."""
-
-    kind: _ChangeKind
-    subject: str
-    """An input path, a stage name, an instance name, or "" for the whole cache."""
-    detail: dict[str, str]
-    """How the change is made, by what it changes: for `delete_tracked`, what happens to each
-    cache object the restore reads (``_OBJECTS``), to the committed listing and to the
-    directory holding the path (``_tracked_detail``), and what stands in the path's place
-    (``_occupy``); for `lose_outputs`, what else the stage loses (``_lost_detail``); for
-    `edit_listed`, the edit; for any other, nothing."""
-
-
-class _Case(NamedTuple):
-    seed: int
-    project: _Project
-    changes: tuple[_Change, ...]
-    options: tuple[str, ...]
-    targets: tuple[str, ...]
 
 
 def _seeds() -> list[int]:
@@ -180,246 +86,12 @@ def _seeds() -> list[int]:
 
 
 # =============================================================================
-# The generator
-# =============================================================================
-
-
-def _generate(seed: int, *, locked_out: bool) -> _Case:
-    """The case of ``seed``. ``locked_out``: whether a mode can lock this user out of a path
-    (not root), so a change may make a cache object or directory unreadable or a directory
-    read-only."""
-    rng = random.Random(seed)
-    inputs = [
-        _Input(f"data/raw/f{index}.txt", False, rng.choice(("no", "whole")))
-        for index in range(rng.randint(1, 3))
-    ]
-    inputs += [
-        _Input(f"data/raw/d{index}", True, rng.choice(("no", "whole", "member")))
-        for index in range(rng.randint(0, 2))
-    ]
-    paths = [item.path for item in inputs]
-    stages = list[_Stage]()
-    for pipeline in (f"p{index}" for index in range(rng.randint(1, 2))):
-        chain = rng.choice((0, 2, 3, 3))
-        plain = list[str]()
-        for index in range(rng.randint(2, 3) if chain == 0 else rng.randint(0, 2)):
-            candidates = [*paths, *plain]
-            name = f"{pipeline}/s{index}"
-            reads = tuple(rng.sample(candidates, rng.randint(1, min(2, len(candidates)))))
-            stages.append(
-                _Stage(name, pipeline, f"s{index}", "plain", reads, "", rng.random() < 0.3)
-            )
-            plain.append(name)
-        candidates = [*paths, *plain]
-        functions = ("plan0", "cut0", "build0")[:chain]
-        over = ""
-        for function, kind in zip(functions, ("producer", "mapped", "chained"), strict=False):
-            reads = tuple(rng.sample(candidates, rng.randint(0, 1))) if kind != "chained" else ()
-            name = f"{pipeline}/{function}"
-            stages.append(_Stage(name, pipeline, function, kind, reads, over, False))
-            over = name
-    stages = _compose_across(random.Random(f"{seed}:across"), stages)
-    producers = [item.name for item in stages if item.kind == "producer"]
-    project = _Project(
-        inputs=tuple(inputs),
-        stages=tuple(stages),
-        remote=rng.random() < 0.5,
-        dropping=tuple(name for name in producers if rng.random() < 0.25),
-    )
-    changes = _occupy(
-        random.Random(f"{seed}:occupant"), _generate_changes(rng, project, locked_out=locked_out)
-    )
-    options = tuple(
-        option
-        for option, chance in (("--no-commit", 0.4), ("--checkout-missing", 0.5))
-        if rng.random() < chance
-    )
-    targets = list[str]()
-    if rng.random() < 0.5:
-        named = [
-            *(item.name for item in stages),
-            *(f"{item.name}@{key}" for item in stages if item.over for key in _KEYS),
-        ]
-        targets = rng.sample(named, rng.randint(1, min(2, len(named))))
-    return _Case(seed, project, changes, options, tuple(targets))
-
-
-def _compose_across(rng: random.Random, stages: list[_Stage]) -> list[_Stage]:
-    """``stages``, or, for half the cases of two pipelines, ``stages`` with pipeline p0 composed
-    from p1's handles, which its pipeline.py imports: each plain stage of p0 may also read a
-    plain stage of p1, and p0's chained stage is mapped over the instances of a mapped or
-    chained stage of p1 instead of p0's mapped stage. ``rng`` is this alone's, and a stage keeps
-    its kind, so a case composed of no cross-pipeline read is the one its seed gave before these
-    were generated. With p0's chained stage over p1's chained stage, pivot 0.10.4 registered
-    p1's chained stage before the mapped stage it is mapped over, and so never expanded it
-    outside a run."""
-    if len({item.pipeline for item in stages}) == 1 or rng.random() < 0.5:
-        return stages
-    plain = [item.name for item in stages if item.pipeline == "p1" and item.kind == "plain"]
-    mapped = [item.name for item in stages if item.pipeline == "p1" and item.over]
-    composed = list[_Stage]()
-    for item in stages:
-        if item.pipeline == "p0" and item.kind == "plain" and plain and rng.random() < 0.5:
-            composed.append(item._replace(reads=(*item.reads, rng.choice(plain))))
-        elif item.pipeline == "p0" and item.kind == "chained" and mapped:
-            composed.append(item._replace(over=rng.choice(mapped)))
-        else:
-            composed.append(item)
-    return composed
-
-
-# How likely each subject is to be changed, by its kind: a producer and a mapped stage have the
-# most ways to go wrong, the whole cache the fewest
-_WEIGHTS = {"input": 1.0, "plain": 1.0, "producer": 3.0, "mapped": 2.0, "chained": 2.0}
-
-
-def _generate_changes(
-    rng: random.Random, project: _Project, *, locked_out: bool
-) -> tuple[_Change, ...]:
-    """One to three changes, each to its own input, its own stage or the whole cache, a
-    subject drawn by its weight (``_WEIGHTS``)."""
-    choices = list[tuple[float, list[_Change]]]()
-    for item in project.inputs:
-        if item.tracked == "no":
-            choices.append(
-                (
-                    _WEIGHTS["input"],
-                    [
-                        _Change("delete_input", item.path, {}),
-                        _Change("change_input", item.path, {}),
-                    ],
-                )
-            )
-            continue
-        path = _tracked_path(item)
-        detail = _tracked_detail(rng, directory=item.directory and item.tracked == "whole")
-        if not locked_out:
-            # Root reads and writes whatever the modes say
-            detail = {
-                key: "kept"
-                if key in _OBJECTS and value in ("unreadable", "unsearchable")
-                else value
-                for key, value in detail.items()
-            } | {"parent": "writable"}
-        choices.append((_WEIGHTS["input"], [_Change("delete_tracked", path, detail)]))
-    for item in project.stages:
-        options = [_Change("change_code", item.name, {})]
-        if item.params:
-            options.append(_Change("change_params", item.name, {}))
-        if item.kind in ("plain", "producer"):
-            producer = item.kind == "producer"
-            options += [
-                _Change("delete_output", item.name, {}),
-                _Change("delete_lock", item.name, {}),
-                # A stage whose cache objects are gone, a pull-only one with a remote, twice
-                _Change("lose_outputs", item.name, _lost_detail(rng, producer=producer)),
-                _Change("lose_outputs", item.name, _lost_detail(rng, producer=producer)),
-            ]
-        if item.kind == "producer":
-            edit = rng.choice(("add c.txt", "add c d.txt", "remove a.txt"))
-            options += [
-                _Change("edit_listed", item.name, {"edit": edit}),
-                _Change("delete_listing", item.name, {}),
-            ]
-        if item.over:
-            instance = f"{item.name}@{rng.choice(_KEYS)}"
-            options += [
-                _Change("delete_output", instance, {}),
-                _Change("delete_lock", instance, {}),
-                _Change("lose_outputs", instance, {"listing": "kept", "workspace": "kept"}),
-                _Change("track_output", instance, {}),
-                _Change("track_output", instance, {}),
-            ]
-        choices.append((_WEIGHTS[item.kind], options))
-    choices.append((0.5, [_Change("empty_cache", "", {})]))
-    count = rng.randint(1, min(3, len(choices)))
-    # Drawn without replacement by weight: the largest of random() ** (1 / weight)
-    ranked = sorted(choices, key=lambda choice: rng.random() ** (1 / choice[0]), reverse=True)
-    picked = [rng.choice(options) for _, options in ranked[:count]]
-    if any(change.kind == "empty_cache" for change in picked):
-        # Every object is gone, so a tracked path's restore finds none, locked out or not
-        picked = [
-            change._replace(
-                detail={
-                    key: "removed" if key in _OBJECTS else value
-                    for key, value in change.detail.items()
-                }
-            )
-            if change.kind == "delete_tracked"
-            else change
-            for change in picked
-        ]
-    return tuple(sorted(picked, key=lambda change: _ORDER.index(change.kind)))
-
-
-# The keys of a `delete_tracked` detail that each say what happens to a cache object the
-# restore reads (``_OBJECT_FATES``)
-_OBJECTS = ("object", "listing", "members")
-
-# What deleting a tracked path does to a cache object its restore reads: kept, removed,
-# unreadable, or in a prefix directory this user cannot search
-_OBJECT_FATES = ("kept", "removed", "unreadable", "unsearchable")
-# The same for a tracked directory's member objects: each but a prefix directory locked
-_MEMBER_FATES = _OBJECT_FATES[:3]
-# What it does to a tracked directory's committed listing
-_COMMITTED = ("intact", "stale", "empty", "missing")
-# What it does to the directory that holds the tracked path
-_PARENTS = ("writable", "read_only")
-# What stands where the tracked path was: nothing, or a FIFO, which the pre-flight counts as
-# missing (``track.present_kind``), the restore does not replace, and nothing may open
-_OCCUPANTS = ("none", "fifo")
-# How likely a FIFO is to stand where a deleted tracked path was
-_FIFO_CHANCE = 0.1
-
-
-def _tracked_detail(rng: random.Random, *, directory: bool) -> dict[str, str]:
-    """What deleting a tracked path does to what its restore reads: its object (a file), or its
-    cached listing object, committed listing and member objects (a directory), each as
-    ``_OBJECT_FATES``, ``_COMMITTED`` and ``_MEMBER_FATES`` say (``_OBJECTS``); and whether the
-    directory that holds it is left writable or made read-only (``_PARENTS``)."""
-    parent = rng.choice(_PARENTS)
-    if not directory:
-        return {"object": rng.choice(_OBJECT_FATES), "parent": parent}
-    return {
-        "listing": rng.choice(_OBJECT_FATES),
-        "committed": rng.choice(_COMMITTED),
-        "members": rng.choice(_MEMBER_FATES),
-        "parent": parent,
-    }
-
-
-def _occupy(rng: random.Random, changes: tuple[_Change, ...]) -> tuple[_Change, ...]:
-    """``changes``, with what stands where each `delete_tracked` change's path was in its detail,
-    as ``_OCCUPANTS`` says: nothing, or, in one case of ``1 / _FIFO_CHANCE``, a FIFO. ``rng`` is
-    this alone's, so a case with no FIFO is the one its seed gave before FIFOs were generated."""
-    return tuple(
-        change._replace(
-            detail=change.detail
-            | {"occupant": _OCCUPANTS[1] if rng.random() < _FIFO_CHANCE else _OCCUPANTS[0]}
-        )
-        if change.kind == "delete_tracked"
-        else change
-        for change in changes
-    )
-
-
-def _lost_detail(rng: random.Random, *, producer: bool) -> dict[str, str]:
-    """What else a stage that lost its cache objects lost: its committed listing (a producer),
-    and its output in the workspace, removed or, for a producer, edited."""
-    workspace = ("kept", "removed")
-    if not producer:
-        return {"listing": "kept", "workspace": rng.choice(workspace)}
-    edits = (*workspace, "add c.txt", "add c d.txt", "remove a.txt")
-    return {"listing": rng.choice(("kept", "removed")), "workspace": rng.choice(edits)}
-
-
-# =============================================================================
 # Building the tree
 # =============================================================================
 
 
 def _pipeline_code(
-    project: _Project, pipeline: str, *, changed: Collection[str], first_run: bool
+    project: Project, pipeline: str, *, changed: Collection[str], first_run: bool
 ) -> str:
     """Pipeline ``pipeline``'s pipeline.py: each stage's text names its stage, its version (1 for
     a stage in ``changed``, else 0) and what it read. In the ``first_run`` a dropping producer
@@ -479,7 +151,11 @@ def _pipeline_code(
                 f"    return {read_text}",
             ]
         elif item.kind == "producer":
-            keys = (*_KEYS, _DROPPED_KEY) if first_run and item.name in project.dropping else _KEYS
+            keys = (
+                (*keep_going_cases.KEYS, keep_going_cases.DROPPED_KEY)
+                if first_run and item.name in project.dropping
+                else keep_going_cases.KEYS
+            )
             files = ", ".join(f'"{key}.txt": "{key}|" + {read_text}' for key in keys)
             lines += [
                 f"def {item.function}({', '.join(arguments)}) -> Annotated[dict[str, str], directory]:",
@@ -512,7 +188,7 @@ def _pipeline_code(
 
 
 def _write_pipelines(
-    root: pathlib.Path, project: _Project, *, changed: Collection[str] = (), first_run: bool = False
+    root: pathlib.Path, project: Project, *, changed: Collection[str] = (), first_run: bool = False
 ) -> None:
     for pipeline in sorted({item.pipeline for item in project.stages}):
         path = root / pipeline / "pipeline.py"
@@ -520,7 +196,7 @@ def _write_pipelines(
         path.write_text(_pipeline_code(project, pipeline, changed=changed, first_run=first_run))
 
 
-def _build(case: _Case, root: pathlib.Path, home: pathlib.Path) -> None:
+def _build(case: Case, root: pathlib.Path, home: pathlib.Path) -> None:
     """``case``'s project at ``root`` (a copy of an initialized one), after a first full run."""
     project = case.project
     for item in project.inputs:
@@ -537,7 +213,9 @@ def _build(case: _Case, root: pathlib.Path, home: pathlib.Path) -> None:
         (root / ".pivot" / "config.yaml").write_text(
             yaml.safe_dump({"remotes": {"origin": _REMOTE}})
         )
-    tracked = [_tracked_path(item) for item in project.inputs if item.tracked != "no"]
+    tracked = [
+        keep_going_cases.tracked_path(item) for item in project.inputs if item.tracked != "no"
+    ]
     if tracked:
         _ok(helpers.run_pivot(root, home, "track", *tracked), case)
     _ok(helpers.run_pivot(root, home, "repro", "--all"), case)
@@ -590,7 +268,7 @@ def _stage_parts(name: str) -> tuple[str, str]:
     return pipeline, own
 
 
-def _output_path(root: pathlib.Path, project: _Project, name: str) -> pathlib.Path:
+def _output_path(root: pathlib.Path, project: Project, name: str) -> pathlib.Path:
     """The workspace output of stage or instance ``name``."""
     pipeline, own = _stage_parts(name)
     producer = any(item.name == name and item.kind == "producer" for item in project.stages)
@@ -620,10 +298,10 @@ def _edit_listed(directory: pathlib.Path, edit: str) -> None:
 type _Modes = list[tuple[pathlib.Path, int]]
 
 
-def _apply_lose_outputs(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_lose_outputs(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     """Remove from the cache every output object stage or instance ``change.subject``'s lock
     names (with a remote, a pull brings them back), and its committed listing or workspace
-    output as ``change.detail`` says (``_lost_detail``)."""
+    output as ``change.detail`` says (``keep_going_cases._lost_detail``)."""
     name, details = change.subject, change.detail
     recorded = yaml.safe_load(_lock_path(root, name).read_text())
     # A lock that records a directory, read or written, keeps every entry under `records`
@@ -646,43 +324,43 @@ def _apply_lose_outputs(change: _Change, root: pathlib.Path, case: _Case) -> _Mo
     return []
 
 
-def _apply_empty_cache(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_empty_cache(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     for entry in (root / ".pivot" / "cache" / "files").iterdir():
         shutil.rmtree(entry)
     return []
 
 
-def _apply_delete_listing(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_delete_listing(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     _listing_path(root, change.subject).unlink()
     return []
 
 
-def _apply_edit_listed(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_edit_listed(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     _edit_listed(_output_path(root, case.project, change.subject), change.detail["edit"])
     return []
 
 
-def _apply_delete_output(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_delete_output(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     cache.remove_output(_output_path(root, case.project, change.subject))
     return []
 
 
-def _apply_track_output(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_track_output(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     output = _output_path(root, case.project, change.subject)
     cache.remove_output(output)
     helpers.track_without_data(output)
     return []
 
 
-def _apply_delete_lock(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_delete_lock(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     _lock_path(root, change.subject).unlink()
     return []
 
 
-def _apply_delete_tracked(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_delete_tracked(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     """Delete tracked path ``change.subject`` from the workspace, change what its restore reads,
-    and put what stands in its place there, as ``change.detail`` says (``_tracked_detail``,
-    ``_occupy``)."""
+    and put what stands in its place there, as ``change.detail`` says
+    (``keep_going_cases._tracked_detail``, ``keep_going_cases._occupy``)."""
     details = change.detail
     path = root / change.subject
     pvt = track.get_pvt_path(path)
@@ -723,12 +401,12 @@ def _apply_delete_tracked(change: _Change, root: pathlib.Path, case: _Case) -> _
     return modes
 
 
-def _apply_delete_input(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_delete_input(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     cache.remove_output(root / change.subject)
     return []
 
 
-def _apply_change_input(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_change_input(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     path = root / change.subject
     if path.is_dir():
         (path / "z.txt").write_text("z")
@@ -738,14 +416,14 @@ def _apply_change_input(change: _Change, root: pathlib.Path, case: _Case) -> _Mo
     return []
 
 
-def _apply_change_code(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_change_code(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     # Each pipeline holds every stage whose code the case changes, whichever change writes it
     changed = [other.subject for other in case.changes if other.kind == "change_code"]
     _write_pipelines(root, case.project, changed=changed)
     return []
 
 
-def _apply_change_params(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+def _apply_change_params(change: Change, root: pathlib.Path, case: Case) -> _Modes:
     params = root / "params.yaml"
     values = yaml.safe_load(params.read_text()) if params.exists() else {}
     values[change.subject] = {"k": 1}
@@ -754,8 +432,9 @@ def _apply_change_params(change: _Change, root: pathlib.Path, case: _Case) -> _M
 
 
 # How ``_prepare`` makes each kind of change in the tree at a root, but for the modes it sets,
-# which it returns; in the order it makes them, each reading what the ones before it leave
-_APPLY: dict[_ChangeKind, Callable[[_Change, pathlib.Path, _Case], _Modes]] = {
+# which it returns. It makes a case's changes in the order ``keep_going_cases.ORDER`` gives
+# them, each reading what the ones before it leave
+_APPLY: dict[ChangeKind, Callable[[Change, pathlib.Path, Case], _Modes]] = {
     "lose_outputs": _apply_lose_outputs,
     "empty_cache": _apply_empty_cache,
     "delete_listing": _apply_delete_listing,
@@ -769,10 +448,9 @@ _APPLY: dict[_ChangeKind, Callable[[_Change, pathlib.Path, _Case], _Modes]] = {
     "change_code": _apply_change_code,
     "change_params": _apply_change_params,
 }
-_ORDER = tuple(_APPLY)
 
 
-def _prepare(case: _Case, base: pathlib.Path, root: pathlib.Path) -> None:
+def _prepare(case: Case, base: pathlib.Path, root: pathlib.Path) -> None:
     """A copy of ``base`` at ``root`` with ``case``'s changes made; the modes they set last, so
     no change meets a path another one locked."""
     _copy_tree(base, root)
@@ -783,7 +461,7 @@ def _prepare(case: _Case, base: pathlib.Path, root: pathlib.Path) -> None:
         path.chmod(mode)
 
 
-def _limited(case: _Case) -> set[str]:
+def _limited(case: Case) -> set[str]:
     """The stages whose explanation the dry run takes from the files on disk where the run's
     restore changes them (spec R5's limit, written in docs/cli/index.md): with
     --checkout-missing, each stage that reads a directory holding a deleted tracked file, and
@@ -795,7 +473,7 @@ def _limited(case: _Case) -> set[str]:
     holding = {
         item.path
         for item in case.project.inputs
-        if item.tracked == "member" and _tracked_path(item) in deleted
+        if item.tracked == "member" and keep_going_cases.tracked_path(item) in deleted
     }
     limited = {item.name for item in case.project.stages if holding.intersection(item.reads)}
     grew = True
@@ -815,7 +493,7 @@ def _limited(case: _Case) -> set[str]:
 # =============================================================================
 
 
-def _ok(proc: subprocess.CompletedProcess[str], case: _Case) -> None:
+def _ok(proc: subprocess.CompletedProcess[str], case: Case) -> None:
     assert proc.returncode == 0, f"seed {case.seed}: {proc.args}\n{proc.stdout}{proc.stderr}"
 
 
@@ -829,7 +507,7 @@ def initialized_project(
 
 
 def _report(
-    case: _Case, root: pathlib.Path, found: list[str], *procs: subprocess.CompletedProcess[str]
+    case: Case, root: pathlib.Path, found: list[str], *procs: subprocess.CompletedProcess[str]
 ) -> str:
     """What a failure prints: the seed, how to run it again, each disagreement, the case, its
     pipelines as the commands ran them, and the commands' output."""
@@ -862,7 +540,7 @@ def test_dry_run_keep_going_agrees_with_the_run_on_generated_projects(
     """R5 on a generated project: the leave-out dry run of a changed tree lists the stages the
     run on a copy of the same tree runs, skips, fails or blocks, as
     ``keep_going_agreement.disagreements`` reads them."""
-    case = _generate(seed, locked_out=os.geteuid() != 0)
+    case = keep_going_cases.generate(seed, locked_out=os.geteuid() != 0)
     initialized, home = initialized_project
     base = tmp_path / "base"
     _copy_tree(initialized, base)
@@ -880,13 +558,13 @@ def test_dry_run_keep_going_agrees_with_the_run_on_generated_projects(
     assert not found, _report(case, roots[0], found, dry, ran)
 
 
-def _target_kind(case: _Case, target: str) -> str:
+def _target_kind(case: Case, target: str) -> str:
     if "@" in target:
         return "instance"
     return next(item.kind for item in case.project.stages if item.name == target)
 
 
-def _restores(case: _Case) -> bool:
+def _restores(case: Case) -> bool:
     """Whether ``case``'s commands restore a tracked path, or say why not, from a cache that
     holds objects: they run with --checkout-missing, and no change empties the cache. Without
     it neither reads a tracked path's object or listing."""
@@ -895,26 +573,26 @@ def _restores(case: _Case) -> bool:
     )
 
 
-def _deleted_input(case: _Case, change: _Change) -> _Input:
+def _deleted_input(case: Case, change: Change) -> Input:
     """The input of ``case`` that `delete_tracked` ``change`` deletes: the tracked path itself,
-    or the directory that holds it (``_tracked_path``)."""
+    or the directory that holds it (``keep_going_cases.tracked_path``)."""
     return next(
         item
         for item in case.project.inputs
-        if item.tracked != "no" and _tracked_path(item) == change.subject
+        if item.tracked != "no" and keep_going_cases.tracked_path(item) == change.subject
     )
 
 
-def _is_read(case: _Case, item: _Input) -> bool:
+def _is_read(case: Case, item: Input) -> bool:
     """Whether a stage of ``case`` reads input ``item``."""
     return any(item.path in stage.reads for stage in case.project.stages)
 
 
-def _restored_read(case: _Case, change: _Change) -> str | None:
+def _restored_read(case: Case, change: Change) -> str | None:
     """What a stage of ``case`` reads that the restore of `delete_tracked` ``change`` brings
     back, as ``_COVERED`` names it, or None. Nothing may stand in the path's place, the
     directory that holds the tracked path must be writable and a stage must read the input: a
-    file, whose object is kept; a member of a directory (``_Input.tracked`` "member"), whose
+    file, whose object is kept; a member of a directory (``Input.tracked`` "member"), whose
     object is kept, read through that directory; or a whole directory, whose member objects are
     kept and whose listing the restore reads: its cached listing object is kept, or removed
     beside an intact committed listing."""
@@ -937,14 +615,18 @@ def _restored_read(case: _Case, change: _Change) -> str | None:
     return read if restorable else None
 
 
-def _fifo_read(case: _Case, change: _Change) -> bool:
-    """Whether a FIFO stands in the place of `delete_tracked` ``change``'s path (``_occupy``) and
-    a stage of ``case`` reads it, or the directory that holds it."""
-    return change.detail["occupant"] == "fifo" and _is_read(case, _deleted_input(case, change))
+def _fifo_read(case: Case, change: Change) -> str | None:
+    """The FIFO in the place of `delete_tracked` ``change``'s path (``keep_going_cases._occupy``),
+    as ``_COVERED`` names it, when a stage of ``case`` reads that path or the directory that
+    holds it; else None."""
+    if change.detail["occupant"] == "fifo" and _is_read(case, _deleted_input(case, change)):
+        return "a FIFO a stage reads in place of its tracked path"
+    return None
 
 
-def _across(case: _Case) -> set[str]:
-    """What ``case`` composes across pipelines (``_compose_across``), as ``_COVERED`` names it."""
+def _across(case: Case) -> set[str]:
+    """What ``case`` composes across pipelines (``keep_going_cases._compose_across``), as
+    ``_COVERED`` names it."""
     kinds = {item.name: item.kind for item in case.project.stages}
     found = set[str]()
     for item in case.project.stages:
@@ -966,7 +648,7 @@ def test_dry_run_keep_going_fixed_seeds_cover_every_kind() -> None:
     directory that the restore brings back for the stage reading it (``_restored_read``), and
     a FIFO in its place; and a FIFO stands where a tracked path a stage reads was
     (``_fifo_read``)."""
-    cases = [_generate(seed, locked_out=True) for seed in _FIXED_SEEDS]
+    cases = [keep_going_cases.generate(seed, locked_out=True) for seed in _FIXED_SEEDS]
     tracked = [
         (case, change)
         for case in cases
@@ -978,10 +660,10 @@ def test_dry_run_keep_going_fixed_seeds_cover_every_kind() -> None:
     found = {
         *(f"change {change.kind}" for case in cases for change in case.changes),
         *(
-            "a FIFO a stage reads in place of its tracked path"
+            read
             for case in cases
             for change in case.changes
-            if change.kind == "delete_tracked" and _fifo_read(case, change)
+            if change.kind == "delete_tracked" and (read := _fifo_read(case, change)) is not None
         ),
         *(
             f"{change.kind} {key}={value}"
@@ -1011,12 +693,16 @@ def test_dry_run_keep_going_fixed_seeds_cover_every_kind() -> None:
 
 # What the fixed seeds generate between them (``test_dry_run_keep_going_fixed_seeds_cover_every_kind``)
 _COVERED = {
-    *(f"change {kind}" for kind in _ORDER),
-    *(f"delete_tracked {key}={value}" for key in ("object", "listing") for value in _OBJECT_FATES),
-    *(f"delete_tracked members={value}" for value in _MEMBER_FATES),
-    *(f"delete_tracked committed={value}" for value in _COMMITTED),
-    *(f"delete_tracked parent={value}" for value in _PARENTS),
-    *(f"delete_tracked occupant={value}" for value in _OCCUPANTS),
+    *(f"change {kind}" for kind in keep_going_cases.ORDER),
+    *(
+        f"delete_tracked {key}={value}"
+        for key in ("object", "listing")
+        for value in keep_going_cases.OBJECT_FATES
+    ),
+    *(f"delete_tracked members={value}" for value in keep_going_cases.MEMBER_FATES),
+    *(f"delete_tracked committed={value}" for value in keep_going_cases.COMMITTED),
+    *(f"delete_tracked parent={value}" for value in keep_going_cases.PARENTS),
+    *(f"delete_tracked occupant={value}" for value in keep_going_cases.OCCUPANTS),
     "a FIFO a stage reads in place of its tracked path",
     "a restorable file",
     "a restorable member read through its directory",
