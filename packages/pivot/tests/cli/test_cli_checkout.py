@@ -13,6 +13,7 @@ from conftest import isolated_pivot_dir
 from pivot import cli, types
 from pivot.cli import checkout as checkout_mod
 from pivot.storage import cache, lock, track
+from tests import helpers
 
 _EMPTY_PIPELINE = (
     "from pivot.compose import Pipeline\n\nwith Pipeline('test') as pipeline:\n    pass\n"
@@ -667,6 +668,61 @@ def test_checkout_force_overwrites(runner: click.testing.CliRunner, tmp_path: pa
         assert result.exit_code == 0, f"Failed: {result.output}"
         assert "Restored" in result.output
         assert data_file.read_text() == "original content"
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["links_allowed", "links_refused"])
+def test_checkout_force_reads_a_whole_tree_where_the_restore_starts_from_it(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refused: bool,
+) -> None:
+    """`checkout --force images`: images is a tracked directory, on disk, whose whole tree the
+    cache holds, complete and marked, and whose member b.txt's object is gone, with SYMLINK,
+    HARDLINK and COPY the checkout modes. With links into the cache allowed the restore links
+    the tree as it is: images is restored as a link to it. With the cache's register on a
+    read-only mount (``helpers.register_on_a_read_only_mount``) the restore links nothing and
+    copies each file, which needs b.txt's object: checkout names that object as missing and
+    leaves images as it was. pivot 0.10.4 read the tree as complete there too, and reported only
+    that files of images are missing."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _setup_test_project()
+        (cwd / ".pivot" / "config.yaml").write_text(
+            "cache:\n  checkout_mode: [symlink, hardlink, copy]\n"
+        )
+        images = cwd / "images"
+        images.mkdir()
+        (images / "a.txt").write_text("a")
+        (images / "b.txt").write_text("b")
+        tracking = runner.invoke(cli.cli, ["track", "images"])
+        assert tracking.exit_code == 0, tracking.output
+        helpers.cache_whole_tree(cwd, {"a.txt": "a", "b.txt": "b"})
+        files = cwd / ".pivot" / "cache" / "files"
+        record = track.read_pvt_file(track.get_pvt_path(images))
+        assert record is not None
+        b_hash = next(
+            entry["hash"]
+            for entry in track.tracked_members(images, record, files)["files"]
+            if entry["relpath"] == "b.txt"
+        )
+        cache.get_cache_path(files, b_hash).unlink()
+        if refused:
+            helpers.register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
+        before = sorted(path.relative_to(cwd).as_posix() for path in images.rglob("*"))
+
+        result = runner.invoke(cli.cli, ["checkout", "--force", "images"])
+
+        if refused:
+            assert result.exit_code == 1, result.output
+            assert (
+                f"Cannot overwrite 'images': cache object missing: {b_hash}. The workspace "
+                + "output was not changed."
+            ) in result.output
+            assert sorted(path.relative_to(cwd).as_posix() for path in images.rglob("*")) == before
+        else:
+            assert result.exit_code == 0, result.output
+            assert "Restored 2 file(s)" in result.output
+            assert images.resolve() == cache.tree_path(files, record["hash"]).resolve()
 
 
 # =============================================================================

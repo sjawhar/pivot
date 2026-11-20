@@ -2,8 +2,8 @@
 
 A run checks its stages before it starts (``engine``) and each mapped stage's instances before
 it adds them (``expansion.plan_instances``), and ``pivot repro --dry-run`` checks the same
-(``cli.helpers.eligible_templates``). This module sits below the expansion and the executor, so
-each imports it at its top.
+(``cli.helpers.eligible_templates``). Its importers, ``engine/engine.py``, ``expansion.py`` and
+``cli/helpers.py``, import it at their top; it imports none of them.
 """
 
 from __future__ import annotations

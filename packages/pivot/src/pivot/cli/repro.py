@@ -343,11 +343,11 @@ def _explain_rows(
 ) -> list[tui_console.ExplainRow]:
     """A row for each mapped stage of ``shown`` (None: every one) that ``kept`` leaves
     unexpanded, of the kind the run's decision about it gives: one of ``refused``
-    (``expansion.Expansion``'s), which the run fails, with the reason ``kept`` gives; one mapped
-    over the instances of one of ``refused``, directly or through other mapped stages
-    (``_refused_upstream``), which the run blocks, naming that one; any other one, which the run
-    expands once its producer is current, with what it waits for. In the order of the kinds of
-    ``status_cli.DRY_RUN_SHOWN``, each kind's rows in the order the pipeline holds them."""
+    (``expansion.Expansion``'s), which the run fails, with the reason ``kept`` gives; one the
+    run blocks behind one of ``refused`` (``_refused_upstream``), naming that one; any other
+    one, which the run expands once its producer is current, with what it waits for. In the
+    order of the kinds of ``status_cli.DRY_RUN_SHOWN``, each kind's rows in the order the
+    pipeline holds them."""
     from pivot import status as status_mod
     from pivot.cli import console as tui_console_mod
     from pivot.cli import status as status_cli
@@ -374,10 +374,9 @@ class _Explained(NamedTuple):
     """A row for each mapped stage that does not expand (``_explain_rows``). In leave-out mode:
     one the run would expand once its producer is current (``status_cli.NOT_EXPANDED_ROW``);
     one it refuses to expand (``expansion.Expansion``'s ``refused``, ``REFUSED_ROW``), with the
-    reason it fails that stage with, which runs none of its instances; and one mapped over the
-    instances of a refused one, directly or through other mapped stages, which it blocks
-    (``BLOCKED_ROW``), naming that one. In any other mode every row is not yet expanded,
-    refused and blocked mapped stages included, as 0.10.4 shows them."""
+    reason it fails that stage with, which runs none of its instances; and one it blocks behind
+    a refused one (``BLOCKED_ROW``), naming that one. In any other mode every row is not yet
+    expanded, refused and blocked mapped stages included, as 0.10.4 shows them."""
     orphans: dict[str, str]
     """Each orphaned instance the run would remove, mapped to its mapped stage."""
     left_out_targets: dict[str, exceptions.DependencyNotFoundError]
@@ -409,15 +408,14 @@ def _get_explanations(
     the keys are read as that run reads them. A template the run fails (``expansion.Expansion``'s
     ``refused``: any refusal but an unread listing of a producer current only by a pull, which
     the run runs again) has a row that says so, not a not-expanded one, and so does each
-    template mapped over its instances, directly or through other mapped stages, which the run
-    blocks. The targets stand for the run's own execution order for them (``_scheduled``): each
-    stage of it, every stage upstream of a mapped stage included, the instances of each mapped
-    stage of it that expands, and a row for each mapped stage of it that does not. A
-    left-out stage, every instance of a left-out mapped stage, its row and its orphaned
-    instances are not shown, and a left-out stage changes no orphan the run would
-    remove (``cli_helpers.eligible_templates`` over the stages the run keeps). With
-    ``--checkout-missing``, a notice on stderr names each mapped stage shown as not yet expanded
-    that the run may expand (``_log_restore_limits``).
+    template the run blocks behind it (``_refused_upstream``). The targets stand for the run's
+    own execution order for them (``_scheduled``): each stage of it, every stage upstream of a
+    mapped stage included, the instances of each mapped stage of it that expands, and a row for
+    each mapped stage of it that does not. A left-out stage, every instance of a left-out mapped
+    stage, its row and its orphaned instances are not shown, and a left-out stage changes no
+    orphan the run would remove (``cli_helpers.eligible_templates`` over the stages the run
+    keeps). With ``--checkout-missing``, a notice on stderr names each mapped stage shown as not
+    yet expanded that the run may expand (``_log_restore_limits``).
     Any other mode leaves out nothing (``_no_leave_out``), expands every key with no run checks
     and shows each refused or blocked mapped stage as not yet expanded, as 0.10.4 does, resolves
     the targets as `pivot status` does (``cli_helpers.resolve_mapped_targets``: a mapped stage
@@ -459,8 +457,14 @@ def _get_explanations(
     )
     kept = expansion.without_templates(result, plan.left_out)
     # The run's own execution order for its targets, which the orphans it removes and, in
-    # leave-out mode, the stages shown for its targets both follow
-    order = cli_helpers.run_order(plan.targets, plan.stages)
+    # leave-out mode, the stages shown for its targets both follow. Nothing reads it otherwise:
+    # a run that commits nothing removes no orphan, and only leave-out mode with targets shows
+    # its stages by it (``_scheduled``)
+    order = (
+        cli_helpers.run_order(plan.targets, plan.stages)
+        if not no_commit or (leave_out and plan.targets is not None)
+        else list[str]()
+    )
     removing = (
         []
         if no_commit
@@ -586,10 +590,9 @@ def _dry_run(
 ) -> None:
     """Show what would run without executing. A mapped stage not yet expanded would run: the
     run expands it once its producer is current, then runs its instances. A mapped stage the run
-    refuses to expand would not run: the run fails it, and blocks each mapped stage mapped over
-    its instances, directly or through other mapped stages (``status_cli.DRY_RUN_SHOWN`` says
-    how each such row is listed). An instance whose key left its producer's listing would be
-    removed (``status.orphaned_instances``); nothing is.
+    refuses to expand would not run: the run fails it, and blocks each mapped stage behind it
+    (``status_cli.DRY_RUN_SHOWN`` says how each such row is listed). An instance whose key left
+    its producer's listing would be removed (``status.orphaned_instances``); nothing is.
 
     Raises:
         TargetsLeftOutError: In leave-out mode, after the output, naming each target the run

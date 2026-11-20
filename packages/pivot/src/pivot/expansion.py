@@ -19,6 +19,7 @@ it. A template that does not expand removes nothing, since no plan is known for 
 
 from __future__ import annotations
 
+import heapq
 import pathlib
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
@@ -352,6 +353,11 @@ def read_keys(
     return keys_of(listing.read(committed, record, cache_dir))
 
 
+UPSTREAM_NOT_EXPANDED_REASON = "mapped over the instances of '{}', which is not expanded"
+"""Why a template mapped over the instances of another template, which ``format`` names, is not
+expanded: that one is not (``expand_current``)."""
+
+
 def expand_current(
     pipeline: registry.PipelineLike,
     locks: Mapping[str, types.LockData | None],
@@ -370,15 +376,17 @@ def expand_current(
     name, why a producer is not current, which its templates report. Every expansion of an
     earlier call is removed first (``reset_expansions``), so a command sees the plan as it
     stands. A template mapped over an upstream template's instances expands with it, over the
-    same keys, and stays unexpanded when that one does. Each template expands all or nothing
-    (``registry.StageRegistry.expand``); a refusal leaves it unexpanded with the reason, and
-    names it in ``refused`` unless its producer is in ``pulled`` and no listing could be read.
-    ``fetched`` holds listings read from the remote, by directory hash, already checked against
-    their records: a listing neither committed nor cached is taken from it (a dry run's read,
-    which writes nothing to the cache). A listing neither holds is named in ``listings`` for
-    every template mapped over that source, the ones that reuse its read included. ``checks``,
-    when given, are a run's: each template adds the instances ``plan_instances`` plans over
-    them, or fails with its reason, recorded as any other refusal (the dry run of
+    same keys, and stays unexpanded when that one does: each is taken after every template it
+    is mapped over (``_mapped_order``), as a run expands it, whatever order the pipeline holds
+    them in, and the result holds them in the pipeline's order. Each template expands all or
+    nothing (``registry.StageRegistry.expand``); a refusal leaves it unexpanded with the reason,
+    and names it in ``refused`` unless its producer is in ``pulled`` and no listing could be
+    read. ``fetched`` holds listings read from the remote, by directory hash, already checked
+    against their records: a listing neither committed nor cached is taken from it (a dry run's
+    read, which writes nothing to the cache). A listing neither holds is named in ``listings``
+    for every template mapped over that source, the ones that reuse its read included.
+    ``checks``, when given, are a run's: each template adds the instances ``plan_instances``
+    plans over them, or fails with its reason, recorded as any other refusal (the dry run of
     ``pivot repro --all --keep-going`` passes the run's own). ``pulled`` names the producers of
     ``locks`` current only because a pull would bring them up to date: a run, which never
     pulls, runs each again and expands its templates from what it writes, taken to list the
@@ -394,7 +402,7 @@ def expand_current(
     pipeline.reset_expansions()
     result = empty_expansion()
     read_by_source = dict[types.ArtifactIdentity, _SourceKeys]()
-    for name in pipeline.list_templates():
+    for name in _mapped_order(pipeline):
         template = pipeline.get_template(name)
         source = template["source"]
         producer = source.producer
@@ -403,9 +411,7 @@ def expand_current(
             - set(result["expanded"])
         )
         if upstream:
-            result["not_expanded"][name] = (
-                f"mapped over the instances of '{upstream[0]}', which is not expanded"
-            )
+            result["not_expanded"][name] = UPSTREAM_NOT_EXPANDED_REASON.format(upstream[0])
             continue
         if producer not in locks:
             why = waiting[producer] if producer in waiting else "it has not run"
@@ -449,7 +455,57 @@ def expand_current(
         result["not_expanded"][name] = reason
         # A refusal over the keys read here, which a run that runs a pulled producer again meets
         result["refused"].add(name)
-    return result
+    return _in_order(result, pipeline.list_templates())
+
+
+def _mapped_order(pipeline: registry.PipelineLike) -> list[str]:
+    """The templates of ``pipeline``, each after every template it is mapped over (its
+    ``mapped_deps``), the order a run expands them in: a pipeline can hold a template before
+    the one it is mapped over (one re-entered with ``with`` registers the stages it reads from
+    another pipeline before its own). Of the templates this order lets come next, the first
+    the pipeline holds comes first, so a pipeline that holds each after the ones it is mapped
+    over keeps its order."""
+    names = pipeline.list_templates()
+    position = {name: index for index, name in enumerate(names)}
+    # The templates each one is mapped over that it still waits for; one the pipeline lacks
+    # never expands, so neither does its reader, which reports it (``expand_current``)
+    waiting = {
+        name: {
+            upstream
+            for upstream in pipeline.get_template(name)["mapped_deps"].values()
+            if upstream is not None and upstream in position
+        }
+        for name in names
+    }
+    readers = {name: list[str]() for name in names}
+    for name, upstreams in waiting.items():
+        for upstream in upstreams:
+            readers[upstream].append(name)
+    # The positions of the templates that wait for none, the first the pipeline holds on top
+    ready = [position[name] for name in names if not waiting[name]]
+    order = list[str]()
+    while ready:
+        name = names[heapq.heappop(ready)]
+        order.append(name)
+        for reader in readers[name]:
+            waiting[reader].discard(name)
+            if not waiting[reader]:
+                heapq.heappush(ready, position[reader])
+    assert len(order) == len(names), "a template is mapped over instances built before it"
+    return order
+
+
+def _in_order(result: Expansion, names: list[str]) -> Expansion:
+    """``result`` with the templates of each field in the order of ``names``."""
+    return Expansion(
+        expanded={name: result["expanded"][name] for name in names if name in result["expanded"]},
+        listed={name: result["listed"][name] for name in names if name in result["listed"]},
+        not_expanded={
+            name: result["not_expanded"][name] for name in names if name in result["not_expanded"]
+        },
+        listings={name: result["listings"][name] for name in names if name in result["listings"]},
+        refused=result["refused"],
+    )
 
 
 class _SourceKeys(NamedTuple):

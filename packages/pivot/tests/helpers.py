@@ -1,13 +1,14 @@
 """Test helpers shared by test modules: pipelines built with the compositional API or written as
-pipeline.py text, tracked files with no data or removed once tracked, git projects that the
-installed `pivot` runs in, the output of `pivot repro --jsonl` and its restore warnings, the dry
-run and the run of `pivot repro --all --keep-going`, sockets, and venvs that CI-only tests
-install with uv."""
+pipeline.py text, tracked files with no data or removed once tracked, a cache's whole-directory
+trees and a cache register on a read-only mount, git projects that the installed `pivot` runs in,
+the output of `pivot repro --jsonl` and its restore warnings, the dry run and the run of `pivot
+repro --all --keep-going`, sockets, and venvs that CI-only tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
 from __future__ import annotations
 
+import errno
 import functools
 import inspect
 import json
@@ -26,7 +27,7 @@ import pytest
 
 from pivot import cli, compose, exceptions, project, stage_def
 from pivot import names as stage_names
-from pivot.storage import cache, state, store, track
+from pivot.storage import cache, naming, state, store, track
 from pivot.storage import mounts as mounts_module
 
 if TYPE_CHECKING:
@@ -101,6 +102,51 @@ def track_then_remove(runner: click.testing.CliRunner, root: pathlib.Path, name:
     cache.remove_output(root / name)
 
 
+def cache_whole_tree(root: pathlib.Path, files: Mapping[str, str]) -> None:
+    """Put in the cache of the project at ``root`` the whole-directory tree of a directory holding
+    ``files`` (each relpath with its text), complete and marked, as a SYMLINK commit of a stage
+    output with the same files leaves it."""
+    twin = root / "twin"
+    twin.mkdir()
+    for relpath, text in files.items():
+        (twin / relpath).write_text(text)
+    cache.save_to_cache(
+        twin,
+        root / ".pivot" / "cache" / "files",
+        checkout_modes=[cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY],
+    )
+    twin.unlink()
+
+
+def register_on_a_read_only_mount(
+    monkeypatch: pytest.MonkeyPatch, cache_root: pathlib.Path
+) -> None:
+    """Make the register of the cache at ``cache_root`` behave, in this process, as on a
+    filesystem mounted read-only, which this user cannot make: opening a naming lock file there
+    fails with EROFS, as it does on such a mount (``naming.naming_unit`` then refuses this
+    process's links into the cache), and ``os.statvfs`` of the register reports ``ST_RDONLY``
+    beside its real figures. The links a registration refuses go to a table of this test's
+    own."""
+    register = os.path.realpath(naming.register_root(cache_root))
+    real_open_cache_lock = cache.open_cache_lock
+    real_statvfs = os.statvfs
+
+    def open_cache_lock(path: pathlib.Path, *, dir_fd: int | None = None) -> int:
+        if dir_fd is None and os.path.realpath(path.parent) == register:
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(path))
+        return real_open_cache_lock(path, dir_fd=dir_fd)
+
+    def statvfs(path: str | os.PathLike[str]) -> os.statvfs_result:
+        found = real_statvfs(path)
+        if os.path.realpath(path) != register:
+            return found
+        return os.statvfs_result((*found[:8], found.f_flag | os.ST_RDONLY, *found[9:]))
+
+    monkeypatch.setattr(cache, "_UNREGISTERED_ROOTS", dict[str, str]())
+    monkeypatch.setattr(cache, "open_cache_lock", open_cache_lock)
+    monkeypatch.setattr(os, "statvfs", statvfs)
+
+
 # The line `TrackedFileMissingError` ends with when a file it lists overlaps a stage output
 OVERLAP_STOPS = (
     "Pivot does not run a stage whose output overlaps a file above. "
@@ -153,9 +199,14 @@ def run_keep_going(
     root: pathlib.Path, home: pathlib.Path, *args: str
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, Any]]]:
     """The run ``dry_run_keep_going`` with ``args`` predicts, `pivot repro --all --keep-going
-    --jsonl` in project ``root``, and its JSONL events."""
+    --jsonl` in project ``root``, and its JSONL events (``jsonl_events``)."""
     proc = run_pivot(root, home, "repro", "--all", "--keep-going", "--jsonl", *args)
-    return proc, [json.loads(line) for line in proc.stdout.splitlines()]
+    return proc, jsonl_events(proc.stdout)
+
+
+def jsonl_events(stdout: str) -> list[dict[str, Any]]:
+    """The events a `--jsonl` run's ``stdout`` holds, one JSON object a line."""
+    return [json.loads(line) for line in stdout.splitlines()]
 
 
 def stage_statuses(stdout: str) -> dict[str, object]:
@@ -227,7 +278,7 @@ def restore_warnings(stderr: str) -> list[str]:
 
 def completed_stages(stdout: str) -> dict[str, dict[str, object]]:
     """The `stage_complete` event of each stage a `--jsonl` run reports, by stage."""
-    events = [json.loads(line) for line in stdout.splitlines()]
+    events = jsonl_events(stdout)
     return {event["stage"]: event for event in events if event["type"] == "stage_complete"}
 
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import errno
 import json
 import os
 import pathlib
@@ -735,22 +734,15 @@ def _helper_images_tree_project(
 ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
     """`_helper_tracked_images_project` with the checkout modes ``modes`` (the list
     `cache.checkout_mode` gives, SYMLINK first) and the whole directory tree of data/raw/images
-    in the cache, complete and marked, as a SYMLINK commit of a stage output with the same files
-    leaves it. Returns data/raw/images, the tree and the object of its member a.png."""
+    in the cache, complete and marked (``helpers.cache_whole_tree``). Returns data/raw/images,
+    the tree and the object of its member a.png."""
     (root / ".pivot" / "config.yaml").write_text(f"cache:\n  checkout_mode: [{modes}]\n")
     _helper_tracked_images_project(runner, root)
     files = root / ".pivot" / "cache" / "files"
     images = root / "data" / "raw" / "images"
     record = track.read_pvt_file(track.get_pvt_path(images))
     assert record is not None
-    # A directory with the same files, saved as a SYMLINK commit saves an output
-    twin = root / "twin"
-    twin.mkdir()
-    (twin / "a.png").write_text("a")
-    cache.save_to_cache(
-        twin, files, checkout_modes=[cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
-    )
-    twin.unlink()
+    helpers.cache_whole_tree(root, {"a.png": "a"})
     member_hash = track.tracked_members(images, record, files)["files"][0]["hash"]
     return images, cache.tree_path(files, record["hash"]), cache.get_cache_path(files, member_hash)
 
@@ -812,33 +804,28 @@ def test_tracked_keep_going_and_dry_run_keep_going_read_a_symlink_tree_as_the_re
         assert not images.exists()
 
 
-def _helper_register_on_a_read_only_mount(
-    monkeypatch: pytest.MonkeyPatch, cache_root: pathlib.Path
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes in a read-only directory")
+def test_tracked_keep_going_and_dry_run_keep_going_find_a_member_absent_past_a_failed_tree_link(
+    runner: CliRunner, tmp_path: pathlib.Path
 ) -> None:
-    """Make the register of the cache at ``cache_root`` behave, in this process, as on a
-    filesystem mounted read-only, which this user cannot make: opening a naming lock file there
-    fails with EROFS, as it does on such a mount (``naming.naming_unit`` then refuses this
-    process's links into the cache), and ``os.statvfs`` of the register reports ``ST_RDONLY``
-    beside its real figures. The links a registration refuses go to a table of this test's
-    own."""
-    register = os.path.realpath(naming.register_root(cache_root))
-    real_open_cache_lock = cache.open_cache_lock
-    real_statvfs = os.statvfs
+    """R1, R5 (SYMLINK first, links allowed): data/raw/images is a missing tracked directory
+    whose whole tree the cache holds, complete and marked, its member a.png's object gone, and
+    data/raw is read-only (0o555). The restore links the tree as it is into data/raw, which
+    fails, then looks a.png's object up before it restores file by file, and finds it absent:
+    the run leaves dirs/scan out, runs alpha and exits 0, with no restore warning, and so does
+    the dry run (it warned that it cannot write in data/raw before, where the run warns of
+    nothing)."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        images, _, member_object = _helper_images_tree_project(runner, cwd, _COPY_AMONG_MODES)
+        member_object.unlink()
 
-    def open_cache_lock(path: pathlib.Path, *, dir_fd: int | None = None) -> int:
-        if dir_fd is None and os.path.realpath(path.parent) == register:
-            raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(path))
-        return real_open_cache_lock(path, dir_fd=dir_fd)
+        with _helper_locked(cwd / "data" / "raw", 0o555):
+            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
 
-    def statvfs(path: str | os.PathLike[str]) -> os.statvfs_result:
-        found = real_statvfs(path)
-        if os.path.realpath(path) != register:
-            return found
-        return os.statvfs_result((*found[:8], found.f_flag | os.ST_RDONLY, *found[9:]))
-
-    monkeypatch.setattr(cache, "_UNREGISTERED_ROOTS", dict[str, str]())
-    monkeypatch.setattr(cache, "open_cache_lock", open_cache_lock)
-    monkeypatch.setattr(os, "statvfs", statvfs)
+        _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
+        for result in (dry_run, ran):
+            assert helpers.restore_warnings(result.stderr) == [], result.output
+        assert not images.exists()
 
 
 def _helper_unreadable_member(
@@ -922,12 +909,12 @@ def _helper_read_only_cache_dry_run_and_run(
     modes: str,
 ) -> tuple[Result, Result, pathlib.Path | None]:
     """``project``'s tree with the checkout modes ``modes``, whose cache's register is on a
-    read-only mount (``_helper_register_on_a_read_only_mount``): the run cannot register there,
+    read-only mount (``helpers.register_on_a_read_only_mount``): the run cannot register there,
     so it refuses links into the cache (`naming.naming_unit`), and the dry run reads the mount's
     flag. Returns the dry run and the run on that tree, each made while ``project``'s lock is
     held, and the path it locked (None: nothing)."""
     lock = project(runner, root, modes)
-    _helper_register_on_a_read_only_mount(monkeypatch, root / ".pivot" / "cache")
+    helpers.register_on_a_read_only_mount(monkeypatch, root / ".pivot" / "cache")
     with lock as locked:
         dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
     assert cache.links_refused(root / ".pivot" / "cache" / "files"), (
@@ -1154,7 +1141,7 @@ def test_tracked_keep_going_and_dry_run_keep_going_fail_a_tree_restore_that_cann
         (cwd / "dirs" / "pipeline.py").write_text(_helper_directory_reader_code("sub/images"))
         images = raw / "sub" / "images"
         if read_only_register:
-            _helper_register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
+            helpers.register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
 
         with _helper_locked(tree, 0), _helper_locked(raw, 0o555):
             dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
@@ -1206,7 +1193,7 @@ def test_tracked_keep_going_and_dry_run_keep_going_refuse_a_file_link_as_the_run
                 track.PvtData(path="sub/cached.txt", hash=record["hash"], size=record["size"]),
             )
             cached = locked / "sub" / "cached.txt"
-        _helper_register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
+        helpers.register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
 
         with _helper_locked(locked, 0o555):
             dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)

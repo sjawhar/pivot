@@ -45,7 +45,9 @@ _SEEDS_VARIABLE = "PIVOT_DIFFERENTIAL_SEEDS"
 # reaches meets each cache object, listing and directory it reads, a file, a member and a whole
 # directory that it brings back among them
 # (``test_dry_run_keep_going_fixed_seeds_cover_every_kind``), with the seeds that found the
-# disagreements this test was written for
+# disagreements this test was written for. Since cases compose across pipelines
+# (``_compose_across``), seeds 14, 76, 80 and 1126 generate composed cases, not the ones they were
+# pinned for
 _FIXED_SEEDS = (
     *(4, 13, 14, 18, 39, 48, 52, 61, 76, 80, 106, 117, 193, 380, 522, 729),
     # A pulled producer whose directory a --no-commit dry run read
@@ -59,7 +61,7 @@ _FIXED_SEEDS = (
     # search (1083)
     *(8697, 2747, 1083),
     # A chained stage mapped over another pipeline's chained stage, which pivot 0.10.4 registered
-    # before the mapped stage it is mapped over and left not expanded
+    # before the mapped stage it is mapped over and, expanding in that order, left not expanded
     817,
 )
 
@@ -838,11 +840,9 @@ def test_dry_run_keep_going_agrees_with_the_run_on_generated_projects(
     dry = helpers.run_pivot(
         roots[0], home, *helpers.DRY_RUN_KEEP_GOING, *case.options, *case.targets
     )
-    ran, events = helpers.run_keep_going(roots[1], home, *case.options, *case.targets)
+    ran, _ = helpers.run_keep_going(roots[1], home, *case.options, *case.targets)
 
-    found = keep_going_agreement.disagreements(
-        dry, ran, events, roots=roots, limited=_limited(case)
-    )
+    found = keep_going_agreement.disagreements(dry, ran, roots=roots, limited=_limited(case))
     assert not found, _report(case, roots[0], found, dry, ran)
 
 

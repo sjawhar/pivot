@@ -202,8 +202,8 @@ def test_stages_reached_through_another_pipeline_are_registered_after_what_they_
     """Pipeline report maps `report/_helper_final` over the instances of prep's
     `prep/_helper_build`, mapped over `prep/_helper_cut_with`'s, mapped over the files of
     `prep/_helper_plan` and reading `prep/_helper_value`. Walking report's handles reaches each
-    stage before the stages it reads; each is registered after them, so a mapped stage expands
-    after the one it is mapped over (pivot 0.10.4 registered them in the order reached)."""
+    stage before the stages it reads; each is registered, and so listed, after them (pivot
+    0.10.4 registered them in the order reached)."""
     with compose.Pipeline("prep", root=tmp_path) as prep:
         value = _helper_value()
         plan = _helper_plan(_plan_input(prep))

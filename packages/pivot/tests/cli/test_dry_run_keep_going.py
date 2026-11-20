@@ -285,7 +285,7 @@ def test_dry_run_keep_going_checks_only_the_instances_a_target_names(
     root, home = helpers.refused_mapped_project(tmp_path, helpers.MAPPED_FILE_PIPELINE)
 
     document, stderr = helpers.dry_run_keep_going(root, home, "p/cut@b")
-    ran, events = helpers.run_keep_going(root, home, "p/cut@b")
+    ran, _ = helpers.run_keep_going(root, home, "p/cut@b")
 
     assert document == {
         "stages": {
@@ -315,7 +315,7 @@ def test_dry_run_keep_going_plans_only_the_keys_an_instance_target_names(
 
     every, _ = helpers.dry_run_keep_going(root, home)
     document, stderr = helpers.dry_run_keep_going(root, home, "p/cut@a")
-    ran, events = helpers.run_keep_going(root, home, "p/cut@a")
+    ran, _ = helpers.run_keep_going(root, home, "p/cut@a")
 
     assert first.returncode == 1, first.stdout + first.stderr
     clash = (
@@ -379,7 +379,7 @@ def test_dry_run_keep_going_fails_a_mapped_stage_whose_incremental_output_is_not
     root, home = helpers.uncached_incremental_project(tmp_path, _INCREMENTAL_MAPPED_PIPELINE)
 
     document, stderr = helpers.dry_run_keep_going(root, home)
-    ran, events = helpers.run_keep_going(root, home)
+    ran, _ = helpers.run_keep_going(root, home)
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
     statuses = helpers.stage_statuses(ran.stdout)
@@ -406,7 +406,7 @@ def test_dry_run_keep_going_expands_a_mapped_stage_over_an_uncached_incremental_
     root, home = helpers.uncached_incremental_project(tmp_path, _INCREMENTAL_MAPPED_PIPELINE)
 
     document, stderr = helpers.dry_run_keep_going(root, home, "--allow-uncached-incremental")
-    ran, events = helpers.run_keep_going(root, home, "--allow-uncached-incremental")
+    ran, _ = helpers.run_keep_going(root, home, "--allow-uncached-incremental")
 
     assert ran.returncode == 0, ran.stdout + ran.stderr
     statuses = helpers.stage_statuses(ran.stdout)

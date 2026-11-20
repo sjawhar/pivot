@@ -193,6 +193,11 @@ user-facing rules and their limits are under [`pivot track`](../cli/index.md#piv
 - A whole-directory tree (`cache.tree_path`) is used unchecked only when its `.content-checked`
   marker holds the listing's bytes. Restores and `cache.missing_cache_objects` check it with
   `repair=False`; only the commit path repairs (`cache._ensure_tree_complete`).
+- A directory restore starts from that tree only where it links the tree whole
+  (`cache.restore_tree`: SYMLINK first, and links into the cache allowed or no COPY among the
+  modes); `cache.missing_cache_objects`, which `pivot get` and `checkout --force` ask, reads the
+  same rule, so where links are refused and COPY is among the modes it looks up each member's
+  object, as the restore that copies it does.
 - A listing is also a cache object, at the directory's hash (`listing.store_object`).
 
 ## The naming lock and the register

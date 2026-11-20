@@ -12,7 +12,7 @@ import os
 import re
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
-from pivot import registry, status
+from pivot import expansion, registry, status
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -215,21 +215,24 @@ def _row_disagreements(
 
 
 # The reason a mapped stage over another's instances is not yet expanded while that one is not
-# (``expansion.expand_current``)
-_OVER_NOT_EXPANDED = re.compile(r"mapped over the instances of '([^']+)', which is not expanded")
+# (``expansion.UPSTREAM_NOT_EXPANDED_REASON``), the name of that one its one group
+_OVER_NOT_EXPANDED = re.compile(
+    re.escape(expansion.UPSTREAM_NOT_EXPANDED_REASON).replace(re.escape("{}"), "([^']+)")
+)
 
 
-def _producer_disagreements(rows: Mapping[str, _Row], *, limited: Collection[str]) -> list[str]:
+def _producer_disagreements(rows: Mapping[str, _Row]) -> list[str]:
     """A row not yet expanded stands for a mapped stage whose producer is not current (R5). A
     mapped stage over the instances of another has that one's producer, so a row not expanded
     only because the one it is mapped over is not, where no row of that one is not expanded
-    (the dry run expanded it), names a producer the dry run found current. The rows of the
-    stages of ``limited`` are not read."""
+    (the dry run expanded it), names a producer the dry run found current. This holds for the
+    stages of ``disagreements``' ``limited`` too: one pass of the expansion cannot both expand
+    a mapped stage and leave a stage mapped over its instances waiting for it."""
     not_expanded = _not_expanded(rows)
     found = list[str]()
     for name in sorted(not_expanded):
         over = _OVER_NOT_EXPANDED.search(rows[name].reason)
-        if over is not None and over[1] not in not_expanded and not _is_limited(name, limited):
+        if over is not None and over[1] not in not_expanded:
             found.append(
                 f"not expanded, though the dry run expanded '{over[1]}', which it is mapped "
                 + f"over: {name}: {rows[name].reason!r}"
@@ -295,21 +298,23 @@ def _exit_disagreements(
 def disagreements(
     dry: subprocess.CompletedProcess[str],
     ran: subprocess.CompletedProcess[str],
-    events: Sequence[Mapping[str, Any]],
     *,
     roots: Sequence[pathlib.Path],
     limited: Collection[str],
 ) -> list[str]:
-    """Each way the leave-out dry run ``dry`` and the run ``ran``, whose JSONL events are
-    ``events``, of one tree (copies at ``roots``) disagree, each named, rule by rule: their
-    stderr (``_stderr_disagreements``); a dry run that stops before its document
-    (``_stop_disagreements``); else the rows (``_row_disagreements``), a row not yet expanded
-    whose producer the dry run found current (``_producer_disagreements``), `would_remove`
-    (``_removal_disagreements``) and the exit codes (``_exit_disagreements``). ``limited``: the
-    stages whose explanation the dry run takes from the files on disk where the run's restore
-    changes them (spec R5's limit, written in docs/cli/index.md), a mapped stage standing for
-    its instances too; their rows need only be present, and their ``would_run`` and reason need
-    not be the run's. Not compared: the dry run's notices, which are stderr only."""
+    """Each way the leave-out dry run ``dry`` and the `--jsonl` run ``ran`` of one tree (copies
+    at ``roots``) disagree, each named, rule by rule: their stderr (``_stderr_disagreements``);
+    a dry run that stops before its document (``_stop_disagreements``); else the rows
+    (``_row_disagreements``), a row not yet expanded whose producer the dry run found current
+    (``_producer_disagreements``), `would_remove` (``_removal_disagreements``) and the exit
+    codes (``_exit_disagreements``), the run's stages and removals read from its JSONL events.
+    ``limited``: the stages whose explanation the dry run takes from the files on disk where the
+    run's restore changes them (spec R5's limit, written in docs/cli/index.md), a mapped stage
+    standing for its instances too; their rows need only be present, and their ``would_run``
+    and reason need not be the run's, but for a row not yet expanded
+    (``_producer_disagreements``). Not compared: the dry run's notices, which are stderr only.
+    """
+    events = helpers.jsonl_events(ran.stdout)
     completed = [_outcome(event) for event in events if event["type"] == "stage_complete"]
     found = _stderr_disagreements(dry, ran, roots)
     if not dry.stdout.strip():
@@ -319,7 +324,7 @@ def disagreements(
     return [
         *found,
         *_row_disagreements(rows, completed, roots=roots, limited=limited),
-        *_producer_disagreements(rows, limited=limited),
+        *_producer_disagreements(rows),
         *_removal_disagreements(document, events, rows),
         *_exit_disagreements(dry, ran, rows, completed, limited=limited),
     ]

@@ -3,8 +3,9 @@
 over p/build's (``_CHAIN_PIPELINE``). The dry run lists the stages the run on the same tree runs,
 skips, fails or blocks (spec R5): a mapped stage whose expansion the run refuses, those it blocks
 behind it, a producer current only because a pull would bring it up to date, targets naming a
-mapped stage or one of its instances, the limit of a producer that must run first, and a chain
-another pipeline reaches through its handles.
+mapped stage or one of its instances, the limit of a producer that must run first, a chain
+another pipeline reaches through its handles, and a pipeline re-entered after another one read
+its handles.
 
 Each test drives the installed ``pivot`` binary in a real git project (``helpers.git_project``)
 and parses the dry run's stdout as one JSON document. The run's stages are its `stage_complete`
@@ -161,6 +162,45 @@ with Pipeline("report") as pipeline:
     final(built)
 """
 
+# Pipeline alpha maps alpha/cut over alpha/plan's files; pipeline beta maps beta/build over
+# alpha/cut's instances; alpha, re-entered with `with`, maps alpha/final over beta/build's. Alpha
+# registers beta/build, which it reads, before its own stages, alpha/cut among them
+_REENTERED_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+@stage
+def build(cut: str) -> str:
+    return cut + "!"
+
+
+@stage
+def final(build: str) -> str:
+    return build + "?"
+
+
+with Pipeline("alpha") as pipeline:
+    cuts = cut(pipeline.map(plan()))
+
+with Pipeline("beta"):
+    built = build(cuts)
+
+with pipeline:
+    final(built)
+"""
+
 # _CHAIN_PIPELINE's mapped stages, each standing for its instances while not expanded
 _CHAIN_TEMPLATES = ["p/cut", "p/build", "p/final"]
 
@@ -239,11 +279,11 @@ def test_dry_run_keep_going_refuses_a_mapped_stage_over_a_missing_tracked_file(
     explained = helpers.ok(
         helpers.run_pivot(root, home, "repro", "--all", "--keep-going", "--explain")
     )
-    ran, events = helpers.run_keep_going(root, home)
+    ran, _ = helpers.run_keep_going(root, home)
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
     completed = helpers.completed_stages(ran.stdout)
-    statuses = helpers.stage_statuses(ran.stdout)
+    statuses = {stage: event["status"] for stage, event in completed.items()}
     assert statuses == {
         "p/plan": "cached",
         "p/cut": "failed",
@@ -395,7 +435,7 @@ def test_dry_run_keep_going_leaves_a_mapped_stage_not_expanded_over_a_producer_o
     change(root)
 
     document, stderr = helpers.dry_run_keep_going(root, home, *options, *targets)
-    ran, events = helpers.run_keep_going(root, home, *options, *targets)
+    ran, _ = helpers.run_keep_going(root, home, *options, *targets)
 
     stages = document["stages"]
     assert stages.keys() == {"p/plan", "p/cut", *chained}, document
@@ -460,7 +500,7 @@ def test_dry_run_keep_going_fails_a_mapped_stage_over_a_producer_only_pullable(
     shutil.rmtree(root / "data" / "p" / "plan")
 
     document, stderr = helpers.dry_run_keep_going(root, home)
-    ran, events = helpers.run_keep_going(root, home)
+    ran, _ = helpers.run_keep_going(root, home)
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
     statuses = helpers.stage_statuses(ran.stdout)
@@ -496,7 +536,7 @@ def test_dry_run_keep_going_lists_the_instances_a_failing_mapped_target_is_mappe
     root, home = _missing_output_project(tmp_path, "data/p/build@a.txt")
 
     document, stderr = helpers.dry_run_keep_going(root, home, "p/build")
-    ran, events = helpers.run_keep_going(root, home, "p/build")
+    ran, _ = helpers.run_keep_going(root, home, "p/build")
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
     statuses = helpers.stage_statuses(ran.stdout)
@@ -527,9 +567,9 @@ def test_dry_run_keep_going_lists_the_instances_of_a_chain_another_pipeline_reac
     """Pipeline report maps report/final over the instances of prep/build, mapped over
     prep/cut's, mapped over prep/plan's files (``_REPORT_PIPELINE``); only prep/plan ran. Walking
     report's handles reaches prep/build before prep/cut, and pivot 0.10.4 registered them in that
-    order, so outside a run prep/build and report/final stayed not expanded. Each is registered
-    after the stage it is mapped over now: the dry run lists every instance, each would run, and
-    the run runs them."""
+    order and expanded them in it, so outside a run prep/build and report/final stayed not
+    expanded. Each expands after the stage it is mapped over now: the dry run lists every
+    instance, each would run, and the run runs them."""
     root, home = helpers.git_project(tmp_path)
     helpers.write_pipeline(root, "prep", _PREP_PIPELINE)
     (root / "pipeline.py").write_text(_REPORT_PIPELINE)
@@ -555,6 +595,39 @@ def test_dry_run_keep_going_lists_the_instances_of_a_chain_another_pipeline_reac
     assert statuses.keys() == document["stages"].keys()
 
 
+def test_dry_run_keep_going_lists_the_instances_a_re_entered_pipeline_lists_out_of_order(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pipeline alpha, re-entered with `with` after pipeline beta mapped beta/build over
+    alpha/cut's instances, maps alpha/final over beta/build's (``_REENTERED_PIPELINE``); only
+    alpha/plan ran. Alpha lists beta/build before alpha/cut, which it is mapped over, so pivot
+    0.10.4, expanding in that order, left beta/build and alpha/final not expanded outside a run.
+    Each expands after the stage it is mapped over now, whatever order alpha lists them in: the
+    dry run lists every instance, each would run, and the run runs them."""
+    root, home = helpers.git_project(tmp_path)
+    (root / "pipeline.py").write_text(_REENTERED_PIPELINE)
+    helpers.ok(helpers.run_pivot(root, home, "repro", "--all", "alpha/plan"))
+
+    document, stderr = helpers.dry_run_keep_going(root, home)
+    ran, _ = helpers.run_keep_going(root, home)
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    instances = [
+        f"{template}@{key}"
+        for template in ("alpha/cut", "beta/build", "alpha/final")
+        for key in "ab"
+    ]
+    statuses = helpers.stage_statuses(ran.stdout)
+    assert statuses == {"alpha/plan": "cached", **dict.fromkeys(instances, "ran")}, ran.stdout
+    assert document == {
+        "stages": {
+            "alpha/plan": helpers.UNCHANGED_ROW,
+            **dict.fromkeys(instances, {"would_run": True, "reason": "No previous run"}),
+        }
+    }, stderr
+    assert statuses.keys() == document["stages"].keys()
+
+
 def test_dry_run_keep_going_lists_the_instance_a_blocked_instance_target_is_mapped_over(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -573,7 +646,7 @@ def test_dry_run_keep_going_lists_the_instance_a_blocked_instance_target_is_mapp
     shutil.rmtree(root / "data" / "p" / "plan")
 
     document, stderr = helpers.dry_run_keep_going(root, home, "p/final@a")
-    ran, events = helpers.run_keep_going(root, home, "p/final@a")
+    ran, _ = helpers.run_keep_going(root, home, "p/final@a")
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
     statuses = helpers.stage_statuses(ran.stdout)
@@ -622,7 +695,7 @@ def test_dry_run_keep_going_lists_the_stages_upstream_of_a_mapped_target_not_exp
     (root / "pipeline.py").write_text(_SHARED_PIPELINE.replace('"b.txt": "b"', '"b.txt": "B"'))
 
     document, stderr = helpers.dry_run_keep_going(root, home, *targets)
-    ran, events = helpers.run_keep_going(root, home, *targets)
+    ran, _ = helpers.run_keep_going(root, home, *targets)
 
     assert document == {
         "stages": {
@@ -655,7 +728,7 @@ def test_dry_run_keep_going_limit_a_mapped_stage_its_producer_must_run_for(
     (root / "pipeline.py").write_text(_CHAIN_PIPELINE.replace('"b.txt": "b"', '"b.txt": "B"'))
 
     document, stderr = helpers.dry_run_keep_going(root, home)
-    ran, events = helpers.run_keep_going(root, home)
+    ran, _ = helpers.run_keep_going(root, home)
 
     assert document == {
         "stages": {
@@ -701,7 +774,7 @@ def test_dry_run_keep_going_reads_the_keys_a_no_commit_run_reads(
         added.write_text("c")
 
     document, stderr = helpers.dry_run_keep_going(root, home, "--no-commit")
-    ran, events = helpers.run_keep_going(root, home, "--no-commit")
+    ran, _ = helpers.run_keep_going(root, home, "--no-commit")
 
     assert document == {
         "stages": {

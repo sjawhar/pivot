@@ -63,9 +63,11 @@ DRY_RUN_SHOWN = {
     BLOCKED_ROW: DryRunShown(would_run=False, words="would be blocked"),
 }
 """Each kind of row that ``pivot repro --dry-run`` lists among its stages, in the order it lists
-them, with how it lists that kind: the run expands a mapped stage not yet expanded once its
-producer is current and runs its instances, fails one it refuses to expand and runs none of its
-instances, and blocks one mapped over a refused one's instances."""
+them, which is the order ``--explain`` shows the same rows in too (``cli/repro.py``
+``_explain_rows``), with how the dry run lists that kind: the run expands a mapped stage not yet
+expanded once its producer is current and runs its instances (``NOT_EXPANDED_ROW``), fails one
+it refuses to expand and runs none of its instances (``REFUSED_ROW``), and blocks one behind a
+refused one (``BLOCKED_ROW``)."""
 
 
 @cli_decorators.pivot_command(allow_all=True)

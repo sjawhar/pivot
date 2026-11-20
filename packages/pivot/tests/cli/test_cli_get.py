@@ -1,14 +1,20 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from pivot import cli, project
+from pivot import cli, project, types
+from pivot.remote import sync as transfer
+from pivot.storage import cache, track
+from tests import helpers
 
 if TYPE_CHECKING:
+    import pathlib
+
     import click.testing
     from pytest import MonkeyPatch
 
     from conftest import GitRepo
+    from pivot.remote.protocol import RemoteStorage
 
 
 # =============================================================================
@@ -169,6 +175,86 @@ def test_get_restores_a_file_while_pipeline_root_is_refused(
 
     assert result.exit_code == 0, result.output
     assert (repo_path / "notes.txt").read_text() == "notes"
+
+
+class _ObjectRemote:
+    """A remote holding the cache objects ``objects`` maps by hash, which records each hash a
+    download asks of it. It has only the url and download_batch a restore uses."""
+
+    url: str = "s3://bucket/objects"
+
+    objects: dict[str, bytes]
+    asked: list[str]
+
+    def __init__(self, objects: dict[str, bytes]) -> None:
+        self.objects = objects
+        self.asked = list[str]()
+
+    async def download_batch(
+        self, items: list[tuple[str, pathlib.Path]], *, readonly: bool = False
+    ) -> list[types.TransferResult]:
+        assert readonly, "get downloads cache objects read-only"
+        results = list[types.TransferResult]()
+        for file_hash, path in items:
+            self.asked.append(file_hash)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(self.objects[file_hash])
+            results.append(types.TransferResult(hash=file_hash, success=True))
+        return results
+
+
+def test_get_downloads_a_member_a_whole_tree_holds_where_links_are_refused(
+    runner: click.testing.CliRunner, git_repo: GitRepo, monkeypatch: MonkeyPatch
+) -> None:
+    """`pivot get` of tracked directory images, whose whole tree the cache holds, complete and
+    marked, and whose member b.txt's object is gone, with SYMLINK, HARDLINK and COPY the
+    checkout modes and the cache's register on a read-only mount
+    (``helpers.register_on_a_read_only_mount``). The restore links nothing and copies each
+    file, so it lacks b.txt's object: get downloads that object from the remote and restores
+    images from it. pivot 0.10.4 read the tree as complete there, downloaded nothing and failed
+    to restore from the cache."""
+    repo_path, commit = git_repo
+    (repo_path / ".pivot").mkdir()
+    (repo_path / ".pivot" / "config.yaml").write_text(
+        "cache:\n  checkout_mode: [symlink, hardlink, copy]\n"
+    )
+    monkeypatch.chdir(repo_path)
+    monkeypatch.setattr(project, "_project_root_cache", repo_path)
+    images = repo_path / "images"
+    images.mkdir()
+    (images / "a.txt").write_text("a")
+    (images / "b.txt").write_text("b")
+    helpers.track_then_remove(runner, repo_path, "images")
+    sha = commit("track images")
+    helpers.cache_whole_tree(repo_path, {"a.txt": "a", "b.txt": "b"})
+    files = repo_path / ".pivot" / "cache" / "files"
+    record = track.read_pvt_file(track.get_pvt_path(images))
+    assert record is not None
+    b_hash = next(
+        entry["hash"]
+        for entry in track.tracked_members(images, record, files)["files"]
+        if entry["relpath"] == "b.txt"
+    )
+    cache.get_cache_path(files, b_hash).unlink()
+    remote = _ObjectRemote({b_hash: b"b"})
+
+    def open_remote(name: str | None) -> tuple[RemoteStorage, str]:
+        assert name is None, "get names no remote"
+        return cast("RemoteStorage", cast("object", remote)), "origin"
+
+    monkeypatch.setattr(transfer, "create_remote_from_name", open_remote)
+    helpers.register_on_a_read_only_mount(monkeypatch, repo_path / ".pivot" / "cache")
+
+    result = runner.invoke(cli.cli, ["get", "--rev", sha[:7], "images"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Restored: {images} (from remote)" in result.output.splitlines(), result.output
+    assert remote.asked == [b_hash]
+    assert not images.is_symlink()
+    assert {path.name: path.read_text() for path in images.iterdir()} == {
+        "a.txt": "a",
+        "b.txt": "b",
+    }
 
 
 def test_get_skip_existing_without_force(

@@ -1374,7 +1374,8 @@ class Pipeline:
             raise exceptions.StageDefinitionError(msg)
 
     def _foreign_reads(self, node: _StageNode) -> list[tuple[Pipeline, _StageNode]]:
-        """The stages of other pipelines that ``node`` reads, in the order it takes them."""
+        """The stages of other pipelines that ``node`` reads, in ``_iter_stage_handles`` order
+        (single-handle inputs, then list inputs)."""
         reads = list[tuple[Pipeline, _StageNode]]()
         for handle in _iter_stage_handles(node):
             if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
@@ -1387,13 +1388,13 @@ class Pipeline:
         """The stages of other pipelines that this pipeline's stages read, directly or through
         each other, each after every stage it reads.
 
-        They are registered in this order, which the registry keeps, and
-        ``expansion.expand_current`` expands a template mapped over another template's
-        instances only when that one has already expanded, so a template listed before it would
-        stay unexpanded outside a run. A depth-first walk from each of this pipeline's stages,
-        through the stages each reads in the order it takes them, adds a stage once every stage
-        it reads is added: the same order on every load. A stage of this pipeline that one of
-        them reads is not walked; it is registered with this pipeline's own stages, after them.
+        They are registered in this order, the order the pipeline lists them in (``list_stages``,
+        ``list_templates``); ``expansion.expand_current`` takes each template after the ones it
+        is mapped over whatever that order is. A depth-first walk from each of this pipeline's
+        stages, through the stages each reads in ``_iter_stage_handles`` order (single-handle
+        inputs, then list inputs), adds a stage once every stage it reads is added: the same
+        order on every load. A stage of this pipeline that one of them reads is not walked; it is
+        registered with this pipeline's own stages, after them.
         """
         visited = set[int]()
         result = list[tuple[Pipeline, _StageNode]]()

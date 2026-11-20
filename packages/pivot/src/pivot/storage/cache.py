@@ -1885,14 +1885,15 @@ def restore_tree(
 ) -> pathlib.Path | None:
     """The whole-directory SYMLINK tree of directory ``output_hash`` that a restore with
     ``checkout_modes`` starts from (``_restore_directory_from_cache``): the cache holds the tree
-    and SYMLINK is first among the modes; None where that restore starts file by file. A restore
-    that starts from the tree makes the directory that holds its path before it reads the tree
-    or looks up any member's object, then links the tree where ``linked_tree`` finds it, else
-    restores file by file. ``checkout_modes`` are the modes the checkout uses, as
-    ``linked_tree`` takes them. An ``OSError`` of the tree's lookup is raised, as that restore
-    meets it, whatever the modes."""
+    and the restore links it as a whole (``_links_whole_tree``: SYMLINK is first among the
+    modes, and this process may link into the cache or no COPY is among them); None where that
+    restore starts file by file. A restore that starts from the tree makes the directory that
+    holds its path before it reads the tree or looks up any member's object, then links the
+    tree where ``linked_tree`` finds it, else restores file by file. ``checkout_modes`` are the
+    modes the checkout uses, as ``linked_tree`` takes them. An ``OSError`` of the tree's lookup
+    is raised, as that restore meets it, whatever the modes."""
     tree = resolve_cache_tree_path(cache_dir, output_hash["hash"])
-    return tree if checkout_modes[0] == CheckoutMode.SYMLINK else None
+    return tree if tree is not None and _links_whole_tree(checkout_modes, tree) else None
 
 
 def linked_tree(
@@ -1912,11 +1913,10 @@ def linked_tree(
     (``_tree_file_stats``). An ``OSError`` of the tree's lookup is raised, as that restore meets
     it.
 
-    ``checkout_modes`` must be the modes the checkout uses: this does not read whether the
-    process may link into the cache (``links_refused``). A caller whose links are refused and
-    whose modes hold COPY passes ``refused_link_modes``' list, which links no tree, as
-    ``executor.tracked_restore.check_tracked`` does; with no COPY among them, the checkout uses
-    them as they are and refuses at the link."""
+    Whether this process may link into the cache (``links_refused``) is read as the restore
+    reads it. A process that never registers in the cache, and so never has its links refused
+    (the dry run, ``executor.tracked_restore.check_tracked``), passes ``refused_link_modes``'
+    list where its run's registration would refuse them."""
     tree = restore_tree(output_hash, cache_dir, checkout_modes)
     if tree is None or not _ensure_tree_complete(tree, members, cache_dir, repair=False):
         return None
@@ -1939,11 +1939,14 @@ def missing_cache_objects(
 ) -> list[str]:
     """Return hashes required to restore an output that are absent from the cache.
 
-    ``members`` is a directory's listing (None for a file). With SYMLINK first, an existing
-    whole-directory tree for a directory output is checked but never repaired here: a supplied
-    listing must match its canonical mark byte-for-byte before the tree is trusted
-    (``linked_tree``). Without a tree it trusts, each object is looked up as a restore that
-    links no whole tree looks it up (``missing_linked_objects``).
+    ``members`` is a directory's listing (None for a file). Where a restore with
+    ``checkout_modes`` starts from a directory output's whole-directory tree (``restore_tree``:
+    SYMLINK first, and links into the cache allowed or no COPY among the modes), the tree is
+    checked but never repaired here: a supplied listing must match its canonical mark
+    byte-for-byte before the tree is trusted (``linked_tree``). Without a tree it trusts, each
+    object is looked up as a restore that links no whole tree looks it up
+    (``missing_linked_objects``): so where links are refused and COPY is among the modes, each
+    member is looked up, as the restore that copies it does.
 
     With ``readable``, each object found is also opened for reading, as every checkout of it
     opens it (a copy reads it, and a link's staged entry is opened through it,
@@ -2507,10 +2510,8 @@ def _restore_directory_from_cache(
 ) -> bool:
     """Restore a directory atomically. ``recorded`` is as ``restore_from_cache`` says: each
     file's stat is taken in the tree or staging directory, before the swap puts it in place."""
-    cache_dir_path = resolve_cache_tree_path(cache_dir, output_hash["hash"])
-    symlink_fast_path = cache_dir_path is not None and _links_whole_tree(
-        checkout_modes, cache_dir_path
-    )
+    cache_dir_path = restore_tree(output_hash, cache_dir, checkout_modes)
+    symlink_fast_path = cache_dir_path is not None
     if not symlink_fast_path:
         for entry in members["files"]:
             if resolve_cache_object_path(cache_dir, entry["hash"]) is None:

@@ -180,7 +180,10 @@ def check_tracked(
     symlink restore of a directory whose whole tree the cache holds opens none. And the restore
     must be able to write the path (``_write_failure``): one that starts from the cache's whole
     tree of a directory makes the directory that holds the path before it reads the tree or
-    looks up any member's object, so that is checked first (``_tree_start_failure``).
+    looks up any member's object, so that is checked first (``_tree_start_failure``); one that
+    links that tree as it is, into an existing directory it cannot write in, fails at the link
+    and looks each member's object up before it restores file by file
+    (``_tree_link_fails``), so a member the cache lacks makes it absent there, with no warning.
 
     With ``links_refused`` (``naming.register_refuses_links``: the run's registration refuses
     links into the cache), the restore checks every object out as ``cache.refused_link_modes``
@@ -208,6 +211,8 @@ def check_tracked(
         absent = cache.missing_cache_objects(
             source.hash, source.members, cache_dir, modes, readable=True
         )
+        if not absent and _tree_link_fails(path, source, cache_dir, modes):
+            absent = cache.missing_linked_objects(source.hash, source.members, cache_dir)
     except OSError as e:
         _warn_failed(path, e)
         return Check(Outcome.FAILED, set())
@@ -277,13 +282,19 @@ def _check_refusing(
     if absent:
         return Check(Outcome.ABSENT, set())
     members = source.members
-    # A restore that links the file or the whole tree makes the directory that holds the path
-    # and links before it writes there; any other stages the directory beside the path
-    if not ((members is None or tree is not None) and path.parent.is_dir()):
-        failed = _write_failure(path)
-        if failed is not None:
-            return failed
-    if members is None or tree is not None or members["files"]:
+    if members is None or tree is not None:
+        # A restore that links the file or the whole tree makes the directory that holds the
+        # path and links before it writes there
+        if not path.parent.is_dir():
+            failed = _write_failure(path)
+            if failed is not None:
+                return failed
+        raise cache.unregistered_link_error(cache_dir, path, cache_root)
+    # Any other stages the directory beside the path, then links its first file
+    failed = _write_failure(path)
+    if failed is not None:
+        return failed
+    if members["files"]:
         raise cache.unregistered_link_error(cache_dir, path, cache_root)
     return Check(Outcome.RESTORED, _created_inside(members))
 
@@ -307,6 +318,33 @@ def _tree_start_failure(
     ):
         return None
     return _write_failure(path)
+
+
+def _tree_link_fails(
+    path: pathlib.Path,
+    source: _Source,
+    cache_dir: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+) -> bool:
+    """Whether the restore of missing tracked directory ``path`` from ``source`` with
+    ``checkout_modes``, the modes its checkout uses, links the cache's whole tree of it as it
+    is (``cache.linked_tree``, as a restore that records what it writes finds it) into an
+    existing directory that holds ``path`` and that it cannot write in
+    (``state_dir.nearest_entry_problem``; a missing one the restore makes, where it can write,
+    else it fails first, ``_tree_start_failure``). The link fails there; the restore then looks
+    each member's object up (``cache.missing_linked_objects``), and one the cache lacks makes
+    it absent, else it restores file by file and fails to stage the directory there
+    (``_write_failure``). An ``OSError`` of the tree's lookup is raised, as the restore meets
+    it."""
+    return (
+        types.is_dir_hash(source.hash)
+        and source.members is not None
+        and state_dir_mod.nearest_entry_problem(path.parent) is not None
+        and cache.linked_tree(
+            source.hash, source.members, cache_dir, checkout_modes, stat_files=True
+        )
+        is not None
+    )
 
 
 def _write_failure(path: pathlib.Path) -> Check | None:

@@ -3399,6 +3399,50 @@ def test_symlink_restore_reports_a_cache_miss_past_a_tree_missing_an_object(
     assert not cache._tree_layout_marker(tree).exists()
 
 
+@pytest.mark.parametrize("refused", [False, True], ids=["links_allowed", "links_refused"])
+def test_missing_cache_objects_reads_a_whole_tree_where_the_restore_starts_from_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, refused: bool
+) -> None:
+    """A directory's whole tree in the cache, complete and marked, whose member b.txt's object
+    is gone, restored with SYMLINK, HARDLINK and COPY. With links into the cache allowed, the
+    restore links the tree as it is, so nothing is missing and it brings the directory back.
+    Where this process could not register in the cache (``cache.refuse_links_from``), the
+    restore links nothing and copies each file, and lacks b.txt's object: the restore fails and
+    ``missing_cache_objects`` names that object, where pivot 0.10.4 read the tree as complete
+    and named nothing, so `pivot get` downloaded nothing and `checkout --force` named no missing
+    object."""
+    monkeypatch.setattr(cache, "_UNREGISTERED_ROOTS", dict[str, str]())
+    cache_root = tmp_path / "cache"
+    cache_dir = cache_root / "files"
+    twin = tmp_path / "twin"
+    twin.mkdir()
+    (twin / "a.txt").write_text("a")
+    (twin / "b.txt").write_text("b")
+    modes = [cache.CheckoutMode.SYMLINK, cache.CheckoutMode.HARDLINK, cache.CheckoutMode.COPY]
+    output_hash = cache.save_to_cache(twin, cache_dir, checkout_modes=modes)
+    assert is_dir_hash(output_hash)
+    tree = cache.tree_path(cache_dir, output_hash["hash"])
+    assert twin.resolve() == tree.resolve(), "a SYMLINK commit links the whole tree"
+    members = _helper_cached_listing(cache_dir, output_hash)
+    b_hash = next(entry["hash"] for entry in members["files"] if entry["relpath"] == "b.txt")
+    cache.get_cache_path(cache_dir, b_hash).unlink()
+    if refused:
+        cache.refuse_links_from(cache_root, (cache_root,))
+    out = tmp_path / "out"
+
+    missing = cache.missing_cache_objects(output_hash, members, cache_dir, modes)
+    restored = cache.restore_from_cache(
+        out, output_hash, cache_dir, checkout_modes=modes, members=members
+    )
+
+    assert missing == ([b_hash] if refused else [])
+    assert restored is not refused
+    if refused:
+        assert not out.exists()
+    else:
+        assert out.resolve() == tree.resolve(), "the restore links the tree as it is"
+
+
 @pytest.mark.parametrize(
     "old_suffix",
     [
