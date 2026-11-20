@@ -891,6 +891,42 @@ def test_tracked_keep_going_and_dry_run_keep_going_limit_a_cache_register_this_u
         assert not (cwd / "data" / "raw" / "images").exists()
 
 
+def test_tracked_keep_going_and_dry_run_keep_going_refuse_a_cache_whose_store_is_its_own_mount(
+    runner: CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cache's object store, files/, is the root of a mount of its own: a bind mount of the
+    directory onto itself, which keeps its device, so only this process's mount table shows it
+    (`/proc/self/mounts`, which this user cannot change, stands in a file of this test's own).
+    No register can show every project of such a store (`naming.StoreLayout.unshared`), so the
+    run refuses at its start, before any stage runs, in every mode. The dry run in leave-out
+    mode refuses the same way, with the same error and no document, where it listed
+    alpha/stage_a before."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+        store = cwd / ".pivot" / "cache" / "files"
+        store.mkdir(parents=True)
+        table = tmp_path / "mounts"
+        table.write_text(
+            f"/dev/root / ext4 rw 0 0\n/dev/root {os.path.realpath(store)} ext4 rw 0 0\n"
+        )
+        monkeypatch.setattr(naming, "_MOUNTS_TABLE", table)
+        monkeypatch.setattr(naming, "_SHARED_MOUNT_WATCH", naming._SharedMountWatch())
+
+        dry_run = runner.invoke(cli.cli, helpers.DRY_RUN_KEEP_GOING)
+        ran = runner.invoke(cli.cli, ["repro", "--all", "--keep-going", "--jsonl"])
+
+        refusal = (
+            f"Error: Refusing to name objects in {cwd / '.pivot' / 'cache'}: its files/ "
+            + f"({os.path.realpath(store)}) is a mount of its own"
+        )
+        for result in (dry_run, ran):
+            assert result.exit_code == 1, result.output
+            assert refusal in result.stderr, result.output
+        assert dry_run.stdout == "", dry_run.output
+        assert helpers.completed_stages(ran.stdout) == {}, ran.output
+        assert not (cwd / "data" / "alpha" / "stage_a.txt").exists(), "no stage runs"
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root searches a directory whatever its mode")
 def test_tracked_keep_going_off_an_unreadable_listing_prefix_directory_stops_as_in_0_10_4(
     runner: CliRunner, tmp_path: pathlib.Path

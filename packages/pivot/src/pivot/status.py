@@ -370,10 +370,10 @@ def expand_current(
     ``restorable`` holds the missing tracked files that the restore brings back, which the
     explanations count as present (``_explanations_for``). ``no_commit`` reads the keys a
     listing gives as a ``--no-commit`` run reads them, from the workspace where neither the
-    committed file nor the cache holds a usable listing (``expansion.expand_current``'s
-    ``workspace``). ``not_current``, when given, receives each stage of the producers' execution
-    order that is not current: a template whose producer it holds waits for that producer, or is
-    mapped over the instances of one that does.
+    committed file nor the cache holds a usable listing, for a producer that run skips, not one
+    it runs again (``expansion.expand_current``'s ``workspace``). ``not_current``, when given,
+    receives each stage of the producers' execution order that is not current: a template whose
+    producer it holds waits for that producer, or is mapped over the instances of one that does.
 
     Returns the expansion and the explanations it computed, before their upstream is counted,
     for the caller to pass on as ``known`` (computed with ``force``, ``allow_missing`` and

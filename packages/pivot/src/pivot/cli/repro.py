@@ -183,7 +183,9 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     """The decisions ``pivot repro --all --keep-going`` makes before it expands a mapped stage,
     made in its order (``Engine._orchestrate_execution`` in leave-out mode), reading only.
 
-    It finds the missing tracked files with the run's skip, built from the loaded stages
+    It refuses a cache whose object store is a mount of its own, as the run's registration in
+    the cache does before anything else (``naming.require_shared_store``); finds the missing
+    tracked files with the run's skip, built from the loaded stages
     (``executor.core.find_missing_tracked_files``; with ``checkout_missing`` each tracked path
     that the restore brings back counts as present, as ``_LeaveOut.found`` says, and nothing is
     restored); stops on one that is, lies inside or contains an output of a loaded stage
@@ -193,13 +195,16 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     leaves out (``expansion.left_out_targets``).
 
     Raises:
+        CacheError: The cache's object store is the root of a mount of its own.
         TrackedFileMissingError: A missing tracked file that the restore does not bring back
             overlaps an output of a loaded stage.
         MultipleDependencyError: Every stage is left out.
     """
     from pivot.executor import core as executor_core
-    from pivot.storage import member_skip, ownership
+    from pivot.storage import member_skip, naming, ownership
 
+    cache_dir = config.locate_cache_dir()
+    naming.require_shared_store(cache_dir)
     pipeline = cli_helpers.get_pipeline()
     # The loaded stages, as the run start holds them: no instance
     pipeline.reset_expansions()
@@ -209,7 +214,7 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     found = executor_core.find_missing_tracked_files(
         project_root,
         skip=member_skip.own_member_skip(
-            project_root, loaded, config.locate_state_dir(), config.locate_cache_dir() / "files"
+            project_root, loaded, config.locate_state_dir(), cache_dir / "files"
         ),
         checkout_missing=checkout_missing,
     )
@@ -355,7 +360,9 @@ def _get_explanations(
     ``refused``: any refusal but an unread listing of a producer current only by a pull, which
     the run runs again) is in ``refused``, not ``not_expanded``, and each template mapped over
     its instances, directly or through other mapped stages, is in ``blocked``, as the run blocks
-    it. A left-out stage, every instance of a left-out mapped stage, its not-expanded row and its
+    it. A target naming a mapped stage not expanded stands for its producer, as in any mode, and
+    for the instances of each mapped stage it is mapped over that expands, which the run runs. A
+    left-out stage, every instance of a left-out mapped stage, its not-expanded row and its
     orphaned instances are not shown, and a left-out stage changes no orphan the run would
     remove (``cli_helpers.eligible_templates`` over the stages the run keeps). With
     ``--checkout-missing``, a notice on stderr names each mapped stage shown as not yet expanded
@@ -415,6 +422,23 @@ def _get_explanations(
     )
     orphans = status_mod.orphaned_instances(pipeline, kept, removing)
     targets, shown_templates = cli_helpers.resolve_mapped_targets(plan.targets, kept)
+    if leave_out and targets is not None and shown_templates:
+        # A target naming a mapped stage not expanded stands for its producer, and the mapped
+        # stages it is mapped over are shown; the run expands each of those that expands here
+        # and runs its instances, so they are targets too
+        targets = list(
+            dict.fromkeys(
+                [
+                    *targets,
+                    *(
+                        instance
+                        for template in shown_templates
+                        if template in kept["expanded"]
+                        for instance in kept["expanded"][template]
+                    ),
+                ]
+            )
+        )
     # Each left-out stage and template, and every instance of a left-out template
     hidden = set(plan.left_out).union(
         *(result["expanded"][name] for name in plan.left_out if name in result["expanded"])

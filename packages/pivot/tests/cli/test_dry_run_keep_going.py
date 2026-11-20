@@ -24,7 +24,7 @@ from tests import helpers
 if TYPE_CHECKING:
     import pathlib
     import subprocess
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 # left/cut is mapped over left/plan's files and reads data/raw/shared.txt besides; with
 # _INCREMENTAL, left/grow also reads it and keeps an incremental output
@@ -711,48 +711,112 @@ def _lose_plan_listing(root: pathlib.Path) -> None:
     (root / ".pivot" / "stages" / "p" / "plan=.listing").unlink()
 
 
+def _remove_plan_directory(root: pathlib.Path) -> None:
+    shutil.rmtree(root / "data" / "p" / "plan")
+
+
+def _add_plan_file_whose_key_names_no_stage(root: pathlib.Path) -> None:
+    (root / "data" / "p" / "plan" / "c d.txt").write_text("c")
+
+
+def _remove_plan_file_a(root: pathlib.Path) -> None:
+    (root / "data" / "p" / "plan" / "a.txt").unlink()
+
+
+# The instances of _CHAIN_PIPELINE's mapped stages, each over keys a and b
+_CHAIN_INSTANCES = [f"{template}@{key}" for template in _CHAIN_TEMPLATES for key in "ab"]
+
+# The not-yet-expanded rows of p/build and p/final, mapped over p/cut's and p/build's instances
+_CHAINED_ROWS = {
+    chained: {
+        "would_run": True,
+        "reason": f"Not yet expanded: mapped over the instances of '{over}', which is not "
+        + "expanded",
+    }
+    for chained, over in (("p/build", "p/cut"), ("p/final", "p/build"))
+}
+
+
+@pytest.mark.parametrize(
+    ("change", "options", "targets", "chained", "added"),
+    [
+        pytest.param(
+            _remove_plan_directory, [], [], _CHAINED_ROWS, _CHAIN_INSTANCES, id="directory_removed"
+        ),
+        pytest.param(
+            _add_plan_file_whose_key_names_no_stage,
+            ["--no-commit"],
+            [],
+            _CHAINED_ROWS,
+            _CHAIN_INSTANCES,
+            id="no_commit_file_whose_key_names_no_stage",
+        ),
+        pytest.param(
+            _remove_plan_file_a,
+            ["--no-commit"],
+            [],
+            _CHAINED_ROWS,
+            _CHAIN_INSTANCES,
+            id="no_commit_file_removed",
+        ),
+        pytest.param(
+            _remove_plan_file_a,
+            ["--no-commit"],
+            ["p/cut@a"],
+            {},
+            ["p/cut@a"],
+            id="no_commit_target_naming_the_removed_file",
+        ),
+    ],
+)
 def test_dry_run_keep_going_leaves_a_mapped_stage_not_expanded_over_a_producer_only_pullable(
     tmp_path: pathlib.Path,
+    change: Callable[[pathlib.Path], None],
+    options: list[str],
+    targets: list[str],
+    chained: dict[str, dict[str, object]],
+    added: list[str],
 ) -> None:
-    """p/plan's lock matches, but its directory, its cache objects and its committed listing
-    are gone. A remote is configured, so the dry run counts p/plan current, as a pull would
-    bring it up to date, and cannot read its listing. The run never pulls: it runs p/plan again,
-    expands p/cut, p/build and p/final from what p/plan writes, and exits 0. So the dry run shows
-    p/plan as a stage that would run, and p/cut, p/build and p/final as mapped stages not yet
+    """p/plan's lock matches, but its cache objects and its committed listing are gone, and
+    ``change`` changes its directory: removed, or, under --no-commit, holding a file whose key
+    cannot name a stage, or without a.txt. A remote is configured, so the dry run counts p/plan
+    current, as a pull would bring it up to date, and cannot read its listing. The run never
+    pulls: it runs p/plan again, which writes a.txt and b.txt anew, expands the mapped stages
+    from what p/plan writes (under --no-commit, from the directory it rewrote), adds the
+    instances ``added`` and exits 0. So the dry run shows p/plan as a stage that would run, and
+    p/cut, with p/build and p/final when no target names an instance (``chained``), as not yet
     expanded, as 0.10.4 does, each a row for the instances the run adds; none would fail or be
-    blocked."""
+    blocked. It never reads p/plan's directory on disk, which the run replaces: read under
+    --no-commit, a key that cannot name a stage made p/cut a stage that would fail, and a
+    missing a.txt made the target p/cut@a unknown or left only p/cut@b."""
     root, home = _git_project(tmp_path)
     (root / "pipeline.py").write_text(_CHAIN_PIPELINE)
     _ok(helpers.run_pivot(root, home, "repro"))
     _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", "s3://bucket/x"))
     _lose_plan_listing(root)
-    shutil.rmtree(root / "data" / "p" / "plan")
+    change(root)
 
-    document, stderr = _dry_run(root, home)
-    ran, events = _run(root, home)
+    document, stderr = _dry_run(root, home, *options, *targets)
+    ran, events = _run(root, home, *options, *targets)
 
     stages = document["stages"]
-    assert stages.keys() == {"p/plan", *_CHAIN_TEMPLATES}, document
+    assert stages.keys() == {"p/plan", "p/cut", *chained}, document
     assert stages["p/plan"] == {"would_run": True, "reason": "Outputs missing from cache"}
     cut = stages["p/cut"]["reason"]
     assert cut.startswith("Not yet expanded: the listing of 'p/plan' is missing"), cut
     assert cut.endswith("and `pivot repro --force p/plan` writes it again"), cut
-    for chained, over in (("p/build", "p/cut"), ("p/final", "p/build")):
-        assert stages[chained] == {
-            "would_run": True,
-            "reason": f"Not yet expanded: mapped over the instances of '{over}', which is not "
-            + "expanded",
-        }, stderr
+    assert {name: stages[name] for name in chained} == chained, stderr
     assert all(row["would_run"] for row in stages.values()), document
     assert ran.returncode == 0, ran.stdout + ran.stderr
     statuses = _statuses(events)
-    assert statuses == {
-        "p/plan": "ran",
-        **{f"{template}@{key}": "cached" for template in _CHAIN_TEMPLATES for key in "ab"},
-    }, ran.stdout
+    assert statuses == {"p/plan": "ran", **dict.fromkeys(added, "cached")}, ran.stdout
     assert {registry.template_of(stage, _CHAIN_TEMPLATES) or stage for stage in statuses} == (
         stages.keys()
     )
+    assert sorted(path.name for path in (root / "data" / "p" / "plan").iterdir()) == [
+        "a.txt",
+        "b.txt",
+    ], "the run rewrote p/plan's directory"
 
 
 @pytest.mark.parametrize("refusal", ["overlap", "uncached-incremental"])
@@ -811,6 +875,147 @@ def test_dry_run_keep_going_fails_a_mapped_stage_over_a_producer_only_pullable(
     assert statuses.keys() == document["stages"].keys()
 
 
+def _missing_build_output_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """_CHAIN_PIPELINE after a run, with data/p/build@a.txt, the output p/build@a writes, a
+    missing tracked file with no cache object."""
+    root, home = _git_project(tmp_path)
+    (root / "pipeline.py").write_text(_CHAIN_PIPELINE)
+    _ok(helpers.run_pivot(root, home, "repro"))
+    tracked = root / "data" / "p" / "build@a.txt"
+    tracked.unlink()
+    helpers.track_without_data(tracked)
+    return root, home
+
+
+# The start of the reason the run fails p/build with when p/build@a's output is missing
+_BUILD_REFUSED = (
+    "cannot expand over the files of 'p/plan': The following tracked files are missing:\n"
+)
+_BUILD_OUTPUT_NAMED = "data/p/build@a.txt: it is output 'data/p/build@a.txt' of stage 'p/build@a'"
+
+
+def test_dry_run_keep_going_lists_the_instances_a_failing_mapped_target_is_mapped_over(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Target p/build, which is mapped over p/cut's instances, with p/plan current: the run
+    expands p/cut and skips p/cut@a and p/cut@b, then fails p/build, whose instance p/build@a
+    would write over the missing tracked file data/p/build@a.txt, and exits 1. The dry run lists
+    the same stages: p/plan, p/cut's instances, and p/build as a stage that would fail, with
+    the run's reason. A target naming a mapped stage that is not expanded stands for its
+    producer, and for the instances of each mapped stage it is mapped over that expands."""
+    root, home = _missing_build_output_project(tmp_path)
+
+    document, stderr = _dry_run(root, home, "p/build")
+    ran, events = _run(root, home, "p/build")
+
+    assert ran.returncode == 1, ran.stdout + ran.stderr
+    completed = {event["stage"]: event for event in events if event["type"] == "stage_complete"}
+    statuses = {stage: event["status"] for stage, event in completed.items()}
+    assert statuses == {
+        "p/plan": "cached",
+        "p/cut@a": "cached",
+        "p/cut@b": "cached",
+        "p/build": "failed",
+    }, ran.stdout
+    reason = completed["p/build"]["reason"]
+    assert reason.startswith(_BUILD_REFUSED), reason
+    assert _BUILD_OUTPUT_NAMED in reason, reason
+    assert document == {
+        "stages": {
+            "p/plan": _UNCHANGED,
+            "p/cut@a": _UNCHANGED,
+            "p/cut@b": _UNCHANGED,
+            "p/build": {"would_run": False, "reason": reason},
+        }
+    }, stderr
+    assert statuses.keys() == document["stages"].keys()
+
+
+def test_dry_run_keep_going_lists_the_instance_a_blocked_instance_target_is_mapped_over(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Target p/final@a, with p/build@a's output data/p/build@a.txt a missing tracked file, and
+    p/plan's lock matching while its directory and the cache objects are gone and a remote is
+    configured (a producer only a pull brings up to date), its committed listing kept. The run
+    runs p/plan again, expands p/cut over key a alone and skips p/cut@a, since p/plan writes the
+    same a.txt again, fails p/build, whose p/build@a would write over the missing file, blocks
+    p/final, and exits 1. The dry run lists the same stages: p/cut@a too, the instance of p/cut,
+    which expands, that the target is mapped over through p/build. It says p/cut@a would run,
+    as it says of every stage downstream of one that would run: what p/plan writes is known
+    only once it has run."""
+    root, home = _missing_build_output_project(tmp_path)
+    _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", "s3://bucket/x"))
+    _empty_cache(root)
+    shutil.rmtree(root / "data" / "p" / "plan")
+
+    document, stderr = _dry_run(root, home, "p/final@a")
+    ran, events = _run(root, home, "p/final@a")
+
+    assert ran.returncode == 1, ran.stdout + ran.stderr
+    completed = {event["stage"]: event for event in events if event["type"] == "stage_complete"}
+    statuses = {stage: event["status"] for stage, event in completed.items()}
+    assert statuses == {
+        "p/plan": "ran",
+        "p/cut@a": "cached",
+        "p/build": "failed",
+        "p/final": "blocked",
+    }, ran.stdout
+    reason = completed["p/build"]["reason"]
+    assert reason.startswith(_BUILD_REFUSED), reason
+    assert _BUILD_OUTPUT_NAMED in reason, reason
+    assert document == {
+        "stages": {
+            "p/plan": {"would_run": True, "reason": "Outputs missing from cache"},
+            "p/cut@a": {"would_run": True, "reason": "Upstream stale (p/plan)"},
+            "p/build": {"would_run": False, "reason": reason},
+            "p/final": {"would_run": False, "reason": "upstream 'p/build' would fail"},
+        }
+    }, stderr
+    assert statuses.keys() == document["stages"].keys()
+
+
+def test_dry_run_keep_going_limit_a_mapped_stage_its_producer_must_run_for(
+    tmp_path: pathlib.Path,
+) -> None:
+    """R5's limit, pinned: data/p/cut@a.txt, the output p/cut@a writes, is a missing tracked
+    file, and p/plan's code changed, so p/plan is not current. Which files p/plan writes, and so
+    which instances p/cut adds and what they write, is known only once p/plan has run, and a dry
+    run runs nothing: it shows p/cut, p/build and p/final as not yet expanded, rows that would
+    run, and exits 0. The run runs p/plan, then fails p/cut, whose instance p/cut@a would write
+    over the missing file, blocks p/build and p/final, and exits 1."""
+    root, home = _git_project(tmp_path)
+    (root / "pipeline.py").write_text(_CHAIN_PIPELINE)
+    _ok(helpers.run_pivot(root, home, "repro"))
+    tracked = root / "data" / "p" / "cut@a.txt"
+    tracked.unlink()
+    helpers.track_without_data(tracked)
+    (root / "pipeline.py").write_text(_CHAIN_PIPELINE.replace('"b.txt": "b"', '"b.txt": "B"'))
+
+    document, stderr = _dry_run(root, home)
+    ran, events = _run(root, home)
+
+    assert document == {
+        "stages": {
+            "p/plan": {"would_run": True, "reason": "Code changed"},
+            "p/cut": {
+                "would_run": True,
+                "reason": "Not yet expanded: waits for 'p/plan': Code changed",
+            },
+            **_CHAINED_ROWS,
+        }
+    }, stderr
+    assert ran.returncode == 1, ran.stdout + ran.stderr
+    completed = {event["stage"]: event for event in events if event["type"] == "stage_complete"}
+    assert {stage: event["status"] for stage, event in completed.items()} == {
+        "p/plan": "ran",
+        "p/cut": "failed",
+        "p/build": "blocked",
+        "p/final": "blocked",
+    }, ran.stdout
+    reason = completed["p/cut"]["reason"]
+    assert "data/p/cut@a.txt: it is output 'data/p/cut@a.txt' of stage 'p/cut@a'" in reason, reason
+
+
 @pytest.mark.parametrize("tree", ["listing_lost", "file_added"])
 def test_dry_run_keep_going_reads_the_keys_a_no_commit_run_reads(
     tmp_path: pathlib.Path, tree: str
@@ -835,12 +1040,11 @@ def test_dry_run_keep_going_reads_the_keys_a_no_commit_run_reads(
     document, stderr = _dry_run(root, home, "--no-commit")
     ran, events = _run(root, home, "--no-commit")
 
-    instances = [f"{template}@{key}" for template in _CHAIN_TEMPLATES for key in "ab"]
-    assert document == {"stages": {"p/plan": _UNCHANGED, **dict.fromkeys(instances, _UNCHANGED)}}, (
-        stderr
-    )
+    assert document == {
+        "stages": {"p/plan": _UNCHANGED, **dict.fromkeys(_CHAIN_INSTANCES, _UNCHANGED)}
+    }, stderr
     assert ran.returncode == 0, ran.stdout + ran.stderr
     statuses = _statuses(events)
-    assert statuses == dict.fromkeys(["p/plan", *instances], "cached"), ran.stdout
+    assert statuses == dict.fromkeys(["p/plan", *_CHAIN_INSTANCES], "cached"), ran.stdout
     assert statuses.keys() == document["stages"].keys()
     assert not added.exists(), "the skip restores the directory to its lock's record"

@@ -54,10 +54,11 @@ class Expansion(TypedDict):
             ``plan_instances``, an instance another stage's name or output path holds); its
             reason is the one ``not_expanded`` gives. A template whose producer is current only
             because a pull would bring it up to date (``pulled``) is not in it when no listing
-            could be read: a run runs that producer again and reads the listing it writes. Any
-            other refusal of such a template is in it: it is over the keys the committed or
-            cached listing gives, which that run is taken to write again, so the run meets it
-            after it runs the producer.
+            could be read: a run runs that producer again and reads the keys from what it
+            writes, so the producer's directory on disk, which that run replaces, is not read
+            for it, under ``--no-commit`` either. Any other refusal of such a template is in it:
+            it is over the keys the committed or cached listing gives, which that run is taken
+            to write again, so the run meets it after it runs the producer.
             With a run's ``checks`` and, for a ``--no-commit`` run, its ``workspace``, these are
             the templates that run fails, with the reasons it gives: it skips the same
             producers or runs a pulled one again, reads the keys read here, and plans and adds
@@ -213,8 +214,8 @@ def workspace_keys(
     (``cache.hash_directory``, ``cache_dir`` the object root). A ``--no-commit`` run writes no
     listing, so once the producer has finished it reads the keys here, holding the READ lock on
     the directory (``engine``); its dry run reads here, with no lock, the keys of a directory
-    whose listing neither the committed file nor the cache holds in a usable form
-    (``expand_current``'s ``workspace``).
+    whose listing neither the committed file nor the cache holds in a usable form, of a producer
+    the run skips (``expand_current``'s ``workspace``).
 
     Raises:
         ListingMissingError: The directory is missing.
@@ -386,8 +387,11 @@ def expand_current(
     files the listing read here lists. ``workspace``, when given (that dry run of a
     ``--no-commit`` run), reads a listing that neither the committed file nor the cache holds,
     or that cannot be used, as that run reads its keys: from the directory in the workspace
-    (``workspace_keys``). The run hashes the directory its producer's skip leaves at the lock's
-    record, so a listing either holds lists the same files.
+    (``workspace_keys``), for a producer the run skips. The run hashes the directory that skip
+    leaves at the lock's record, so a listing either holds lists the same files. It never reads
+    the directory of a producer in ``pulled``, which the run replaces when it runs that producer
+    again: a listing of such a producer that cannot be read leaves its templates unexpanded and
+    not refused.
     """
     pipeline.reset_expansions()
     result = empty_expansion()
@@ -418,7 +422,8 @@ def expand_current(
                 default_state_dir=default_state_dir,
                 cache_dir=cache_dir,
                 fetched=fetched,
-                workspace=workspace,
+                # The run runs a pulled producer again and reads the directory it rewrites
+                workspace=None if producer in pulled else workspace,
             )
             read_by_source[source] = read
         if read.missing is not None:

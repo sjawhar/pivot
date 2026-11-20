@@ -527,7 +527,7 @@ def _helper_missing_tracked(root: Path, *paths: str) -> list[str]:
     The directory holding each path exists, since it holds the .pvt."""
     for path in paths:
         helpers.track_without_data(root / path)
-    return executor_core.find_missing_tracked_files(root).missing
+    return executor_core.find_missing_tracked_files(root).missing.paths
 
 
 def _helper_runnable(
