@@ -173,10 +173,9 @@ def check_tracked(
 
     The restore's own source (``_source``) must be found: an unavailable listing fails, a
     missing one is absent. The restore must be able to read each cache object it links, as it
-    checks them out with ``checkout_modes``, by the rule a forced checkout uses
-    (``cache.missing_cache_objects``): where it links no whole tree of a directory as it is
-    (``cache.linked_tree``, as a restore that records what it writes finds it), each object is
-    found (``cache.missing_linked_objects``) and opened for reading, as the checkout opens it;
+    checks them out with ``checkout_modes``: where it links no whole tree of a directory as it
+    is (``_linked_tree``), each object is found (``cache.missing_linked_objects``) and opened
+    for reading, as the checkout opens it;
     an ``OSError`` from that lookup or open (an object or a directory of the cache this user
     cannot read) fails it, with the warning the restore gives for the error. A symlink restore
     of a directory whose whole tree the cache holds opens none. And the restore must be able to
@@ -211,11 +210,7 @@ def check_tracked(
         failed = _tree_start_failure(path, source, cache_dir, modes)
         if failed is not None:
             return failed
-        tree = (
-            cache.linked_tree(source.hash, source.members, cache_dir, modes, stat_files=True)
-            if types.is_dir_hash(source.hash) and source.members is not None
-            else None
-        )
+        tree = _linked_tree(source, cache_dir, modes)
         if tree is None:
             absent = cache.missing_linked_objects(
                 source.hash, source.members, cache_dir, readable=True
@@ -237,6 +232,19 @@ def check_tracked(
     if failed is not None:
         return failed
     return Check(Outcome.RESTORED, _created_inside(source.members))
+
+
+def _linked_tree(
+    source: _Source, cache_dir: pathlib.Path, checkout_modes: list[cache.CheckoutMode]
+) -> pathlib.Path | None:
+    """The cache's whole tree of the directory ``source`` restores that a restore with
+    ``checkout_modes`` links as it is (``cache.linked_tree``, its files stat'd as a restore that
+    records what it writes finds them), else None, as for a file."""
+    if not types.is_dir_hash(source.hash) or source.members is None:
+        return None
+    return cache.linked_tree(
+        source.hash, source.members, cache_dir, checkout_modes, stat_files=True
+    )
 
 
 def _check_refusing(
@@ -277,13 +285,7 @@ def _check_refusing(
         failed = _tree_start_failure(path, source, cache_dir, checkout_modes)
         if failed is not None:
             return failed
-        tree = (
-            cache.linked_tree(
-                source.hash, source.members, cache_dir, checkout_modes, stat_files=True
-            )
-            if types.is_dir_hash(source.hash) and source.members is not None
-            else None
-        )
+        tree = _linked_tree(source, cache_dir, checkout_modes)
         # The restore links a whole tree as it is, looking up no object of it. Any other one
         # looks up each object it links before it reaches a link
         absent = (

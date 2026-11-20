@@ -460,7 +460,9 @@ def expand_current(
 def _mapped_order(pipeline: registry.PipelineLike) -> list[str]:
     """The templates of ``pipeline`` in an order a run could expand them in: each after every
     template it is mapped over (its ``mapped_deps``). Of the templates that can come next, the
-    one the pipeline holds first comes first."""
+    one the pipeline holds first comes first, so a pipeline that holds each template after the
+    ones it is mapped over keeps its order, and their instances register (``list_stages``,
+    ``pivot list``) in the order 0.10.4 registers them."""
     import networkx as nx
 
     names = pipeline.list_templates()
