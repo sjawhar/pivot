@@ -29,6 +29,7 @@ import signal
 import sys
 import threading
 import traceback
+import types as _stdlib_types
 import warnings
 from typing import (
     IO,
@@ -139,9 +140,29 @@ class _CoveredImportState(threading.local):
     starting_pivot_thread: bool = False
 
 
+class _HookRecordingState(threading.local):
+    """The queue of the import hooks' recording running on this thread (`_record_hooked_import`):
+    the batches of module names this thread's hooked imports and reloads requested while it ran,
+    in order, each with whether it is recorded for the running stage; None while no recording
+    runs here.
+
+    The recording can import, and not only the hooks' own machinery: Debian's CPython 3.13.5
+    `pathlib` imports `ntpath` in every `PurePath.__init__`, and `fingerprint.is_user_code`
+    builds paths and reads a module's `__name__`, which runs the body of a module that
+    `importlib.util.LazyLoader` set up, with every import that body makes. Such an import goes
+    through `_tracked_import` or `_tracked_import_module` as any other import does, under the
+    covered thread rule (`_covered_import`); only its recording waits in the queue, for the
+    recording that runs, so a recording never runs inside itself. Another thread's imports are
+    recorded by that thread's hooks.
+    """
+
+    queued: collections.deque[tuple[list[str], bool]] | None = None
+
+
 _stage_imports: _StageImports | None = None
 _stage_imports_lock = threading.Lock()
 _covered_import_state = _CoveredImportState()
+_hook_recording_state = _HookRecordingState()
 _original_import = builtins.__import__
 _original_import_module = importlib.import_module
 _original_reload = importlib.reload
@@ -177,17 +198,6 @@ def _close_window(tracked: _StageImports) -> None:
             tracked.window_resident_before = frozenset()
 
 
-def _is_user_source_module(module: object) -> bool:
-    """Whether `module` is user code loaded from a source file.
-
-    A module created without a file (CPython's `pyexpat.errors`, Cython's `_cython_3_3_0`) has
-    no source to fingerprint, so the stage-import check ignores it.
-    """
-    if not isinstance(module, type(sys)):
-        return False
-    return isinstance(vars(module).get("__file__"), str) and fingerprint.is_user_code(module)
-
-
 def _package_chain(name: str) -> list[str]:
     """`name` and its packages: `a.b.c` gives `a`, `a.b`, `a.b.c`."""
     parts = name.split(".")
@@ -196,11 +206,13 @@ def _package_chain(name: str) -> list[str]:
 
 def _record_stage_import(names: Sequence[str]) -> None:
     """Record each of `names` that is resident user source for the running stage, whether or not
-    it was resident before. On a covered thread of that stage nothing is recorded."""
+    it was resident before; a module made without a source file is ignored
+    (`fingerprint.is_user_source_module`). Whether a hooked import is the stage's own, not one of
+    a covered thread, is decided as it returns (`_record_hooked_import`)."""
     tracked = _stage_imports
-    if tracked is None or _on_covered_thread(tracked):
+    if tracked is None:
         return
-    found = [name for name in names if _is_user_source_module(sys.modules.get(name))]
+    found = [name for name in names if fingerprint.is_user_source_module(sys.modules.get(name))]
     if not found:
         return
     with _stage_imports_lock:
@@ -347,6 +359,45 @@ def _import_package(globals: Mapping[str, object] | None) -> str | None:
     return calc_package(globals)
 
 
+def _record_hooked_import(names: list[str], *, for_stage: bool) -> None:
+    """Record the modules `names` that a hooked import or reload requested: in the record of
+    loaded source (`loaded_source.record_modules`), and, when `for_stage` and this thread is not a
+    covered thread of the running stage as the import returns, for that stage
+    (`_record_stage_import`).
+
+    While a recording runs on this thread, the batch only joins its queue
+    (`_HookRecordingState`). Otherwise this call records it, then each batch queued meanwhile,
+    until none is left, and skips a batch it has already recorded, so it ends even where every
+    recording imports the same module again (under Debian's `pathlib`, each path a recording
+    builds imports `ntpath`).
+    """
+    tracked = _stage_imports
+    batch = (names, for_stage and tracked is not None and not _on_covered_thread(tracked))
+    state = _hook_recording_state
+    if state.queued is not None:
+        state.queued.append(batch)
+        return
+    queued = collections.deque([batch])
+    recorded = set[tuple[tuple[str, ...], bool]]()
+    try:
+        # First inside the `try`: CPython runs a pending signal handler at the end of a call, and
+        # the worker's SIGINT handler raises (`_interrupt_stage`). Set before a call outside the
+        # `try`, the queue could stay set on this thread for the worker's life, and every later
+        # hooked import would only join it.
+        state.queued = queued
+        while queued:
+            batch_names, batch_for_stage = queued.popleft()
+            key = (tuple(batch_names), batch_for_stage)
+            if key in recorded:
+                continue
+            recorded.add(key)
+            loaded_source.record_modules(batch_names)
+            if batch_for_stage:
+                _record_stage_import(batch_names)
+    finally:
+        state.queued = None
+
+
 def _tracked_import(
     name: str,
     globals: Mapping[str, object] | None = None,  # noqa: A002 - CPython's `__import__` signature
@@ -360,7 +411,7 @@ def _tracked_import(
         if not level:
             # Unpickling a stage imports the modules it refers to before the stage starts. Record
             # each one the recorder saw compile; `record_unseen_modules` judges the rest.
-            loaded_source.record_modules(_package_chain(name))
+            _record_hooked_import(_package_chain(name), for_stage=False)
         return result
     package = _import_package(globals) if level else None
     absolute: str | None = name
@@ -376,8 +427,7 @@ def _tracked_import(
         result = _original_import(name, globals, locals, fromlist or (), level)
     if absolute is not None:
         names = _package_chain(absolute) + [f"{absolute}.{item}" for item in items]
-        loaded_source.record_modules(names)
-        _record_stage_import(names)
+        _record_hooked_import(names, for_stage=True)
     return result
 
 
@@ -386,7 +436,7 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
     if tracked is None:
         result = _original_import_module(name, package)
         if not name.startswith("."):
-            loaded_source.record_modules(_package_chain(name))
+            _record_hooked_import(_package_chain(name), for_stage=False)
         return result
     try:
         absolute = importlib.util.resolve_name(name, package) if name.startswith(".") else name
@@ -395,17 +445,17 @@ def _tracked_import_module(name: str, package: str | None = None) -> object:
     with _covered_import(tracked, absolute, []):
         result = _original_import_module(name, package)
     if absolute is not None:
-        loaded_source.record_modules(_package_chain(absolute))
-        _record_stage_import(_package_chain(absolute))
+        _record_hooked_import(_package_chain(absolute), for_stage=True)
     return result
 
 
 def _tracked_reload(module: ModuleType) -> ModuleType:
-    """Reload `module`; the discovery recorder wraps the reload's loader and refreshes its record."""
+    """Reload `module`; the discovery recorder wraps the reload's loader and refreshes its record.
+    While a stage runs, the reloaded module is recorded as a hooked import's modules are
+    (`_record_hooked_import`)."""
     result = _original_reload(module)
-    tracked = _stage_imports
-    if tracked is not None:
-        _record_stage_import([result.__name__])
+    if _stage_imports is not None:
+        _record_hooked_import([result.__name__], for_stage=True)
     return result
 
 
@@ -492,7 +542,7 @@ def _track_stage_imports(covered: frozenset[str]) -> Generator[_StageImports]:
         tracked.new_outside_window.update(
             name
             for name in resident_after - resident_before - tracked.added_in_window
-            if _is_user_source_module(sys.modules.get(name))
+            if fingerprint.is_user_source_module(sys.modules.get(name))
         )
         if installed_here:
             _uninstall_import_hooks()
@@ -889,6 +939,102 @@ class WorkerStageInfo(TypedDict):
     # carries them again only when the coordinator loaded code after that.
     loaded_sources_token: str
     loaded_sources: NotRequired[dict[str, str]]
+    # The submodules the stage reads through their packages (`RegistryStageInfo.read_submodules`)
+    # that the coordinator holds bound on them, a package before its submodules
+    # (`executor.core.prepare_worker_info`), set when there is one: the name of each that
+    # cloudpickle pickles by reference, which the worker imports, and each it pickles by value that
+    # pickles alone, the module itself, sent in the stage's pickle. The worker binds them on their
+    # packages while the stage runs (`_sent_submodules_bound`). Why:
+    # `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs".
+    sent_submodules: NotRequired[tuple[ModuleType | str, ...]]
+
+
+def _error_on_one_line(exc: BaseException) -> str:
+    """The type and message of `exc` on one line: the last entry of its description (a
+    `SyntaxError`'s follows the lines that place it), its notes left out and the non-empty lines
+    of a message, each stripped, joined by spaces. It is described as
+    `traceback.format_exception_only` describes an error, with no traceback, and with no source
+    line looked up for an error it chains: a lookup can raise (`zipimporter` decodes a module's
+    source as UTF-8 whatever its coding cookie says).
+
+    Describing it runs the error's own code (a `__notes__` property, the `__dir__` it reads for a
+    suggestion, a metaclass `__getattribute__` through which it reads the class's `__qualname__`),
+    where CPython's description catches at most an `Exception`. Where describing it raises
+    anything but `WorkerTerminated`, the text is the class's qualified name alone, without its
+    module (`Outer.Error`, where the line would read `company.local.Outer.Error: boom`), read with
+    `type.__getattribute__`, so no metaclass `__getattribute__` runs. A class body can store a
+    `str` subclass as its `__qualname__`; the name is copied into a plain `str` with
+    `str.__str__`, which runs none of that subclass's methods, so neither does the warning's `%s`
+    that formats it. The result is always a plain `str`. `WorkerTerminated` is raised: an
+    interrupt of the run stays one."""
+    try:
+        described = traceback.TracebackException(
+            type(exc), exc, None, compact=True, lookup_lines=False
+        )
+        described.__notes__ = None
+        entry = list(described.format_exception_only())[-1]
+    except WorkerTerminated:
+        raise
+    except BaseException:
+        return str.__str__(type.__getattribute__(type(exc), "__qualname__"))
+    return " ".join(line.strip() for line in entry.splitlines() if line.strip())
+
+
+@contextlib.contextmanager
+def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[None]:
+    """Bind each of `submodules` (`WorkerStageInfo.sent_submodules`, a package before its
+    submodules) on its package, as the import of a submodule binds it there, for everything of
+    the stage: its parameter overrides, input loaders, the stage and its output writers. Code that
+    cloudpickle sent by value runs none of its module's imports, and so finds through the package
+    (`company.local.f()`, after `import company.local` in its module) only what is bound there, as
+    a plain run of that code finds what its import bound.
+
+    A module sent by name is imported here (`importlib.import_module`), which binds it on its
+    package where it loads it; `sys.modules` holds what that import put there, as after any
+    import. Where that import raises (any `Exception`, `SystemExit` or `KeyboardInterrupt`), one
+    warning, logged into the stage's output (`_queue_logging`), names the module and the error on
+    one line (`_error_on_one_line`), nothing is bound for it, and the stage runs: code that reads
+    the module through its package fails there with `AttributeError`, as in Pivot 0.10.4, which
+    binds nothing on the package; a run that does not read it runs. An interrupt of the run
+    (`WorkerTerminated`), raised by the import or while the error is described, stays one. A
+    module sent by value is bound as it came, with no import, and adds nothing to `sys.modules`.
+    A module is bound only where this process holds its package (`sys.modules`) and the package
+    holds no attribute of that name, read through `vars` so no `__getattr__` runs: a module an
+    import in this process bound there (a helper the worker imports by name that runs
+    `from company.local import Mode`) is the copy that code holds, and stays.
+
+    On the way out, also when the stage fails or an interrupt leaves before the stage starts, each
+    binding made here is removed where the package still holds that module, so no later stage of
+    this worker finds it."""
+    bound = list[tuple[_stdlib_types.ModuleType, str, _stdlib_types.ModuleType]]()
+    try:
+        for submodule in submodules:
+            if isinstance(submodule, _stdlib_types.ModuleType):
+                module = submodule
+            else:
+                try:
+                    module = importlib.import_module(submodule)
+                except WorkerTerminated:
+                    raise
+                except (Exception, SystemExit, KeyboardInterrupt) as exc:
+                    logger.warning(
+                        "Could not import module '%s', which the stage reads through its "
+                        + "package: %s. The module is not bound on its package, so code that "
+                        + "reads it through the package fails.",
+                        submodule,
+                        _error_on_one_line(exc),
+                    )
+                    continue
+            package, _, attribute = module.__name__.rpartition(".")
+            parent = sys.modules.get(package)
+            if isinstance(parent, _stdlib_types.ModuleType) and attribute not in vars(parent):
+                setattr(parent, attribute, module)
+                bound.append((parent, attribute, module))
+        yield
+    finally:
+        for parent, attribute, module in reversed(bound):
+            if vars(parent).get(attribute) is module:
+                delattr(parent, attribute)
 
 
 def _make_result(
@@ -951,8 +1097,17 @@ def _execute_stage(
 
     # Ensure worker has correct cwd for this stage (workers in reusable pool
     # may have stale cwd from previous execution in different project).
-    # _queue_logging captures log messages to the output queue (for TUI display).
-    with contextlib.chdir(project_root), _queue_logging(stage_name, output_queue):
+    # _queue_logging captures log messages to the output queue (for TUI display), among them the
+    # warning of a submodule sent by name whose import fails.
+    # _sent_submodules_bound binds the submodules sent with the stage first, before the parameter
+    # overrides, for everything of the stage, and removes the bindings on the way out. It imports
+    # a submodule sent by name here, not as loky unpickles the call, where an import that raises
+    # breaks the pool and fails every stage it runs.
+    with (
+        contextlib.chdir(project_root),
+        _queue_logging(stage_name, output_queue),
+        _sent_submodules_bound(stage_info.get("sent_submodules", ())),
+    ):
         no_commit = stage_info["no_commit"]
 
         production_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_info["state_dir"]))

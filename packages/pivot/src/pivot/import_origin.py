@@ -27,32 +27,61 @@ _BUILTIN_OR_FROZEN = ("built-in", "frozen")
 
 
 def of_module(module: types.ModuleType) -> Origin:
-    """The origin of a loaded module: its spec's location, else its `__file__`, else the
-    directories of a namespace package."""
+    """The origin of a loaded module: its spec's location, else its `__file__` (`file_of_module`),
+    resolved; else the directories of a namespace package."""
+    file = file_of_module(module)
+    if file is not None:
+        return ("file", os.path.realpath(file))
     spec = getattr(module, "__spec__", None)
-    if isinstance(spec, importlib.machinery.ModuleSpec):
-        if not spec.has_location and spec.origin in _BUILTIN_OR_FROZEN:
-            return (spec.origin,)
-        if spec.has_location and isinstance(spec.origin, str):
-            return ("file", os.path.realpath(spec.origin))
-    filename = getattr(module, "__file__", None)
-    if isinstance(filename, str):
-        return ("file", os.path.realpath(filename))
+    if isinstance(spec, importlib.machinery.ModuleSpec) and (
+        (origin := _built_in_or_frozen(spec)) is not None
+    ):
+        return origin
     path = getattr(module, "__path__", None)
     if path is not None:
         return _namespace(path)
     return NO_FILE
 
 
+def file_of_module(module: types.ModuleType) -> str | None:
+    """The file a loaded module comes from as its import located it, not resolved: its spec's
+    location, else its `__file__`; None for a built-in or frozen module and for one with neither.
+    `of_module` resolves it into a `("file", ...)` origin."""
+    spec = getattr(module, "__spec__", None)
+    if isinstance(spec, importlib.machinery.ModuleSpec):
+        if _built_in_or_frozen(spec) is not None:
+            return None
+        if (file := file_of_spec(spec)) is not None:
+            return file
+    filename = getattr(module, "__file__", None)
+    return filename if isinstance(filename, str) else None
+
+
 def of_spec(spec: importlib.machinery.ModuleSpec) -> Origin:
     """The origin of a module an import would load from `spec`."""
-    if not spec.has_location and spec.origin in _BUILTIN_OR_FROZEN:
-        return (spec.origin,)
-    if spec.has_location and isinstance(spec.origin, str):
-        return ("file", os.path.realpath(spec.origin))
+    file = file_of_spec(spec)
+    if file is not None:
+        return ("file", os.path.realpath(file))
+    if (origin := _built_in_or_frozen(spec)) is not None:
+        return origin
     if spec.submodule_search_locations is not None:
         return _namespace(spec.submodule_search_locations)
     return NO_FILE
+
+
+def file_of_spec(spec: importlib.machinery.ModuleSpec) -> str | None:
+    """The file an import would load a module from with `spec`, as the finder located it, not
+    resolved: its origin when it has a location; else None. `of_spec` resolves it into a
+    `("file", ...)` origin."""
+    return spec.origin if spec.has_location and isinstance(spec.origin, str) else None
+
+
+def _built_in_or_frozen(spec: importlib.machinery.ModuleSpec) -> Origin | None:
+    """The origin of a built-in or frozen module's `spec`, one with no location whose origin is
+    `built-in` or `frozen`: `("built-in",)` or `("frozen",)`; None for any other spec."""
+    if not spec.has_location and spec.origin in _BUILTIN_OR_FROZEN:
+        return (spec.origin,)
+    return None
 
 
 def describe(origin: Origin) -> str:

@@ -1516,8 +1516,8 @@ def test_output_loader_change_detected(
     merges loader keys by class name only, so two CSV outputs with different
     configs clobber each other's config hash.
     """
-    fp_before, _ = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=before_outs))
-    fp_after, _ = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=after_outs))
+    fp_before = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=before_outs)).manifest
+    fp_after = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=after_outs)).manifest
     assert fp_before != fp_after
 
 
@@ -1537,8 +1537,8 @@ def test_output_tag_change_changes_the_fingerprint(after_tag: types.ArtifactTag)
     before = _make_out("a", loaders.YAML())
     after = _make_out("a", loaders.YAML(), tag=after_tag)
 
-    fp_before = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=[before]))
-    fp_after = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=[after]))
+    fp_before = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=[before])).manifest
+    fp_after = _compute_fingerprint("s", _make_stage_info(_dummy_stage, outs=[after])).manifest
 
     assert fp_before != fp_after
 
@@ -1551,7 +1551,7 @@ def test_no_fingerprint_output_loader_collision(set_project_root: pathlib.Path) 
     def _nofp_stage() -> dict:
         return {}
 
-    fp_before, _ = _compute_fingerprint(
+    fp_before = _compute_fingerprint(
         "s",
         _make_stage_info(
             _nofp_stage,
@@ -1560,8 +1560,8 @@ def test_no_fingerprint_output_loader_collision(set_project_root: pathlib.Path) 
                 _make_out("b", loaders.CSV(index_col=0)),
             ],
         ),
-    )
-    fp_after, _ = _compute_fingerprint(
+    ).manifest
+    fp_after = _compute_fingerprint(
         "s",
         _make_stage_info(
             _nofp_stage,
@@ -1570,13 +1570,13 @@ def test_no_fingerprint_output_loader_collision(set_project_root: pathlib.Path) 
                 _make_out("b", loaders.CSV(index_col=0)),
             ],
         ),
-    )
+    ).manifest
     assert fp_before != fp_after
 
 
 def test_dep_loader_config_collision() -> None:
     """Two deps with same loader class but different configs must both be fingerprinted."""
-    fp_before, _ = _compute_fingerprint(
+    fp_before = _compute_fingerprint(
         "s",
         _make_stage_info(
             _dummy_stage,
@@ -1585,8 +1585,8 @@ def test_dep_loader_config_collision() -> None:
                 "test": _make_dep("test", loaders.CSV(index_col=0)),
             },
         ),
-    )
-    fp_after, _ = _compute_fingerprint(
+    ).manifest
+    fp_after = _compute_fingerprint(
         "s",
         _make_stage_info(
             _dummy_stage,
@@ -1595,7 +1595,7 @@ def test_dep_loader_config_collision() -> None:
                 "test": _make_dep("test", loaders.CSV(index_col=0)),
             },
         ),
-    )
+    ).manifest
     assert fp_before != fp_after
 
 
@@ -2166,6 +2166,7 @@ def _helper_execute_compose_stage(
         project_root=tmp_path,
         default_state_dir=tmp_path / ".pivot",
         store_spec=store_spec,
+        pickle_trials={},
     )
     return worker.execute_stage(stage_name, stage_info, cache_dir, output_queue)
 

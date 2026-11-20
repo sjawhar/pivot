@@ -134,7 +134,8 @@ def test_fingerprint_includes_class_and_defaults():
     """Fingerprint for Pydantic param stages includes class and defaults."""
     fp = fingerprint.get_stage_fingerprint(_stage_with_pydantic_param_v1)
 
-    # Should have: self:, module: for the stage's module and its packages, class:, schema:
+    # Should have: self:, module: for the stage's module and its packages, class:, schema:, and
+    # byname: for the module of the model's library base class (pydantic.BaseModel).
     module = _stage_with_pydantic_param_v1.__module__
     modules = {key for key in fp if key.startswith("module:")}
     assert "self:_stage_with_pydantic_param_v1" in fp
@@ -142,7 +143,10 @@ def test_fingerprint_includes_class_and_defaults():
     assert all(f"{module}.".startswith(f"{key[7:]}.") for key in modules), modules
     assert _definition_key("class", ParamsWithListDefault) in fp
     assert _definition_key("schema", ParamsWithListDefault) in fp
-    assert len(fp) == 3 + len(modules), f"Unexpected entries: {list(fp.keys())}"
+    assert fp.get(f"byname:{pydantic.BaseModel.__module__}") == "", (
+        f"the library base class's module must be recorded by name: {list(fp.keys())}"
+    )
+    assert len(fp) == 4 + len(modules), f"Unexpected entries: {list(fp.keys())}"
 
 
 def test_default_factory_is_tracked():

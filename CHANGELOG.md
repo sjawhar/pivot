@@ -2,6 +2,45 @@
 
 <!-- version list -->
 
+## v0.11.0 (2026-11-20)
+
+### Chores
+
+- Remove internal references from a public repository
+  ([#564](https://github.com/sjawhar/pivot/pull/564),
+  [`65b8baf`](https://github.com/sjawhar/pivot/commit/65b8bafe33741226a51185e785e5609b499cfa8f))
+
+### Documentation
+
+- Apply the review of the guide cut ([#564](https://github.com/sjawhar/pivot/pull/564),
+  [`65b8baf`](https://github.com/sjawhar/pivot/commit/65b8bafe33741226a51185e785e5609b499cfa8f))
+
+- Cut the agent guides and skills to what a new engineer needs
+  ([#564](https://github.com/sjawhar/pivot/pull/564),
+  [`65b8baf`](https://github.com/sjawhar/pivot/commit/65b8bafe33741226a51185e785e5609b499cfa8f))
+
+- Cut the agent guides and the fingerprint-testing skill
+  ([#564](https://github.com/sjawhar/pivot/pull/564),
+  [`65b8baf`](https://github.com/sjawhar/pivot/commit/65b8bafe33741226a51185e785e5609b499cfa8f))
+
+- Restore rules the guide cut changed ([#564](https://github.com/sjawhar/pivot/pull/564),
+  [`65b8baf`](https://github.com/sjawhar/pivot/commit/65b8bafe33741226a51185e785e5609b499cfa8f))
+
+- **skills**: Cut writing-pivot-stages to what a pipeline author needs
+  ([#564](https://github.com/sjawhar/pivot/pull/564),
+  [`65b8baf`](https://github.com/sjawhar/pivot/commit/65b8bafe33741226a51185e785e5609b499cfa8f))
+
+- **tests**: Make the Change Detection Matrix cite tests that exist
+  ([#564](https://github.com/sjawhar/pivot/pull/564),
+  [`65b8baf`](https://github.com/sjawhar/pivot/commit/65b8bafe33741226a51185e785e5609b499cfa8f))
+
+### Features
+
+- **fingerprint**: Rerun a stage when a git or local-path library it reaches changes its installed
+  files ([#563](https://github.com/sjawhar/pivot/pull/563),
+  [`ced8676`](https://github.com/sjawhar/pivot/commit/ced86768ae51c802479e44e0867c89f9bffd35ab))
+
+
 ## v0.10.4 (2026-11-06)
 
 ### Bug Fixes

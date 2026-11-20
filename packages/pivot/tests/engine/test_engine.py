@@ -1935,6 +1935,7 @@ async def test_all_cached_pipeline_skips_without_workers(
             project_root=tmp_path,
             state_dir=tmp_path / ".pivot",
             results=results,
+            pickle_trials={},
         )
 
     assert engine._worker_pool is None
@@ -2082,6 +2083,7 @@ async def test_compute_explanation_saves_the_file_hashes_it_read(
         tmp_path,
         default_state_dir=tmp_path / ".pivot",
         store_spec=_helper_store_spec(cache_dir, tmp_path),
+        pickle_trials={},
     )
     write_back = mocker.spy(state_mod, "save_file_hashes")
 

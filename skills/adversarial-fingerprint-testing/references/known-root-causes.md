@@ -17,7 +17,7 @@ Fix: walk the factory as a stage helper, as `_process_dataclass_defaults` does.
 
 ### RC-3: type aliases used only in annotations
 
-With `from __future__ import annotations`, an alias used only in annotations is a string. The function reads no global for it, `get_type_hints` resolves it before `_hint_classes` (which keeps only user classes) sees it, and the function's source does not change. So adding or removing a builtin or library type in the alias is missed. Adding a user-defined type to it is caught. Matrix row: "Type alias definition change" (⚠️).
+With `from __future__ import annotations`, an alias used only in annotations is a string. The function reads no global for it, `get_type_hints` resolves it before `_hint_parts` (which keeps the user classes, and records a library class's module by name, which no lock holds) sees it, and the function's source does not change. So adding or removing a builtin or library type in the alias is missed. Adding a user-defined type to it is caught. Matrix row: "Type alias definition change" (⚠️).
 
 Fix: hash each parameter's full resolved hint, not only the user classes in it.
 

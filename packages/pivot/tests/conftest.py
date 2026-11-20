@@ -28,7 +28,7 @@ import click.testing
 import pytest
 from moto import server as moto_server
 
-from pivot import discovery, project
+from pivot import discovery, installed_distributions, project
 from pivot.compose import Pipeline
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
@@ -267,6 +267,7 @@ def reset_pivot_state(_default_project_root: pathlib.Path) -> Generator[None]:
     # Direct assignment (not mocker.patch) so tests can override by setting to None
     project._project_root_cache = _default_project_root
     config_io.clear_config_cache()
+    installed_distributions.reset()
     for name in _PIVOT_LOGGERS:
         logging.getLogger(name).handlers.clear()
     yield
