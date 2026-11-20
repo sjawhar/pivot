@@ -1,9 +1,8 @@
-"""Red tests from the acceptance of sjawhar/pivot#545 (BET-473) at ae91050dd18a.
+"""Red tests from the acceptance of sjawhar/pivot#545 at ae91050dd18a.
 
-Run from a checkout of the PR head (on a pivot-slices VM, never on sami-rocqperf):
+Run them with:
 
-    cp /mnt/nvme/sami/tmp/BET408/accept/test_map_accept545_red.py packages/pivot/tests/cli/
-    uv run pytest packages/pivot/tests/cli/test_map_accept545_red.py -p no:randomly -n 4 --basetemp=/tmp/a545
+    uv run pytest packages/pivot/tests/cli/test_map_accept545_red.py -p no:randomly -n 4
 
 Each test drives the installed ``pivot`` binary in a real git project, as
 ``tests/cli/test_map_commands.py`` does. Every test failed at ae91050dd18a.

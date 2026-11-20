@@ -313,7 +313,7 @@ uv run pytest packages/pivot/tests packages/pivot-tui/tests -n auto
 **Step 3: End‑to‑end verification**
 
 ```bash
-cd /home/sami/eval-pipeline/pivot
+cd <eval-pipeline checkout>/pivot
 pivot repro
 pivot repro
 ```

@@ -19,7 +19,7 @@ tags: [fingerprint, linecache, inspect, cloudpickle, pickle-by-value, warm-worke
 
 A stage's lock recorded a fingerprint of a helper as edited on disk, while the worker ran the
 helper as discovery had loaded it. The next run compared the lock with the edited file, found them
-equal, and reported the stale output as cached (Dispatch BET-89).
+equal, and reported the stale output as cached.
 
 ## Root Cause
 
