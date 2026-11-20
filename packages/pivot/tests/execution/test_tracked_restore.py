@@ -44,7 +44,7 @@ def _failed(path: pathlib.Path) -> ownership.MissingTracked:
 
 
 # A --checkout-missing pre-flight that leaves nothing missing
-_NONE_MISSING = ownership.MissingTracked(paths=[], failed=frozenset(), checkout_attempted=True)
+_NONE_MISSING = ownership.MissingTracked(paths=[], checkout_attempted=True)
 
 
 @contextlib.contextmanager

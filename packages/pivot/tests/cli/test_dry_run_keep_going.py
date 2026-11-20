@@ -819,32 +819,44 @@ def test_dry_run_keep_going_leaves_a_mapped_stage_not_expanded_over_a_producer_o
     ], "the run rewrote p/plan's directory"
 
 
-@pytest.mark.parametrize("refusal", ["overlap", "uncached-incremental"])
+@pytest.mark.parametrize(
+    ("project", "code", "refused", "named"),
+    [
+        pytest.param(
+            _refused_mapped_project,
+            _CHAIN_PIPELINE,
+            "The following tracked files are missing:\n",
+            "data/p/cut@a.txt: it is output 'data/p/cut@a.txt' of stage 'p/cut@a'",
+            id="overlap",
+        ),
+        pytest.param(
+            _uncached_incremental_project,
+            _INCREMENTAL_CHAIN_PIPELINE,
+            "The following incremental output files exist but are not in cache:\n",
+            "  - p/cut@a: ",
+            id="uncached-incremental",
+        ),
+    ],
+)
 def test_dry_run_keep_going_fails_a_mapped_stage_over_a_producer_only_pullable(
-    tmp_path: pathlib.Path, refusal: str
+    tmp_path: pathlib.Path,
+    project: Callable[[pathlib.Path, str], tuple[pathlib.Path, pathlib.Path]],
+    code: str,
+    refused: str,
+    named: str,
 ) -> None:
     """p/plan's lock matches, but its directory and the cache objects are gone, and its
     committed listing stays. A remote is configured, so the dry run counts p/plan current, as a
     pull would bring it up to date, and reads p/cut's keys from that listing. The run never
     pulls: it runs p/plan again and plans p/cut over the keys p/plan writes, the ones that
-    listing gives. In `overlap` data/p/cut@a.txt, p/cut@a's output, is a missing tracked file
-    with no cache object; in `uncached-incremental` p/cut@a's incremental output is on disk but
-    not in the cache. Either way the run fails p/cut, blocks p/build and p/final and exits 1.
-    Only a listing it cannot read shows p/cut as not yet expanded, so the dry run shows p/cut as
-    a stage that would fail, with the run's reason, and p/build and p/final as blocked."""
-    if refusal == "overlap":
-        root, home = _git_project(tmp_path)
-        (root / "pipeline.py").write_text(_CHAIN_PIPELINE)
-        _ok(helpers.run_pivot(root, home, "repro"))
-        tracked = root / "data" / "p" / "cut@a.txt"
-        tracked.unlink()
-        helpers.track_without_data(tracked)
-        refused = "The following tracked files are missing:\n"
-        named = "data/p/cut@a.txt: it is output 'data/p/cut@a.txt' of stage 'p/cut@a'"
-    else:
-        root, home = _uncached_incremental_project(tmp_path, _INCREMENTAL_CHAIN_PIPELINE)
-        refused = "The following incremental output files exist but are not in cache:\n"
-        named = "  - p/cut@a: "
+    listing gives. ``project`` builds the tree with ``code``: in `overlap` data/p/cut@a.txt,
+    p/cut@a's output, is a missing tracked file, whose cache object is gone with the others; in
+    `uncached-incremental` p/cut@a's incremental output is on disk but not in the cache. Either
+    way the run fails p/cut with the refusal ``refused``, naming ``named``, blocks p/build and
+    p/final and exits 1. Only a listing it cannot read shows p/cut as not yet expanded, so the
+    dry run shows p/cut as a stage that would fail, with the run's reason, and p/build and
+    p/final as blocked."""
+    root, home = project(tmp_path, code)
     _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", "s3://bucket/x"))
     _empty_cache(root)
     shutil.rmtree(root / "data" / "p" / "plan")

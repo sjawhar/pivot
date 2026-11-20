@@ -132,14 +132,10 @@ class _LeaveOut(NamedTuple):
     mode; ``_no_leave_out`` in any other mode, which leaves out nothing)."""
 
     found: MissingTrackedFiles
-    """The missing tracked files, split by whether the restore brings them back
-    (``--checkout-missing``; ``executor.core.find_missing_tracked_files``). A tracked path that
-    the restore brings back counts as present, and nothing restores it: the local cache holds
-    every object its restore needs and this user can read them, unless the restore could not
-    write it (the nearest existing directory above it must be one this user can write in and
-    search) or read its cache objects, or it lies in a tracked directory whose committed
-    listing is stale, empty or unreadable with no cached copy. Such a path stays missing, as in
-    the run, where its failed restore warns and leaves its readers out."""
+    """The missing tracked files, split by whether the ``--checkout-missing`` restore brings them
+    back (``executor.core.find_missing_tracked_files``, by the rule
+    ``MissingTrackedFiles.restorable`` gives). A path it brings back counts as present, and
+    nothing restores it; any other stays missing, as in the run."""
     present: list[tuple[str, ArtifactRef]]
     """Each dependency of the kept stages and templates that no stage produces, with its stage:
     each exists, or the restore creates it (``engine.graph.get_runnable_stages``' ``present``)."""
@@ -164,9 +160,7 @@ def _no_leave_out(stages_list: list[str] | None) -> _LeaveOut:
 
     return _LeaveOut(
         found=executor_core.MissingTrackedFiles(
-            missing=ownership.MissingTracked(
-                paths=[], failed=frozenset(), checkout_attempted=False
-            ),
+            missing=ownership.MissingTracked(paths=[], checkout_attempted=False),
             restorable={},
             restored={},
         ),

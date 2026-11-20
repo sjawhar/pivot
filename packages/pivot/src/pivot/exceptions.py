@@ -396,7 +396,10 @@ class ListingUnavailableError(CorruptListingError):
     cache raises the committed file's own refusal, and a prefix directory of the cache that
     cannot be searched raises its ``OSError``, as in 0.10.4. A restore in leave-out mode leaves
     such a directory missing (``executor.tracked_restore``); every other reader takes it as any
-    ``CorruptListingError``."""
+    ``CorruptListingError``: every handler of that class catches it, and the plain CLI prints
+    only its message. Only ``repro --tui``'s shutdown text, which names the error's class
+    (``cli._run_common.run_tui_with_engine``), shows ``ListingUnavailableError`` where 0.10.4
+    showed ``CorruptListingError``."""
 
 
 class ListingMissingError(CacheError):

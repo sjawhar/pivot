@@ -1457,6 +1457,25 @@ def register_use(
             pass
 
 
+def register_refuses_links(cache_root: pathlib.Path) -> bool:
+    """Whether a command's registration in the cache ``cache_root`` (``register_use``) refuses
+    this process's links into it, told without writing: the cache's register
+    (``register_root``) lies on a filesystem mounted read-only here (``os.statvfs``'s
+    ``ST_RDONLY``). There every write of a registration meets ``EROFS``, on which
+    ``naming_unit`` refuses the links (``cache.refuse_links_from``) and lets the command go on,
+    so a restore copies each object, or refuses to link without COPY among its checkout modes
+    (``cache.refused_link_modes``). A cache that does not exist is registered in by no one.
+
+    A register this user cannot write on a writable filesystem is not one: the registration
+    then stops the command, in every mode, where it writes there (a new or old entry, or a
+    kernel that refuses even the removal of an absent file in such a directory), and passes
+    where it writes nothing. Only the write tells which, so the dry run of a restore
+    (``executor.core.find_missing_tracked_files``), which asks here, does not predict it."""
+    if not cache_root.is_dir():
+        return False
+    return bool(os.statvfs(register_root(cache_root)).f_flag & os.ST_RDONLY)
+
+
 def _unopenable_naming_lock(
     cache_dir: pathlib.Path, path: pathlib.Path, error: OSError
 ) -> exceptions.CacheError:

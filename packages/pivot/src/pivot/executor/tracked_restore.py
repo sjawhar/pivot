@@ -4,9 +4,9 @@ The pre-flight's ``--checkout-missing`` restore (``executor.core.verify_tracked_
 through ``restore_tracked``. The dry run in leave-out mode
 (``executor.core.find_missing_tracked_files``) asks ``check_tracked``, which writes nothing. Both
 find what the restore links through one read, ``_source``. ``check_tracked`` predicts the rest of
-the restore (how it checks each cache object out, which objects it reads, and whether it can
-write the path) from reads alone; the agreement tests, which give a dry run and a run the same
-tree, guard that prediction.
+the restore (how it checks each cache object out, which objects it reads, whether it can write
+the path, and where it refuses to link from a cache it could not register in) from reads alone;
+the agreement tests, which give a dry run and a run the same tree, guard that prediction.
 """
 
 from __future__ import annotations
@@ -14,15 +14,16 @@ from __future__ import annotations
 import enum
 import itertools
 import logging
-import os
 import pathlib
 from typing import TYPE_CHECKING, NamedTuple
 
 from pivot import config, exceptions, types
 from pivot import state_dir as state_dir_mod
-from pivot.storage import cache, naming, ownership, track
+from pivot.storage import cache, ownership, track
 
 if TYPE_CHECKING:
+    import os
+
     from pivot.storage import listing
 
 logger = logging.getLogger(__name__)
@@ -158,35 +159,17 @@ def restore_tracked(
     return Outcome.RESTORED if restored else Outcome.ABSENT
 
 
-def register_refuses_links(cache_root: pathlib.Path) -> bool:
-    """Whether the run's registration in the cache ``cache_root`` refuses this process's links
-    into it, told without writing: the cache's register (``naming.register_root``) lies on a
-    filesystem mounted read-only here (``os.statvfs``'s ``ST_RDONLY``). There every write of a
-    registration meets ``EROFS``, on which ``naming.naming_unit`` refuses the links
-    (``cache.refuse_links_from``) and lets the run go on, so the run's restore copies each
-    object, or refuses to link without COPY among its checkout modes. A cache that does not
-    exist is registered in by no one (``naming.register_use``).
-
-    A register this user cannot write on a writable filesystem is not one: the run's
-    registration then stops the run before its pre-flight, in every mode, where the
-    registration writes there (a new or old entry, or a kernel that refuses even the removal of
-    an absent file in such a directory), and passes where it writes nothing. Only the write
-    tells which, so the dry run does not predict it."""
-    if not cache_root.is_dir():
-        return False
-    return bool(os.statvfs(naming.register_root(cache_root)).f_flag & os.ST_RDONLY)
-
-
 def check_tracked(
     path: pathlib.Path,
     track_data: track.PvtData,
-    cache_dir: pathlib.Path,
+    cache_root: pathlib.Path,
     checkout_modes: list[cache.CheckoutMode],
     *,
     links_refused: bool,
 ) -> Check:
     """How ``restore_tracked`` in leave-out mode would end for missing tracked path ``path``,
-    predicted from reads alone, warning as the restore would that it fails.
+    restored from the cache ``cache_root``, predicted from reads alone, warning as the restore
+    would that it fails.
 
     The restore's own source (``_source``) must be found: an unavailable listing fails, a
     missing one is absent. The restore must be able to read each cache object it links, as it
@@ -194,44 +177,119 @@ def check_tracked(
     (``cache.missing_cache_objects``) finds none absent and opens each one for reading, as the
     checkout opens it; an ``OSError`` from that lookup or open (an object or a directory of the
     cache this user cannot read) fails it, with the warning the restore gives for the error. A
-    symlink restore of a directory whose whole tree the cache holds opens none. With
-    ``links_refused`` (``register_refuses_links``: the run's registration refuses links into
-    ``cache_dir``'s cache), the restore checks every object out with COPY alone, opening each
-    one, or, with no COPY among ``checkout_modes``, refuses to link a path whose objects the
-    cache holds, opening none. And the restore must be able to write the path: the nearest
-    existing entry above it is a directory this process may write in and search
-    (``state_dir.nearest_entry_problem``), where the restore makes each missing directory on the
-    way and stages the path; else it fails, with a warning naming that entry, where the
-    restore's own warning gives the error its write meets.
+    symlink restore of a directory whose whole tree the cache holds opens none. And the restore
+    must be able to write the path (``_write_failure``).
+
+    With ``links_refused`` (``naming.register_refuses_links``: the run's registration refuses
+    links into the cache), the restore checks every object out as ``cache.refused_link_modes``
+    says: with COPY alone, opening each one, or, with no COPY among ``checkout_modes``, it
+    refuses where it reaches a link (``_check_refusing``).
 
     Raises:
         CacheError: With ``links_refused`` and no COPY among ``checkout_modes``, the refusal
-            the restore raises (``cache.unregistered_link_error``) for a path whose objects the
-            cache holds.
+            the restore raises where it reaches a link (``_check_refusing``).
     """
+    cache_dir = cache_root / "files"
     source = _source(path, track_data, cache_dir, tolerate_missing=True)
     if isinstance(source, Outcome):
         return Check(source, set())
-    refuses = links_refused and cache.CheckoutMode.COPY not in checkout_modes
-    modes = [cache.CheckoutMode.COPY] if links_refused and not refuses else checkout_modes
+    modes = checkout_modes
+    if links_refused:
+        copied = cache.refused_link_modes(checkout_modes)
+        if copied is None:
+            return _check_refusing(path, source, cache_root, checkout_modes)
+        modes = copied
     try:
         absent = cache.missing_cache_objects(
-            source.hash, source.members, cache_dir, modes, readable=not refuses
+            source.hash, source.members, cache_dir, modes, readable=True
         )
     except OSError as e:
         _warn_failed(path, e)
         return Check(Outcome.FAILED, set())
     if absent:
         return Check(Outcome.ABSENT, set())
-    if refuses:
-        # The cache root, whose object store cache_dir is, as the run's refusal names it
-        raise cache.unregistered_link_error(cache_dir, path, cache_dir.parent)
-    problem = state_dir_mod.nearest_entry_problem(path.parent)
-    if problem is not None:
-        entry, _ = problem
-        _warn_failed(path, f"this user cannot write in {entry}")
-        return Check(Outcome.FAILED, set())
+    failed = _write_failure(path)
+    if failed is not None:
+        return failed
     return Check(Outcome.RESTORED, _created_inside(source.members))
+
+
+def _check_refusing(
+    path: pathlib.Path,
+    source: _Source,
+    cache_root: pathlib.Path,
+    checkout_modes: list[cache.CheckoutMode],
+) -> Check:
+    """``check_tracked`` where the run's restore of missing tracked path ``path`` from
+    ``source`` refuses every link into the cache ``cache_root`` and has no COPY among
+    ``checkout_modes`` (``cache.refused_link_modes``): it refuses where it reaches a link, and
+    only there, opening no object.
+
+    A file's restore links its object, and a directory's restore that links the cache's whole
+    tree (``cache.linked_tree``, as a restore that records what it writes finds it) links that
+    tree: each looks up its object or tree (a file whose object the cache lacks is absent),
+    makes the directory that holds the path, and refuses before it writes there. So it refuses
+    once that directory exists or can be made, and fails, with a warning, where it cannot. Any
+    other directory's restore looks each member's object up (one the cache lacks makes it
+    absent) and stages the directory beside the path, as ``_write_failure`` checks, before it
+    links its first file and refuses; a listing that holds no file links nothing, so that
+    restore brings the directory back.
+
+    The refusal names the path and the cache's object store, not what the run's names: the
+    object or the tree it links, or, for a directory restored file by file, that file and its
+    object. The agreement tests compare only the words before those.
+
+    Raises:
+        CacheError: The restore reaches a link.
+    """
+    cache_dir = cache_root / "files"
+    try:
+        tree = (
+            cache.linked_tree(
+                source.hash, source.members, cache_dir, checkout_modes, stat_files=True
+            )
+            if types.is_dir_hash(source.hash) and source.members is not None
+            else None
+        )
+        # The restore links a whole tree as it is, looking up no object of it
+        absent = (
+            []
+            if tree is not None
+            else cache.missing_cache_objects(source.hash, source.members, cache_dir, checkout_modes)
+        )
+    except OSError as e:
+        _warn_failed(path, e)
+        return Check(Outcome.FAILED, set())
+    if absent:
+        return Check(Outcome.ABSENT, set())
+    refusal = cache.unregistered_link_error(cache_dir, path, cache_root)
+    if source.members is None or tree is not None:
+        # The restore makes the directory that holds the path, and links before it writes there
+        failed = None if path.parent.is_dir() else _write_failure(path)
+        if failed is not None:
+            return failed
+        raise refusal
+    failed = _write_failure(path)
+    if failed is not None:
+        return failed
+    if source.members["files"]:
+        raise refusal
+    return Check(Outcome.RESTORED, _created_inside(source.members))
+
+
+def _write_failure(path: pathlib.Path) -> Check | None:
+    """``Outcome.FAILED`` where the restore of missing tracked path ``path`` cannot write in the
+    directory that holds it, else None. The nearest existing entry at or above that directory
+    must be a directory this process may write in and search
+    (``state_dir.nearest_entry_problem``), where the restore makes each missing directory on the
+    way and stages the path; else it fails, with a warning naming that entry, where the
+    restore's own warning gives the error its write meets."""
+    problem = state_dir_mod.nearest_entry_problem(path.parent)
+    if problem is None:
+        return None
+    entry, _ = problem
+    _warn_failed(path, f"this user cannot write in {entry}")
+    return Check(Outcome.FAILED, set())
 
 
 def _warn_failed(path: pathlib.Path, reason: object) -> None:

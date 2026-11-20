@@ -125,8 +125,9 @@ def refusal_reason(source: types.ArtifactIdentity, error: exceptions.PivotError)
     """Why a template cannot expand over the files of directory output ``source``, in the one
     wording a run and every command use: a listing that is missing names the commands that
     bring it back, and any other refusal (a file whose key cannot name a stage, an unusable
-    listing, an instance another stage's name or output path holds, a refusal of
-    ``plan_instances``) is given as it is."""
+    listing, an instance another stage's name or output path holds, an instance output over a
+    missing tracked file, an instance's incremental output a run would lose) is given as it
+    is."""
     shown = types.identity_key(source)
     if isinstance(error, exceptions.ListingMissingError):
         return (

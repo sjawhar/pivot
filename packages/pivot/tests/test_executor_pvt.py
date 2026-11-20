@@ -361,9 +361,7 @@ def _left_missing(
     """``paths`` left missing by the pre-flight in leave-out mode, none of them by a failed
     restore."""
     return ownership.MissingTracked(
-        paths=sorted(str(path) for path in paths),
-        failed=frozenset(),
-        checkout_attempted=checkout_attempted,
+        paths=sorted(str(path) for path in paths), checkout_attempted=checkout_attempted
     )
 
 
@@ -714,9 +712,7 @@ def test_find_missing_tracked_files_says_what_the_cache_restores_and_restores_no
     assert [path for path in missing if pathlib.Path(path).exists()] == [], "nothing restored"
     assert executor_core.find_missing_tracked_files(pipeline_dir) == (
         executor_core.MissingTrackedFiles(
-            missing=ownership.MissingTracked(
-                paths=missing, failed=frozenset(), checkout_attempted=False
-            ),
+            missing=ownership.MissingTracked(paths=missing, checkout_attempted=False),
             restorable={},
             restored={},
         )

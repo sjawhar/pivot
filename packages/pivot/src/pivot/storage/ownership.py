@@ -1030,12 +1030,12 @@ class MissingTracked(NamedTuple):
     paths: list[str]
     """Each missing tracked path, absolute and normalized as ``track.discover_pvt_files``
     gives it, sorted."""
-    failed: frozenset[str]
-    """Each path of ``paths`` whose ``--checkout-missing`` restore failed
-    (``executor.tracked_restore.Outcome.FAILED``), which a refusal names as such rather than as
-    one the local cache lacks."""
     checkout_attempted: bool
     """Whether a ``--checkout-missing`` restore tried ``paths`` first."""
+    failed: frozenset[str] = frozenset()
+    """Each path of ``paths`` whose ``--checkout-missing`` restore failed
+    (``executor.tracked_restore.Outcome.FAILED``), which a refusal names as such rather than as
+    one the local cache lacks; none by default."""
 
 
 def tracked_output_refusal(

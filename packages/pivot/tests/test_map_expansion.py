@@ -20,6 +20,7 @@ from pivot.types import Recovery
 
 if TYPE_CHECKING:
     import pathlib
+    from collections.abc import Callable
 
 
 def _stage_plan(
@@ -173,6 +174,69 @@ def test_outputs_missing_from_the_cache_count_as_current_only_with_a_remote(
 
     assert "Outputs missing from cache" in without_remote["not_expanded"]["p/_stage_cut"]
     assert with_remote["expanded"]["p/_stage_cut"] == _CUTS, "restorable from the remote"
+
+
+def _remove_plan_listing(root: pathlib.Path) -> None:
+    for listing in (root / ".pivot" / "stages" / "p").glob("_stage_plan=*.listing"):
+        listing.unlink()
+
+
+def _corrupt_plan_listing(root: pathlib.Path) -> None:
+    for listing in (root / ".pivot" / "stages" / "p").glob("_stage_plan=*.listing"):
+        listing.write_bytes(listing.read_bytes() + b"junk\n")
+
+
+def _keep_plan_listing(_root: pathlib.Path) -> None:
+    pass
+
+
+@pytest.mark.parametrize(
+    ("plan", "change", "refused", "listed"),
+    [
+        pytest.param({"a": 1, "b": 2}, _remove_plan_listing, set[str](), {"p/_stage_cut"}),
+        pytest.param({"a": 1, "b": 2}, _corrupt_plan_listing, set[str](), set[str]()),
+        pytest.param({"a b": 1}, _keep_plan_listing, {"p/_stage_cut"}, set[str]()),
+    ],
+    ids=["listing_removed", "listing_corrupt", "key_names_no_stage"],
+)
+def test_a_producer_current_only_through_pull_excuses_only_a_listing_that_cannot_be_read(
+    set_project_root: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    plan: dict[str, int],
+    change: Callable[[pathlib.Path], None],
+    refused: set[str],
+    listed: set[str],
+) -> None:
+    """p/_stage_plan ran over ``plan``; then its outputs left the cache and the workspace, and a
+    remote is configured, so it is current only because a pull would bring it up to date
+    (``pulled``). A run never pulls: it runs p/_stage_plan again and expands from the listing
+    that run writes. So a listing ``change`` leaves unreadable, removed (``listings`` names it,
+    for a pull to fetch) or corrupt, leaves p/_stage_cut not expanded and not refused; a
+    readable listing whose key cannot name a stage still refuses it."""
+    root = set_project_root
+    monkeypatch.chdir(root)
+    _write_plan(root, plan)
+    executor.run(pipeline=_pipeline(root))
+    pipeline = _pipeline(root)
+    monkeypatch.setattr(remote_config, "list_remotes", lambda: {"origin": "s3://bucket/cache"})
+    producer = pipeline.get_stage("p/_stage_plan")
+    record = expansion.recorded_directory(
+        producer["outs"][0].identity,
+        expansion.stage_lock(producer, config.locate_state_dir()).read(),
+    )
+    assert record is not None
+    _empty_cache(root)
+    plan_dir = root / "data" / "p" / "_stage_plan"
+    for name in os.listdir(plan_dir):
+        os.unlink(plan_dir / name)
+    change(root)
+
+    result, _ = status.expand_current(pipeline)
+
+    assert result["expanded"] == {}
+    assert list(result["not_expanded"]) == ["p/_stage_cut", "p/_stage_build"]
+    assert result["refused"] == refused
+    assert result["listings"] == dict.fromkeys(listed, record)
 
 
 def test_a_listing_neither_committed_nor_cached_is_named_for_pull_to_fetch(

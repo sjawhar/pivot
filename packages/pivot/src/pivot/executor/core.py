@@ -671,9 +671,7 @@ def verify_tracked_files(
         )
 
     tracked_files = track.discover_pvt_files_and_update_memo(project_root, skip=skip)
-    none_missing = ownership.MissingTracked(
-        paths=[], failed=frozenset(), checkout_attempted=checkout_missing
-    )
+    none_missing = ownership.MissingTracked(paths=[], checkout_attempted=checkout_missing)
     if not tracked_files:
         return none_missing
     if checkout_missing:
@@ -766,10 +764,11 @@ class MissingTrackedFiles(NamedTuple):
     Without ``checkout_missing``, every missing one, none of them failed."""
     restorable: dict[str, track.PvtData]
     """Each missing tracked path that the restore brings back, with its ``.pvt`` data, in sorted
-    order: the local cache holds every object its restore needs and this user can read them,
-    unless the restore could not write it (the nearest existing directory above it must be one
-    this user can write in and search) or read its cache objects, or it lies in a tracked
-    directory whose committed listing is stale, empty or unreadable with no cached copy. Empty
+    order (``tracked_restore.check_tracked``): the local cache holds every object its restore
+    links and this user can read each one as the restore reads it, the restore can write the
+    path (the nearest existing directory above it is one this user can write in and search),
+    and a tracked directory's listing is available (neither a committed listing that is stale,
+    empty or unreadable with no cached copy, nor a cached copy this user cannot read). Empty
     without ``checkout_missing``."""
     restored: dict[str, set[tuple[str, ...]]]
     """Each path of ``restorable``, with every path its restore creates inside it, as the parts
@@ -793,11 +792,11 @@ def find_missing_tracked_files(
     as the restore would for each that fails. It discovers with ``track.discover_pvt_files``,
     which never writes the memo. It restores nothing, registers in no cache and writes no state
     database or workspace file; it predicts whether the run's registration refuses links into
-    the cache (``tracked_restore.register_refuses_links``). With ``checkout_missing`` it raises
-    where the pre-flight raises: the refusal of a control path, ``CorruptListingError`` for a
-    missing directory whose listing is corrupt but not unavailable, and the refusal to link
-    from a cache that refuses links where no COPY is among the checkout modes. ``skip`` is as
-    for ``verify_tracked_files``.
+    the cache (``naming.register_refuses_links``). With ``checkout_missing`` it raises where the
+    pre-flight raises: the refusal of a control path, ``CorruptListingError`` for a missing
+    directory whose listing is corrupt but not unavailable, and, from a cache that refuses links
+    with no COPY among the checkout modes, the refusal to link where the restore reaches a link
+    (``tracked_restore.check_tracked``). ``skip`` is as for ``verify_tracked_files``.
     """
     tracked_files = track.discover_pvt_files(project_root, skip=skip)
     if checkout_missing and tracked_files:
@@ -805,16 +804,13 @@ def find_missing_tracked_files(
     found = sorted(path for path in tracked_files if _tracked_path_kind(pathlib.Path(path)) is None)
     if not checkout_missing or not found:
         return MissingTrackedFiles(
-            missing=ownership.MissingTracked(
-                paths=found, failed=frozenset(), checkout_attempted=checkout_missing
-            ),
+            missing=ownership.MissingTracked(paths=found, checkout_attempted=checkout_missing),
             restorable={},
             restored={},
         )
     cache_root = config.locate_cache_dir()
-    cache_dir = cache_root / "files"
     checkout_modes = config.get_checkout_mode_order()
-    links_refused = tracked_restore.register_refuses_links(cache_root)
+    links_refused = naming.register_refuses_links(cache_root)
     missing = list[str]()
     failed = set[str]()
     restorable = dict[str, track.PvtData]()
@@ -823,7 +819,7 @@ def find_missing_tracked_files(
         check = tracked_restore.check_tracked(
             pathlib.Path(path),
             tracked_files[path],
-            cache_dir,
+            cache_root,
             checkout_modes,
             links_refused=links_refused,
         )
