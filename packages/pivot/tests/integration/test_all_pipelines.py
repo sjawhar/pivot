@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import threading
 from typing import TYPE_CHECKING
@@ -12,7 +13,7 @@ import pytest
 
 import pivot_tui.run
 from pivot import cli
-from pivot.storage import lock
+from pivot.storage import cache, lock, track
 from tests import helpers
 from tests.conftest import isolated_pivot_dir
 
@@ -379,23 +380,192 @@ def test_repro_all_tracked_keep_going_leaves_out_a_mapped_stage_whose_shared_inp
         assert (cwd / "data" / "m" / "plan" / "a.txt").read_text() == "a"
 
 
-@pytest.mark.parametrize("tracked", [True, False], ids=["tracked", "untracked"])
+def _helper_restore_warnings(stderr: str) -> list[str]:
+    """Each `Cannot restore` warning line of ``stderr``: a tracked path a restore left missing."""
+    return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
+
+
+@pytest.mark.parametrize("committed", ["stale", "empty"])
+def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_lost_listing(
+    runner: CliRunner, tmp_path: pathlib.Path, committed: str
+) -> None:
+    """R1, R5: dirs/scan reads data/raw/images, a missing tracked directory whose committed
+    listing is stale or empty while the cache holds no copy of the listing (a fresh clone). The
+    run's --checkout-missing restore cannot bring it back: the run warns once, as `pivot
+    checkout` does, leaves dirs/scan out with a `Skipping:` line, runs alpha and exits 0. The
+    dry run with --checkout-missing exits 0, lists alpha alone, and gives the same warning and
+    the same line."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        helpers.write_pipeline(cwd, "dirs", _helper_directory_reader_code("images"))
+        helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+        images = cwd / "data" / "raw" / "images"
+        images.mkdir(parents=True)
+        (images / "a.png").write_text("a")
+        tracking = runner.invoke(cli.cli, ["track", "data/raw/images"])
+        assert tracking.exit_code == 0, tracking.output
+        shutil.rmtree(images)
+        committed_listing = cwd / "data" / "raw" / "images.pvt.listing"
+        committed_listing.write_bytes(
+            committed_listing.read_bytes().replace(b"a.png", b"b.png")
+            if committed == "stale"
+            else b""
+        )
+        record = track.read_pvt_file(track.get_pvt_path(images))
+        assert record is not None
+        cache.get_cache_path(cwd / ".pivot" / "cache" / "files", record["hash"]).unlink()
+
+        dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
+        ran = runner.invoke(
+            cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+        )
+
+        skipped = [
+            "Skipping: Stage 'dirs/scan' depends on input 'images' (path data/raw/images), "
+            + "which does not exist"
+        ]
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
+        }, dry_run.output
+        assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
+        warnings = _helper_restore_warnings(dry_run.stderr)
+        assert len(warnings) == 1, dry_run.output
+        assert warnings[0].startswith(
+            f"Cannot restore {images}: {committed_listing}: its bytes hash to "
+        ), dry_run.output
+        assert ran.exit_code == 0, ran.output
+        completed = helpers.completed_stages(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "ran"
+        }, ran.output
+        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
+        assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
+        assert _helper_restore_warnings(ran.stderr) == warnings, ran.output
+        assert not images.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes in a read-only directory")
+def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_read_only_path(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R1, R5: kept/read_0 reads data/raw/locked/cached.txt, whose object the cache holds, in the
+    read-only directory data/raw/locked. The run's --checkout-missing restore fails with
+    PermissionError: the run warns once, naming the path and the error, leaves kept/read_0 out
+    with a `Skipping:` line, runs alpha and exits 0. The dry run with --checkout-missing does
+    not count the file as present: it lists alpha alone and leaves kept/read_0 out with the same
+    line, warning that it cannot write in data/raw/locked."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        helpers.write_pipeline(
+            cwd,
+            "kept",
+            _helper_broken_pipeline_code(1, name="kept", input_name="locked/cached.txt"),
+        )
+        helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+        locked = cwd / "data" / "raw" / "locked"
+        locked.mkdir(parents=True)
+        cached = locked / "cached.txt"
+        cached.write_text("cached bytes")
+        tracking = runner.invoke(cli.cli, ["track", "data/raw/locked/cached.txt"])
+        assert tracking.exit_code == 0, tracking.output
+        cached.unlink()
+
+        locked.chmod(0o555)
+        try:
+            dry_run = runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, "--checkout-missing"])
+            ran = runner.invoke(
+                cli.cli, ["repro", "--all", "--keep-going", "--checkout-missing", "--jsonl"]
+            )
+        finally:
+            locked.chmod(0o755)
+
+        skipped = [
+            "Skipping: Stage 'kept/read_0' depends on input 'locked/cached.txt' "
+            + "(path data/raw/locked/cached.txt), which does not exist"
+        ]
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
+        }, dry_run.output
+        assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
+        assert _helper_restore_warnings(dry_run.stderr) == [
+            f"Cannot restore {cached}: this user cannot write in {locked}"
+        ], dry_run.output
+        assert ran.exit_code == 0, ran.output
+        completed = helpers.completed_stages(ran.stdout)
+        assert {stage: event["status"] for stage, event in completed.items()} == {
+            "alpha/stage_a": "ran"
+        }, ran.output
+        assert completed.keys() == json.loads(dry_run.stdout)["stages"].keys()
+        assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
+        warnings = _helper_restore_warnings(ran.stderr)
+        assert len(warnings) == 1, ran.output
+        assert warnings[0].startswith(
+            f"Cannot restore {cached}: [Errno 13] Permission denied: '{locked}/"
+        ), ran.output
+        assert not cached.exists()
+
+
+class _FakeTuiApp:
+    """Stands for ``pivot_tui.run.PivotApp`` in a one-shot ``repro --tui``: it starts no terminal
+    UI, and its ``run`` returns once the engine thread posts ``TuiShutdown`` at its end, as the
+    real app exits then (``_run_common.run_tui_with_engine``)."""
+
+    shut_down: threading.Event
+    return_code: int | None
+
+    def __init__(self, **_options: object) -> None:
+        self.shut_down = threading.Event()
+        self.return_code = None
+
+    def post_message(self, message: object) -> bool:
+        if isinstance(message, pivot_tui.run.TuiShutdown):
+            self.shut_down.set()
+        return True
+
+    def set_event_poller(self, _poller: object) -> None:
+        return None
+
+    def run(self) -> None:
+        assert self.shut_down.wait(timeout=300), "the engine thread never ended"
+        self.return_code = 0
+
+
+@pytest.mark.parametrize(
+    ("tracked", "tui"),
+    [
+        pytest.param(True, False, id="tracked"),
+        pytest.param(False, False, id="untracked"),
+        pytest.param(True, True, id="tui"),
+    ],
+)
 def test_repro_all_keep_going_left_out_target_fails_the_run_after_the_other_target_runs(
-    runner: CliRunner, tmp_path: pathlib.Path, tracked: bool
+    runner: CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture, tracked: bool, tui: bool
 ) -> None:
     """A3 (R4): of targets broken/after, downstream of the reader of a missing input, and the
     healthy alpha/stage_a, alpha/stage_a runs; the run then exits 1 naming broken/after and the
-    missing file, and no target is an unknown stage. The tracked case has a second missing
-    tracked file that no stage reads."""
+    missing file, and no target is an unknown stage. The tracked cases have a second missing
+    tracked file that no stage reads. The tui case runs through the one-shot TUI
+    (``cli/repro.py`` ``_run_oneshot_mode``'s TUI branch), whose app is a stand-in that shows
+    nothing; the engine, its RPC socket and the event poller are the real ones."""
+    tui_app = mocker.patch.object(pivot_tui.run, "PivotApp", autospec=True, side_effect=_FakeTuiApp)
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         _helper_reader_project(cwd, tracked=tracked)
         if tracked:
             helpers.track_without_data(cwd / "data" / "raw" / "unrelated.txt")
 
         result = runner.invoke(
-            cli.cli, ["repro", "--all", "--keep-going", "broken/after", "alpha/stage_a"]
+            cli.cli,
+            [
+                "repro",
+                "--all",
+                "--keep-going",
+                *(["--tui"] if tui else []),
+                "broken/after",
+                "alpha/stage_a",
+            ],
         )
 
+        assert tui_app.call_count == (1 if tui else 0), "only the tui case goes through the TUI"
         assert result.exit_code == 1, result.output
         assert "Unknown stage" not in result.output, result.output
         assert _LEFT_OUT_AFTER in result.output, result.output
@@ -441,56 +611,6 @@ def test_repro_all_keep_going_left_out_target_names_an_instance_of_a_left_out_ma
         ) in result.output, result.output
         assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
         assert not (cwd / "data" / "m" / "cut@a.txt").exists()
-
-
-class _FakeTuiApp:
-    """Stands for ``pivot_tui.run.PivotApp`` in a one-shot ``repro --tui``: it starts no terminal
-    UI, and its ``run`` returns once the engine thread posts ``TuiShutdown`` at its end, as the
-    real app exits then (``_run_common.run_tui_with_engine``)."""
-
-    shut_down: threading.Event
-    return_code: int | None
-
-    def __init__(self, **_options: object) -> None:
-        self.shut_down = threading.Event()
-        self.return_code = None
-
-    def post_message(self, message: object) -> bool:
-        if isinstance(message, pivot_tui.run.TuiShutdown):
-            self.shut_down.set()
-        return True
-
-    def set_event_poller(self, _poller: object) -> None:
-        return None
-
-    def run(self) -> None:
-        assert self.shut_down.wait(timeout=300), "the engine thread never ended"
-        self.return_code = 0
-
-
-def test_repro_all_keep_going_tui_left_out_target_fails_the_run_after_the_other_target_runs(
-    runner: CliRunner, tmp_path: pathlib.Path, mocker: MockerFixture
-) -> None:
-    """A3 (R4) through the one-shot TUI (``cli/repro.py`` ``_run_oneshot_mode``'s TUI branch):
-    of targets broken/after, downstream of the reader of a missing tracked file, and the healthy
-    alpha/stage_a, alpha/stage_a runs; the command then exits 1 naming broken/after and the
-    missing file, and no target is an unknown stage. The TUI app is a stand-in that shows
-    nothing; the engine, its RPC socket and the event poller are the real ones."""
-    tui_app = mocker.patch.object(pivot_tui.run, "PivotApp", autospec=True, side_effect=_FakeTuiApp)
-    with isolated_pivot_dir(runner, tmp_path) as cwd:
-        _helper_reader_project(cwd)
-        helpers.track_without_data(cwd / "data" / "raw" / "unrelated.txt")
-
-        result = runner.invoke(
-            cli.cli, ["repro", "--all", "--keep-going", "--tui", "broken/after", "alpha/stage_a"]
-        )
-
-        assert tui_app.call_count == 1, "the run goes through the TUI"
-        assert result.exit_code == 1, result.output
-        assert "Unknown stage" not in result.output, result.output
-        assert _LEFT_OUT_AFTER in result.output, result.output
-        assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
-        assert not (cwd / "data" / "broken" / "after.txt").exists()
 
 
 @pytest.mark.parametrize(

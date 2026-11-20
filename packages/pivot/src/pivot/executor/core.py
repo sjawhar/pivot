@@ -22,7 +22,7 @@ import loky.reusable_executor
 from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
-from pivot.storage import cache, lock, naming, ownership, track
+from pivot.storage import cache, listing, lock, naming, ownership, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
     from pivot.engine import types as engine_types
     from pivot.registry import RegistryStageInfo
-    from pivot.storage import listing
 
 logger = logging.getLogger(__name__)
 
@@ -607,12 +606,18 @@ class _RestoreSource(NamedTuple):
 
 
 def _restore_source(
-    path: pathlib.Path, track_data: track.PvtData, cache_dir: pathlib.Path
+    path: pathlib.Path,
+    track_data: track.PvtData,
+    cache_dir: pathlib.Path,
+    *,
+    tolerate_missing: bool,
 ) -> _RestoreSource | None:
     """What the restore of missing tracked path ``path`` links from ``cache_dir``: its hash and,
     for a directory, its committed listing file, else the cache's listing object. None for a
     directory whose listing neither holds: no restore brings it back. A corrupt listing raises
-    ``CorruptListingError``. The restore (``_restore_tracked_file``) and the dry run's view of it
+    ``CorruptListingError``; with ``tolerate_missing`` (leave-out mode), a lost one
+    (``_listing_lost``) gives None instead, with the warning ``pivot checkout`` gives for it.
+    The restore (``_restore_tracked_file``) and the dry run's view of it
     (``find_missing_tracked_files``) both read it here, so they never disagree on what a restore
     brings back."""
     output_hash = track.pvt_to_hash_info(track_data)
@@ -622,6 +627,28 @@ def _restore_source(
         return _RestoreSource(output_hash, track.tracked_members(path, track_data, cache_dir))
     except exceptions.ListingMissingError:
         return None
+    except exceptions.CorruptListingError as e:
+        if not tolerate_missing or not _listing_lost(path, output_hash, cache_dir):
+            raise
+        logger.warning("Cannot restore %s: %s. %s", path, e, e.REMEDY)
+        return None
+
+
+def _listing_lost(path: pathlib.Path, record: types.DirHash, cache_dir: pathlib.Path) -> bool:
+    """Whether tracked directory ``path``, whose listing read raised ``CorruptListingError``, has
+    lost its listing: its committed ``.pvt.listing`` is stale or empty (``listing.read_bytes``
+    refuses it, without the cache, as bytes that do not hash to ``record`` or a file that cannot
+    be read) and ``cache_dir`` holds no listing object at ``record``'s hash to fall back on, as in
+    a fresh clone. Any other corrupt listing is not lost: a cache object that is corrupt or
+    cannot be read, a collision, or a listing that hashes to ``record`` but does not match it."""
+    if cache.resolve_cache_object_path(cache_dir, record["hash"], notice=False) is not None:
+        return False
+    try:
+        listing.read_bytes(listing.tracked_listing_path(track.get_pvt_path(path)), record, None)
+    except (exceptions.CorruptListingError, exceptions.ListingMissingError):
+        # A committed listing removed since the first read leaves no listing either
+        return True
+    return False
 
 
 def _restore_tracked_file(
@@ -631,6 +658,8 @@ def _restore_tracked_file(
     project_root: pathlib.Path,
     state_dir: pathlib.Path,
     recorded: list[tuple[pathlib.Path, os.stat_result, str]],
+    *,
+    tolerate_missing: bool,
 ) -> bool:
     """Restore a tracked file or directory from cache without replacing a user file that lands
     while staging.
@@ -638,9 +667,12 @@ def _restore_tracked_file(
     Each restored file is appended to ``recorded`` for the caller to record in StateDB
     (``cache.restore_from_cache``). Returns True if successful, False if not in cache. A
     directory is restored from its committed listing file, else the cache's listing object
-    (``_restore_source``).
+    (``_restore_source``). With ``tolerate_missing`` (leave-out mode), it also returns False,
+    leaving the path missing, for a directory whose listing is lost and for a restore that fails
+    with ``OSError``, each with a warning naming the path; a refusal (a ``PivotError``, never an
+    ``OSError``) still raises.
     """
-    source = _restore_source(path, track_data, cache_dir)
+    source = _restore_source(path, track_data, cache_dir, tolerate_missing=tolerate_missing)
     if source is None:
         return False
     target = ownership.ForcedRestore(
@@ -658,16 +690,22 @@ def _restore_tracked_file(
 
     # Use default checkout modes (hardlink with copy fallback).
     checkout_modes = config.get_checkout_mode_order()
-    return cache.restore_from_cache(
-        path,
-        source.hash,
-        cache_dir,
-        checkout_modes=checkout_modes,
-        state_dir=state_dir,
-        members=source.members,
-        before_swap=before_swap,
-        recorded=recorded,
-    )
+    try:
+        return cache.restore_from_cache(
+            path,
+            source.hash,
+            cache_dir,
+            checkout_modes=checkout_modes,
+            state_dir=state_dir,
+            members=source.members,
+            before_swap=before_swap,
+            recorded=recorded,
+        )
+    except OSError as e:
+        if not tolerate_missing:
+            raise
+        logger.warning("Cannot restore %s: %s", path, e)
+        return False
 
 
 def _tracked_path_kind(path: pathlib.Path) -> Literal["file", "directory"] | None:
@@ -711,7 +749,9 @@ def verify_tracked_files(
         skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
             own member of its output (``member_skip.own_member_skip``).
         tolerate_missing: If True, return the tracked files that are still missing after the
-            restore, unless one of them overlaps a path of ``outputs``.
+            restore, unless one of them overlaps a path of ``outputs``. A restore that fails
+            then leaves its path missing, with a warning (``_restore_tracked_file``): a
+            directory whose listing is lost, or a write that fails with ``OSError``.
         outputs: The ``ownership.normalized`` path of each output of the loaded stages, with
             the stage that writes it (``ownership.stage_output_paths``); an empty mapping for
             none. Read only with ``tolerate_missing``, which requires it.
@@ -726,6 +766,9 @@ def verify_tracked_files(
         TrackedFileMissingError: Without ``tolerate_missing``, for every tracked file still
             missing. With it, for each one that is, lies inside or contains a path of
             ``outputs`` (``ownership.tracked_output_refusal``), and for no other file.
+        CorruptListingError: A missing directory's listing is corrupt; with
+            ``tolerate_missing``, only when it is not lost (``_listing_lost``).
+        OSError: Without ``tolerate_missing``, a restore that fails.
     """
     from pivot import metrics
 
@@ -773,7 +816,13 @@ def verify_tracked_files(
                         naming.register_use(cache_root, project_root, state_dir)
                         registered = True
                     if _restore_tracked_file(
-                        path, track_data, cache_dir, project_root, state_dir, pending
+                        path,
+                        track_data,
+                        cache_dir,
+                        project_root,
+                        state_dir,
+                        pending,
+                        tolerate_missing=tolerate_missing,
                     ):
                         logger.info(f"Restored tracked file: {data_path}")
                     else:
@@ -816,8 +865,9 @@ class MissingTrackedFiles(NamedTuple):
     """Each missing tracked path the restore does not bring back (the absolute normalized path
     discovery gives), sorted: without ``checkout_missing``, every missing one."""
     restorable: dict[str, track.PvtData]
-    """Each missing tracked path the local cache can restore, with its ``.pvt`` data, in sorted
-    order. Empty without ``checkout_missing``."""
+    """Each missing tracked path the restore brings back, with its ``.pvt`` data, in sorted
+    order: the local cache holds it, and the restore can write it. Empty without
+    ``checkout_missing``."""
     restored: dict[str, set[tuple[str, ...]]]
     """Each path of ``restorable``, with every path its restore creates inside it, as the parts
     of that path relative to it (``_created_inside``): for a directory, each file and empty
@@ -830,17 +880,19 @@ def find_missing_tracked_files(
     skip: track.PvtSkip | None = None,
     checkout_missing: bool = False,
 ) -> MissingTrackedFiles:
-    """The dry run's view of the pre-flight (``verify_tracked_files``), reading only.
+    """The dry run's view of the pre-flight in leave-out mode (``verify_tracked_files`` with
+    ``tolerate_missing``), reading only.
 
     Finds the tracked files the pre-flight finds missing, with its existence rule
-    (``_tracked_path_kind``), and with ``checkout_missing`` splits off those the local cache can
-    restore: the restore's own source (``_restore_source``) is readable and
-    ``cache.missing_cache_objects``, the rule a forced checkout uses, finds none of its objects
-    absent for the configured checkout modes. It discovers with ``track.discover_pvt_files``,
+    (``_tracked_path_kind``), and with ``checkout_missing`` splits off those its restore brings
+    back: the restore's own source (``_restore_source``) is readable, a lost listing leaving the
+    path missing as in that mode; ``cache.missing_cache_objects``, the rule a forced checkout
+    uses, finds none of its objects absent for the configured checkout modes; and the restore
+    can write the path (``_restore_can_write``). It discovers with ``track.discover_pvt_files``,
     which never writes the memo. It restores nothing, registers in no cache and writes no state
     database or workspace file. With ``checkout_missing`` it raises where the pre-flight raises:
     the refusal of a control path, and ``CorruptListingError`` for a missing directory whose
-    listing is corrupt. ``skip`` is as for ``verify_tracked_files``.
+    listing is corrupt but not lost. ``skip`` is as for ``verify_tracked_files``.
     """
     tracked_files = track.discover_pvt_files(project_root, skip=skip)
     if checkout_missing and tracked_files:
@@ -854,15 +906,33 @@ def find_missing_tracked_files(
     restorable = dict[str, track.PvtData]()
     restored = dict[str, set[tuple[str, ...]]]()
     for path in found:
-        source = _restore_source(pathlib.Path(path), tracked_files[path], cache_dir)
-        if source is None or cache.missing_cache_objects(
-            source.hash, source.members, cache_dir, checkout_modes
+        data_path = pathlib.Path(path)
+        source = _restore_source(data_path, tracked_files[path], cache_dir, tolerate_missing=True)
+        if (
+            source is None
+            or cache.missing_cache_objects(source.hash, source.members, cache_dir, checkout_modes)
+            or not _restore_can_write(data_path)
         ):
             missing.append(path)
             continue
         restorable[path] = tracked_files[path]
         restored[path] = _created_inside(source.members)
     return MissingTrackedFiles(missing=missing, restorable=restorable, restored=restored)
+
+
+def _restore_can_write(path: pathlib.Path) -> bool:
+    """Whether the restore of missing tracked path ``path`` can write it: the nearest existing
+    entry above it is a directory this process may write in and search (``os.access``), where the
+    restore makes each missing directory on the way and stages the path. Else it warns, naming
+    the path and that entry. Only the dry run asks (``find_missing_tracked_files``); the run's
+    restore learns by trying, and in leave-out mode leaves a path whose write fails missing
+    (``_restore_tracked_file``)."""
+    # The root exists: discovery gives absolute paths
+    nearest = next(parent for parent in path.parents if os.path.lexists(parent))
+    if nearest.is_dir() and os.access(nearest, os.W_OK | os.X_OK):
+        return True
+    logger.warning("Cannot restore %s: this user cannot write in %s", path, nearest)
+    return False
 
 
 def _created_inside(members: listing.DirListing | None) -> set[tuple[str, ...]]:

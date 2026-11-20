@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 import pathlib  # noqa: TC003 - compose resolves postponed stage annotations at runtime
 import pickle
@@ -17,7 +19,7 @@ from pivot.storage import cache, ownership, track
 from tests import helpers
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
     import click.testing
 
@@ -688,29 +690,187 @@ def test_find_missing_tracked_files_says_what_the_cache_restores_and_restores_no
     assert (cached_dir / "empty").is_dir(), "the restore creates the empty directory it lists"
 
 
-def test_find_missing_tracked_files_raises_for_a_corrupt_listing_as_the_restore_does(
-    pipeline_dir: pathlib.Path, runner: click.testing.CliRunner
+@contextlib.contextmanager
+def _caught_warnings(caplog: pytest.LogCaptureFixture) -> Generator[list[str]]:
+    """The message of each warning the pre-flight's module (``executor.core``) logs in the
+    block, filled in when the block ends. `pivot track` sets up the CLI's logging, which takes
+    every handler off the root logger, caplog's among them, so the block puts caplog's back on
+    for its length."""
+    root = logging.getLogger()
+    root.addHandler(caplog.handler)
+    caught = list[str]()
+    try:
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            yield caught
+    finally:
+        root.removeHandler(caplog.handler)
+    caught.extend(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == executor_core.logger.name and record.levelno >= logging.WARNING
+    )
+
+
+@pytest.mark.parametrize("committed", ["stale", "empty"])
+def test_a_lost_listing_leaves_its_directory_missing_in_leave_out_mode_and_stops_any_other_run(
+    pipeline_dir: pathlib.Path,
+    runner: click.testing.CliRunner,
+    caplog: pytest.LogCaptureFixture,
+    committed: str,
 ) -> None:
-    """With checkout_missing, a missing tracked directory whose committed listing does not hash
-    to its .pvt, and whose cache holds no copy of the listing to fall back on, stops the dry
-    run's view with ``CorruptListingError``, as it stops the run's restore, rather than reading
-    as not restorable."""
+    """With checkout_missing, a missing tracked directory whose committed listing is stale or
+    empty, and whose cache holds no copy of the listing to fall back on (a fresh clone), has lost
+    its listing. The dry run's view and the leave-out restore (tolerate_missing) each leave it
+    missing, with the one warning `pivot checkout` gives for it; a restore outside leave-out mode
+    still stops on ``CorruptListingError``, as in 0.10.4."""
     images = pipeline_dir / "images"
     images.mkdir()
     (images / "a.jpg").write_bytes(b"image1")
     _track_then_remove(runner, pipeline_dir, "images")
     listing_file = pipeline_dir / "images.pvt.listing"
-    listing_file.write_bytes(listing_file.read_bytes().replace(b"a.jpg", b"b.jpg"))
+    listing_file.write_bytes(
+        listing_file.read_bytes().replace(b"a.jpg", b"b.jpg") if committed == "stale" else b""
+    )
     record = track.read_pvt_file(track.get_pvt_path(images))
     assert record is not None
     cache.get_cache_path(pipeline_dir / ".pivot" / "cache" / "files", record["hash"]).unlink()
+    problem = (
+        f"{listing_file}: its bytes hash to {xxhash.xxh64(listing_file.read_bytes()).hexdigest()}, "
+        + f"not to the directory hash {record['hash']} its lock or .pvt records"
+    )
 
-    with pytest.raises(exceptions.CorruptListingError, match=r"images\.pvt\.listing"):
-        executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
-    with pytest.raises(exceptions.CorruptListingError, match=r"images\.pvt\.listing"):
+    with _caught_warnings(caplog) as dry_run_warnings:
+        found = executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
+    with _caught_warnings(caplog) as run_warnings:
+        missing = executor_core.verify_tracked_files(
+            pipeline_dir, checkout_missing=True, tolerate_missing=True, outputs={}
+        )
+    with pytest.raises(exceptions.CorruptListingError) as exc_info:
+        executor_core.verify_tracked_files(pipeline_dir, checkout_missing=True)
+
+    assert found == executor_core.MissingTrackedFiles(
+        missing=[str(images)], restorable={}, restored={}
+    )
+    assert missing == [str(images)]
+    warning = f"Cannot restore {images}: {problem}. {exceptions.CorruptListingError.REMEDY}"
+    assert dry_run_warnings == [warning]
+    assert run_warnings == [warning]
+    assert str(exc_info.value) == problem
+    assert not images.exists()
+
+
+@pytest.mark.parametrize("corruption", ["listing_disagrees_with_its_pvt", "corrupt_cache_object"])
+def test_any_other_corrupt_listing_stops_the_dry_run_as_it_stops_the_leave_out_restore(
+    pipeline_dir: pathlib.Path,
+    runner: click.testing.CliRunner,
+    caplog: pytest.LogCaptureFixture,
+    corruption: str,
+) -> None:
+    """A corrupt listing that is not lost still raises ``CorruptListingError`` in the dry run's
+    view and in the leave-out restore alike, with no warning: a committed listing that hashes to
+    the .pvt's record but lists fewer files than the .pvt records, the cache holding no copy;
+    and a stale committed listing beside a cache object at the record's hash whose bytes do not
+    hash to it."""
+    images = pipeline_dir / "images"
+    images.mkdir()
+    (images / "a.jpg").write_bytes(b"image1")
+    _track_then_remove(runner, pipeline_dir, "images")
+    pvt_path = track.get_pvt_path(images)
+    listing_file = pipeline_dir / "images.pvt.listing"
+    record = track.read_pvt_file(pvt_path)
+    assert record is not None
+    cache_object = cache.get_cache_path(pipeline_dir / ".pivot" / "cache" / "files", record["hash"])
+    cache_object.unlink()
+    if corruption == "listing_disagrees_with_its_pvt":
+        track.write_pvt_file(
+            pvt_path, track.PvtData(path="images", hash=record["hash"], size=6, nfiles=2)
+        )
+        problem = (
+            f"{listing_file}: lists 1 files of 6 bytes, but its lock or .pvt records 2 files of "
+            + "6 bytes"
+        )
+    else:
+        listing_file.write_bytes(listing_file.read_bytes().replace(b"a.jpg", b"b.jpg"))
+        cache_object.write_bytes(b"junk\n")
+        problem = (
+            f"{cache_object}: its bytes hash to {xxhash.xxh64(b'junk\n').hexdigest()}, not to the "
+            + f"directory hash {record['hash']} its lock or .pvt records"
+        )
+
+    with _caught_warnings(caplog) as warnings:
+        with pytest.raises(exceptions.CorruptListingError) as dry_run_error:
+            executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
+        with pytest.raises(exceptions.CorruptListingError) as run_error:
+            executor_core.verify_tracked_files(
+                pipeline_dir, checkout_missing=True, tolerate_missing=True, outputs={}
+            )
+
+    assert str(dry_run_error.value) == problem
+    assert str(run_error.value) == problem
+    assert warnings == []
+    assert not images.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes in a read-only directory")
+@pytest.mark.parametrize("nested", [False, True], ids=["in_it", "below_a_missing_directory"])
+def test_a_restore_that_cannot_write_leaves_its_path_missing_in_leave_out_mode_only(
+    pipeline_dir: pathlib.Path,
+    runner: click.testing.CliRunner,
+    caplog: pytest.LogCaptureFixture,
+    nested: bool,
+) -> None:
+    """With checkout_missing, a missing tracked file whose object the cache holds, and whose
+    nearest existing directory above it, ``locked``, is read-only, cannot be restored. The dry
+    run's view leaves it missing, with one warning naming ``locked``; the leave-out restore
+    (tolerate_missing) tries, fails with PermissionError and leaves it missing, with one warning
+    naming the path and the error; a restore outside leave-out mode still raises the error. The
+    nested case's .pvt names ``sub/cached.csv``, whose directory ``sub`` does not exist: the
+    restore would make it in ``locked``. Once ``locked`` is writable, the path is restorable
+    and the restore brings it back."""
+    locked = pipeline_dir / "locked"
+    locked.mkdir()
+    (locked / "cached.csv").write_text("cached data")
+    _track_then_remove(runner, pipeline_dir, "locked/cached.csv")
+    data_file = locked / "cached.csv"
+    if nested:
+        pvt_path = track.get_pvt_path(data_file)
+        record = track.read_pvt_file(pvt_path)
+        assert record is not None
+        track.write_pvt_file(
+            pvt_path, track.PvtData(path="sub/cached.csv", hash=record["hash"], size=record["size"])
+        )
+        data_file = locked / "sub" / "cached.csv"
+
+    locked.chmod(0o555)
+    try:
+        with _caught_warnings(caplog) as dry_run_warnings:
+            found = executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
+        with _caught_warnings(caplog) as run_warnings:
+            missing = executor_core.verify_tracked_files(
+                pipeline_dir, checkout_missing=True, tolerate_missing=True, outputs={}
+            )
+        with pytest.raises(PermissionError):
+            executor_core.verify_tracked_files(pipeline_dir, checkout_missing=True)
+    finally:
+        locked.chmod(0o755)
+    writable = executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True)
+
+    assert found == executor_core.MissingTrackedFiles(
+        missing=[str(data_file)], restorable={}, restored={}
+    )
+    assert dry_run_warnings == [f"Cannot restore {data_file}: this user cannot write in {locked}"]
+    assert missing == [str(data_file)]
+    assert len(run_warnings) == 1, run_warnings
+    assert run_warnings[0].startswith(
+        f"Cannot restore {data_file}: [Errno 13] Permission denied: '{locked}/"
+    ), run_warnings
+    assert not data_file.exists()
+    assert list(writable.restorable) == [str(data_file)]
+    assert (
         executor_core.verify_tracked_files(
             pipeline_dir, checkout_missing=True, tolerate_missing=True, outputs={}
         )
-    assert executor_core.find_missing_tracked_files(pipeline_dir) == (
-        executor_core.MissingTrackedFiles(missing=[str(images)], restorable={}, restored={})
+        == []
     )
+    assert data_file.read_text() == "cached data"
