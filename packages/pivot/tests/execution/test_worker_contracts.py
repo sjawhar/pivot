@@ -300,6 +300,21 @@ _NOTES_RAISE = (
     + 'raise Raised.Error("boom")'
 )
 
+# The source of a module whose import raises `Raised.Error("boom")`, whose class's metaclass
+# `__getattribute__` raises `SystemExit` where `__qualname__` is read through it, as describing
+# the error reads it.
+_QUALNAME_RAISES = (
+    "class Meta(type):\n"
+    + "    def __getattribute__(cls, name):\n"
+    + "        if name == '__qualname__':\n"
+    + "            raise SystemExit(1)\n"
+    + "        return super().__getattribute__(name)\n\n"
+    + "class Raised:\n"
+    + "    class Error(Exception, metaclass=Meta):\n"
+    + "        pass\n\n"
+    + 'raise Raised.Error("boom")'
+)
+
 
 def _zipped_package(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, raises: str
@@ -346,6 +361,11 @@ def _zipped_package(
             "Raised.Error",
             id="raises-an-error-whose-notes-raise-system-exit",
         ),
+        pytest.param(
+            _QUALNAME_RAISES,
+            "Raised.Error",
+            id="raises-an-error-whose-metaclass-raises-system-exit-on-its-qualified-name",
+        ),
     ],
 )
 def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line(
@@ -361,14 +381,17 @@ def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line
     (`raises-ending-in-a-newline`) or `boom`, a newline and `  again`
     (`raises-with-an-indented-line`), or with `boom` while it handles a `KeyError` it raised
     (`raises-while-handling-an-error`); or it raises `Raised.Error`, whose class's `__notes__`
-    property raises `SystemExit` (`raises-an-error-whose-notes-raise-system-exit`). Entering
+    property raises `SystemExit` (`raises-an-error-whose-notes-raise-system-exit`), or whose
+    class's metaclass `__getattribute__` raises `SystemExit` where `__qualname__` is read through
+    it (`raises-an-error-whose-metaclass-raises-system-exit-on-its-qualified-name`). Entering
     `_sent_submodules_bound` logs one warning, which gives the error's type and message on one
     line (`RuntimeError: boom`, or `RuntimeError: boom again`), each line of the message stripped
-    and no empty line joined, or the type's qualified name alone (`Raised.Error`) where
-    describing the error raises, binds nothing and does not raise. Were the warning's text built
-    with a line of the module looked up, for the error's traceback or for the error it chains,
-    the lookup would raise `UnicodeDecodeError` out of `_sent_submodules_bound`; so would the
-    `SystemExit` that describing `Raised.Error` raises, were it not caught."""
+    and no empty line joined, or the class's qualified name alone, without its module
+    (`Raised.Error`), where describing the error raises, binds nothing and does not raise. Were
+    the warning's text built with a line of the module looked up, for the error's traceback or for
+    the error it chains, the lookup would raise `UnicodeDecodeError` out of
+    `_sent_submodules_bound`; so would the `SystemExit` that describing `Raised.Error` raises, were
+    it not caught, and the one its metaclass raises, were the fallback name read through it."""
     package = _zipped_package(tmp_path, monkeypatch, raises)
 
     escaped = None

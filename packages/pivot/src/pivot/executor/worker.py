@@ -958,9 +958,12 @@ def _error_on_one_line(exc: BaseException) -> str:
     source as UTF-8 whatever its coding cookie says).
 
     Describing it runs the error's own code (a `__notes__` property, the `__dir__` it reads for a
-    suggestion), where CPython's description catches only an `Exception`. Where describing it
-    raises anything else, the text is the name of its type (`__qualname__`), except for
-    `WorkerTerminated`, which is raised: an interrupt of the run stays one."""
+    suggestion, a metaclass `__getattribute__` through which it reads the class's `__qualname__`),
+    where CPython's description catches at most an `Exception`. Where describing it raises
+    anything but `WorkerTerminated`, the text is the class's qualified name alone, without its
+    module (`Outer.Error`, where the line would read `company.local.Outer.Error: boom`), read with
+    `type.__getattribute__`, so no metaclass `__getattribute__` runs. `WorkerTerminated` is
+    raised: an interrupt of the run stays one."""
     try:
         described = traceback.TracebackException(
             type(exc), exc, None, compact=True, lookup_lines=False
@@ -970,7 +973,7 @@ def _error_on_one_line(exc: BaseException) -> str:
     except WorkerTerminated:
         raise
     except BaseException:
-        return type(exc).__qualname__
+        return type.__getattribute__(type(exc), "__qualname__")
     return " ".join(line.strip() for line in entry.splitlines() if line.strip())
 
 
@@ -986,11 +989,10 @@ def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[
     A module sent by name is imported here (`importlib.import_module`), which binds it on its
     package where it loads it; `sys.modules` holds what that import put there, as after any
     import. Where that import raises (any `Exception`, `SystemExit` or `KeyboardInterrupt`), one
-    warning, logged into the stage's output (`_queue_logging`), names the module and the error's
-    type and message, on one line (`_error_on_one_line`: the type's name alone where describing
-    the error raises), nothing is bound for it, and the stage runs: code that reads the module
-    through its package fails there with `AttributeError`, as in Pivot 0.10.4, which binds
-    nothing on the package; a run that does not read it runs. An interrupt of the run
+    warning, logged into the stage's output (`_queue_logging`), names the module and the error on
+    one line (`_error_on_one_line`), nothing is bound for it, and the stage runs: code that reads
+    the module through its package fails there with `AttributeError`, as in Pivot 0.10.4, which
+    binds nothing on the package; a run that does not read it runs. An interrupt of the run
     (`WorkerTerminated`), raised by the import or while the error is described, stays one. A
     module sent by value is bound as it came, with no import, and adds nothing to `sys.modules`.
     A module is bound only where this process holds its package (`sys.modules`) and the package
