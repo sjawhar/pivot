@@ -1250,9 +1250,22 @@ def refused_link_modes(checkout_modes: list[CheckoutMode]) -> list[CheckoutMode]
     in (``links_refused``) uses: COPY alone, as a copy is the project's own data and links
     nothing; or None when COPY is not among ``checkout_modes``, where the checkout reaches a
     link and refuses it (``refuse_unregistered_link``). The one rule ``_checkout_with_fallback``,
-    the whole-tree checks of a commit and a restore, and the dry run's prediction of a restore
-    (``executor.tracked_restore.check_tracked``) apply."""
+    the whole-tree checks of a commit and a restore (``_links_whole_tree``), and the dry run's
+    prediction of a restore (``executor.tracked_restore.check_tracked``) apply."""
     return [CheckoutMode.COPY] if CheckoutMode.COPY in checkout_modes else None
+
+
+def _links_whole_tree(checkout_modes: list[CheckoutMode], tree: pathlib.Path) -> bool:
+    """Whether a commit or a restore with ``checkout_modes`` links the whole-directory SYMLINK
+    tree ``tree`` of the cache as a whole: SYMLINK is first among them, unless the tree is in a
+    cache this process could not register in (``links_refused``) and COPY is among them, where
+    no link is made and the files are copied one by one (``refused_link_modes``). With no COPY
+    among them, such a cache's tree is still taken whole, and its link is refused."""
+    return (
+        bool(checkout_modes)
+        and checkout_modes[0] == CheckoutMode.SYMLINK
+        and not (links_refused(tree) and refused_link_modes(checkout_modes) is not None)
+    )
 
 
 def unregistered_link_error(
@@ -1867,6 +1880,21 @@ def _tree_file_stats(tree: pathlib.Path, members: listing.DirListing) -> list[os
     return [(tree / entry["relpath"]).stat() for entry in members["files"]]
 
 
+def restore_tree(
+    output_hash: DirHash, cache_dir: pathlib.Path, checkout_modes: list[CheckoutMode]
+) -> pathlib.Path | None:
+    """The whole-directory SYMLINK tree of directory ``output_hash`` that a restore with
+    ``checkout_modes`` starts from (``_restore_directory_from_cache``): the cache holds the tree
+    and SYMLINK is first among the modes; None where that restore starts file by file. A restore
+    that starts from the tree makes the directory that holds its path before it reads the tree
+    or looks up any member's object, then links the tree where ``linked_tree`` finds it, else
+    restores file by file. ``checkout_modes`` are the modes the checkout uses, as
+    ``linked_tree`` takes them. An ``OSError`` of the tree's lookup is raised, as that restore
+    meets it, whatever the modes."""
+    tree = resolve_cache_tree_path(cache_dir, output_hash["hash"])
+    return tree if checkout_modes[0] == CheckoutMode.SYMLINK else None
+
+
 def linked_tree(
     output_hash: DirHash,
     members: listing.DirListing,
@@ -1877,18 +1905,20 @@ def linked_tree(
 ) -> pathlib.Path | None:
     """The whole-directory SYMLINK tree of directory ``output_hash`` that a restore with
     ``checkout_modes`` links as it is (``_restore_directory_from_cache``'s fast path), or None
-    where that restore goes file by file. It links the tree when SYMLINK is first among
-    ``checkout_modes`` and the tree holds ``members`` and is marked with their canonical listing
-    bytes (``_ensure_tree_complete``, which never repairs it here). With ``stat_files``, each of
-    the tree's files must also stat, as a restore that records what it writes stats them
+    where that restore goes file by file. It links the tree it starts from (``restore_tree``)
+    when the tree holds ``members`` and is marked with their canonical listing bytes
+    (``_ensure_tree_complete``, which never repairs it here). With ``stat_files``, each of the
+    tree's files must also stat, as a restore that records what it writes stats them
     (``_tree_file_stats``). An ``OSError`` of the tree's lookup is raised, as that restore meets
-    it."""
-    tree = resolve_cache_tree_path(cache_dir, output_hash["hash"])
-    if (
-        checkout_modes[0] != CheckoutMode.SYMLINK
-        or tree is None
-        or not _ensure_tree_complete(tree, members, cache_dir, repair=False)
-    ):
+    it.
+
+    ``checkout_modes`` must be the modes the checkout uses: this does not read whether the
+    process may link into the cache (``links_refused``). A caller whose links are refused and
+    whose modes hold COPY passes ``refused_link_modes``' list, which links no tree, as
+    ``executor.tracked_restore.check_tracked`` does; with no COPY among them, the checkout uses
+    them as they are and refuses at the link."""
+    tree = restore_tree(output_hash, cache_dir, checkout_modes)
+    if tree is None or not _ensure_tree_complete(tree, members, cache_dir, repair=False):
         return None
     if stat_files:
         try:
@@ -2166,16 +2196,7 @@ def _store_directory(
 
     with restore_lock(path, state_dir) as lock_token:
         cache_dir_path = tree_path(cache_dir, hashed["record"]["hash"])
-        # A cache this process could not register in gets no link (``refused_link_modes``): with
-        # COPY among the modes the files stay copies, one by one (``_checkout_with_fallback``).
-        whole_tree = (
-            bool(checkout_modes)
-            and checkout_modes[0] == CheckoutMode.SYMLINK
-            and not (
-                links_refused(cache_dir_path) and refused_link_modes(checkout_modes) is not None
-            )
-        )
-        if whole_tree:
+        if _links_whole_tree(checkout_modes, cache_dir_path):
             # SYMLINK mode: cache entire directory, symlink to it
             if not cache_dir_path.exists():
                 _publish_tree(path, cache_dir_path, members, cache_dir)
@@ -2487,13 +2508,8 @@ def _restore_directory_from_cache(
     """Restore a directory atomically. ``recorded`` is as ``restore_from_cache`` says: each
     file's stat is taken in the tree or staging directory, before the swap puts it in place."""
     cache_dir_path = resolve_cache_tree_path(cache_dir, output_hash["hash"])
-    # A cache this process could not register in gets no link (``refused_link_modes``): with COPY
-    # among the modes the restore copies file by file (``_checkout_with_fallback``); without it,
-    # the fast path refuses.
-    symlink_fast_path = (
-        checkout_modes[0] == CheckoutMode.SYMLINK
-        and cache_dir_path is not None
-        and not (links_refused(cache_dir_path) and refused_link_modes(checkout_modes) is not None)
+    symlink_fast_path = cache_dir_path is not None and _links_whole_tree(
+        checkout_modes, cache_dir_path
     )
     if not symlink_fast_path:
         for entry in members["files"]:

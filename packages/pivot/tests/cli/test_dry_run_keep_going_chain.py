@@ -199,7 +199,7 @@ def test_dry_run_keep_going_refuses_a_mapped_stage_over_a_missing_tracked_file(
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
     completed = helpers.completed_stages(ran.stdout)
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {
         "p/plan": "cached",
         "p/cut": "failed",
@@ -362,7 +362,7 @@ def test_dry_run_keep_going_leaves_a_mapped_stage_not_expanded_over_a_producer_o
     assert {name: stages[name] for name in chained} == chained, stderr
     assert all(row["would_run"] for row in stages.values()), document
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {"p/plan": "ran", **dict.fromkeys(added, "cached")}, ran.stdout
     assert {registry.template_of(stage, _CHAIN_TEMPLATES) or stage for stage in statuses} == (
         stages.keys()
@@ -419,7 +419,7 @@ def test_dry_run_keep_going_fails_a_mapped_stage_over_a_producer_only_pullable(
     ran, events = helpers.run_keep_going(root, home)
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {
         "p/plan": "ran",
         "p/cut": "failed",
@@ -455,7 +455,7 @@ def test_dry_run_keep_going_lists_the_instances_a_failing_mapped_target_is_mappe
     ran, events = helpers.run_keep_going(root, home, "p/build")
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {
         "p/plan": "cached",
         "p/cut@a": "cached",
@@ -498,7 +498,7 @@ def test_dry_run_keep_going_lists_the_instance_a_blocked_instance_target_is_mapp
     ran, events = helpers.run_keep_going(root, home, "p/final@a")
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {
         "p/plan": "ran",
         "p/cut@a": "cached",
@@ -557,7 +557,7 @@ def test_dry_run_keep_going_lists_the_stages_upstream_of_a_mapped_target_not_exp
         }
     }, stderr
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {"p/plan": "ran", "p/shared": "cached", **instances}, ran.stdout
     assert {registry.template_of(stage, ["p/cut"]) or stage for stage in statuses} == (
         document["stages"].keys()
@@ -590,7 +590,7 @@ def test_dry_run_keep_going_limit_a_mapped_stage_its_producer_must_run_for(
         }
     }, stderr
     assert ran.returncode == 1, ran.stdout + ran.stderr
-    assert helpers.stage_statuses(events) == {
+    assert helpers.stage_statuses(ran.stdout) == {
         "p/plan": "ran",
         "p/cut": "failed",
         "p/build": "blocked",
@@ -632,7 +632,7 @@ def test_dry_run_keep_going_reads_the_keys_a_no_commit_run_reads(
         }
     }, stderr
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == dict.fromkeys(["p/plan", *_CHAIN_INSTANCES], "cached"), ran.stdout
     assert statuses.keys() == document["stages"].keys()
     assert not added.exists(), "the skip restores the directory to its lock's record"

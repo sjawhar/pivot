@@ -35,25 +35,37 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-class ExplainRowKind(NamedTuple):
-    """How ``output_explain_text`` shows a row that is no stage's explanation: its status label
-    and color, and the words its summary counts such rows with."""
-
-    label: str
-    color: str
-    counted: str
-
-
-NOT_EXPANDED_ROW = ExplainRowKind("NOT YET EXPANDED", "cyan", "not yet expanded")
+NOT_EXPANDED_ROW = console.ExplainRowKind("NOT YET EXPANDED", "cyan", "not yet expanded")
 """A mapped stage (``Pipeline.map``) not yet expanded, with what it waits for."""
-REFUSED_ROW = ExplainRowKind("WILL FAIL", "red", "will fail")
+REFUSED_ROW = console.ExplainRowKind("WILL FAIL", "red", "will fail")
 """A mapped stage the run refuses to expand: it fails the stage with the reason and runs none
 of its instances."""
-BLOCKED_ROW = ExplainRowKind("WILL BE BLOCKED", "red", "will be blocked")
-"""A mapped stage mapped over the instances of one the run refuses: the run blocks it."""
-ORPHANED_ROW = ExplainRowKind("ORPHANED (WILL BE REMOVED)", "red", "orphaned")
+BLOCKED_ROW = console.ExplainRowKind("WILL BE BLOCKED", "red", "will be blocked")
+"""A mapped stage mapped over the instances of one the run refuses, directly or through other
+mapped stages: the run blocks it."""
+ORPHANED_ROW = console.ExplainRowKind("ORPHANED (WILL BE REMOVED)", "red", "orphaned")
 """An instance of a mapped stage whose key left its producer's listing: the run that expands
 the mapped stage removes it."""
+
+
+class DryRunShown(NamedTuple):
+    """How ``pivot repro --dry-run`` lists a row of one kind among its stages."""
+
+    would_run: bool
+    """The row's ``would_run`` in the JSON document."""
+    words: str
+    """What the row's line of text says the run would do."""
+
+
+DRY_RUN_SHOWN = {
+    NOT_EXPANDED_ROW: DryRunShown(would_run=True, words="would expand"),
+    REFUSED_ROW: DryRunShown(would_run=False, words="would fail"),
+    BLOCKED_ROW: DryRunShown(would_run=False, words="would be blocked"),
+}
+"""Each kind of row that ``pivot repro --dry-run`` lists among its stages, in the order it lists
+them, with how it lists that kind: the run expands a mapped stage not yet expanded once its
+producer is current and runs its instances, fails one it refuses to expand and runs none of its
+instances, and blocks one mapped over a refused one's instances."""
 
 
 @cli_decorators.pivot_command(allow_all=True)
@@ -157,7 +169,9 @@ def status(
             status_mod.orphaned_instances(
                 pipeline,
                 expansion_result,
-                cli_helpers.eligible_templates(given_targets, expansion_result),
+                cli_helpers.eligible_templates(
+                    expansion_result, cli_helpers.run_order(given_targets)
+                ),
             ),
         )
 
@@ -296,8 +310,14 @@ def status(
                 suggestions,
                 show_tracked,
                 rows=[
-                    *((NOT_EXPANDED_ROW, row["name"], row["reason"]) for row in not_expanded),
-                    *((ORPHANED_ROW, row["name"], row["reason"]) for row in orphaned),
+                    *(
+                        console.ExplainRow(NOT_EXPANDED_ROW, row["name"], row["reason"])
+                        for row in not_expanded
+                    ),
+                    *(
+                        console.ExplainRow(ORPHANED_ROW, row["name"], row["reason"])
+                        for row in orphaned
+                    ),
                 ],
             )
         else:
@@ -467,11 +487,11 @@ def output_explain_text(
     suggestions: list[str] | None = None,
     show_tracked: bool = False,
     *,
-    rows: Sequence[tuple[ExplainRowKind, str, str]] = (),
+    rows: Sequence[console.ExplainRow] = (),
 ) -> None:
-    """Output detailed stage explanations as formatted text, then each of ``rows`` (its kind,
-    name and reason; a mapped stage, ``Pipeline.map``, or an instance of one) in its order, then
-    a summary that counts them by kind, in the order the kinds first come."""
+    """Output detailed stage explanations as formatted text, then each of ``rows`` (a mapped
+    stage, ``Pipeline.map``, or an instance of one) in its order, then a summary that counts
+    them by kind, in the order the kinds first come."""
     sections_printed = 0
 
     # Always show stage explanations section
@@ -481,17 +501,13 @@ def output_explain_text(
         con = console.Console()
         for exp in explanations:
             con.explain_stage(exp)
-        counts = collections.Counter[ExplainRowKind]()
-        for kind, name, reason in rows:
-            con.explain_row(name, kind.label, kind.color, reason)
-            counts[kind] += 1
+        counts = collections.Counter[console.ExplainRowKind]()
+        for row in rows:
+            con.explain_row(row)
+            counts[row.kind] += 1
 
         will_run = sum(1 for e in explanations if e["will_run"])
-        con.explain_summary(
-            will_run,
-            len(explanations) - will_run,
-            [(kind.counted, kind.color, count) for kind, count in counts.items()],
-        )
+        con.explain_summary(will_run, len(explanations) - will_run, counts)
     sections_printed += 1
 
     if show_tracked and tracked_status is not None:

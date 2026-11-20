@@ -1,7 +1,7 @@
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from typing import TextIO
+from typing import NamedTuple, TextIO
 
 import click
 
@@ -28,6 +28,24 @@ def _supports_color(stream: TextIO) -> bool:
         return False
     # Check for NO_COLOR environment variable
     return not os.environ.get("NO_COLOR")
+
+
+class ExplainRowKind(NamedTuple):
+    """How ``Console.explain_row`` shows a row that is no stage's explanation: its status label
+    and color, and the words ``Console.explain_summary`` counts such rows with."""
+
+    label: str
+    color: str
+    counted: str
+
+
+class ExplainRow(NamedTuple):
+    """A row ``--explain`` shows that is no stage's explanation: a mapped stage
+    (``Pipeline.map``) or an instance of one, with its kind and its reason."""
+
+    kind: ExplainRowKind
+    name: str
+    reason: str
 
 
 class Console:
@@ -158,22 +176,22 @@ class Console:
             "Dependency Changes:", explanation["dep_changes"], "identity", "old_hash", "new_hash"
         )
 
-    def explain_row(self, name: str, label: str, color: str, reason: str) -> None:
-        """Print a row that is no stage's explanation (a mapped stage, ``Pipeline.map``, or an
-        instance of one): its name, its status ``label`` in ``color``, and ``reason``."""
-        self._echo(f"\nStage: {self._color(name, 'bold')}")
-        self._echo(f"  Status: {self._color(label, color)}")
-        self._echo(f"  Reason: {display.escape_control(reason, keep_newlines=True)}")
+    def explain_row(self, row: ExplainRow) -> None:
+        """Print ``row``: its name, its kind's status label in its kind's color, and its
+        reason."""
+        self._echo(f"\nStage: {self._color(row.name, 'bold')}")
+        self._echo(f"  Status: {self._color(row.kind.label, row.kind.color)}")
+        self._echo(f"  Reason: {display.escape_control(row.reason, keep_newlines=True)}")
 
     def explain_summary(
-        self, will_run: int, unchanged: int, counts: Sequence[tuple[str, str, int]] = ()
+        self, will_run: int, unchanged: int, counts: Mapping[ExplainRowKind, int]
     ) -> None:
         """Print summary after explain output: the stages that will run, those unchanged, then
-        each of ``counts`` (the words that count rows of one kind, their color, and the count)."""
+        the count of the rows of each kind of ``counts``, in its order."""
         self._echo("")
         run_text = self._color(str(will_run), "green") if will_run > 0 else str(will_run)
         unchanged_text = self._color(str(unchanged), "yellow") if unchanged > 0 else str(unchanged)
         summary = f"Summary: {run_text} will run, {unchanged_text} unchanged"
-        for counted, color, count in counts:
-            summary += f", {self._color(str(count), color)} {counted}"
+        for kind, count in counts.items():
+            summary += f", {self._color(str(count), kind.color)} {kind.counted}"
         self._echo(summary)

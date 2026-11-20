@@ -158,12 +158,10 @@ def run_keep_going(
     return proc, [json.loads(line) for line in proc.stdout.splitlines()]
 
 
-def stage_statuses(events: Sequence[Mapping[str, Any]]) -> dict[str, str]:
-    """The status of each stage whose `stage_complete` event a `--jsonl` run's ``events`` hold,
-    by stage."""
-    return {
-        event["stage"]: event["status"] for event in events if event["type"] == "stage_complete"
-    }
+def stage_statuses(stdout: str) -> dict[str, object]:
+    """The status of each stage a `--jsonl` run's ``stdout`` reports (``completed_stages``), by
+    stage."""
+    return {stage: event["status"] for stage, event in completed_stages(stdout).items()}
 
 
 def refused_mapped_project(tmp_path: pathlib.Path, code: str) -> tuple[pathlib.Path, pathlib.Path]:

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from pivot.storage.store import WorkspaceStore
     from pivot.types import StageExplanation
 
-from pivot import display, exceptions, names, project
+from pivot import display, exceptions, incremental_checks, names, project
 from pivot.cli import decorators as cli_decorators
 
 
@@ -371,27 +371,25 @@ def run_templates(targets: list[str] | None) -> list[str]:
 
 
 def eligible_templates(
-    targets: list[str] | None,
     result: Expansion,
+    order: list[str],
     *,
     force: bool = False,
     allow_uncached_incremental: bool = False,
     stages: dict[str, RegistryStageInfo] | None = None,
 ) -> list[str]:
-    """The templates a run of ``targets`` expands and can therefore remove an orphan of: those
-    in its ``run_order`` when no global incremental-output refusal stops the run and no template
-    incremental-output refusal stops that template or one it is mapped over. Status and
-    ``repro --dry-run`` use this rule so neither promises a removal a run never reaches.
-    ``stages``: the run's graph, as ``run_order`` takes it."""
-    from pivot.executor import core as executor_core
-
+    """The templates a run whose execution order is ``order`` (``run_order`` of its targets)
+    expands and can therefore remove an orphan of: those in its order when no global
+    incremental-output refusal stops the run and no template incremental-output refusal stops
+    that template or one it is mapped over. Status and ``repro --dry-run`` use this rule so
+    neither promises a removal a run never reaches. ``stages``: the run's graph, which ``order``
+    is over, as ``run_order`` takes it."""
     pipeline = get_pipeline()
-    order = run_order(targets, stages)
     templates = set(pipeline.list_templates())
     if stages is None:
         stages = get_graph_stages()
     static = [name for name in order if name not in templates]
-    if executor_core.incremental_refusal(
+    if incremental_checks.incremental_refusal(
         static,
         {name: stages[name] for name in static},
         allow_uncached_incremental=allow_uncached_incremental,
@@ -402,7 +400,7 @@ def eligible_templates(
     for name in (name for name in order if name in templates):
         upstream = {dep for dep in pipeline.get_template(name)["mapped_deps"].values() if dep}
         instances = {stage: pipeline.get_stage(stage) for stage in result["expanded"].get(name, [])}
-        if upstream & refused or executor_core.incremental_refusal(
+        if upstream & refused or incremental_checks.incremental_refusal(
             list(instances),
             instances,
             allow_uncached_incremental=allow_uncached_incremental,

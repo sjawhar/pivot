@@ -22,7 +22,7 @@ from tests import helpers
 from tests.conftest import isolated_pivot_dir
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
     from click.testing import CliRunner, Result
     from pytest_mock import MockerFixture
@@ -376,10 +376,10 @@ def test_repro_all_tracked_keep_going_leaves_out_a_mapped_stage_whose_shared_inp
             + "(path data/raw/missing.txt), which does not exist"
         ], result.output
         events = [json.loads(line) for line in result.stdout.splitlines()]
-        completed = {
-            event["stage"]: event["status"] for event in events if event["type"] == "stage_complete"
-        }
-        assert completed == {"alpha/stage_a": "ran", "m/plan": "ran"}, result.output
+        assert helpers.stage_statuses(result.stdout) == {
+            "alpha/stage_a": "ran",
+            "m/plan": "ran",
+        }, result.output
         assert not [event for event in events if event["type"] == "stages_expanded"]
         assert (cwd / "data" / "m" / "plan" / "a.txt").read_text() == "a"
 
@@ -406,11 +406,65 @@ def _helper_assert_only_alpha_runs(dry_run: Result, ran: Result, skipped: list[s
     }, dry_run.output
     assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
     assert ran.exit_code == 0, ran.output
-    completed = helpers.completed_stages(ran.stdout)
-    assert {stage: event["status"] for stage, event in completed.items()} == {
-        "alpha/stage_a": "ran"
-    }, ran.output
+    assert helpers.stage_statuses(ran.stdout) == {"alpha/stage_a": "ran"}, ran.output
     assert helpers.skipping_lines(ran.stderr) == skipped, ran.output
+
+
+@contextlib.contextmanager
+def _helper_locked(path: pathlib.Path, mode: int) -> Generator[pathlib.Path]:
+    """``path`` at mode ``mode`` while the block runs, then at its own mode again; gives
+    ``path``."""
+    before = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(mode)
+    try:
+        yield path
+    finally:
+        path.chmod(before)
+
+
+def _helper_assert_restore_warnings(
+    dry_run: Result, ran: Result, dry_run_warning: str, run_prefix: str
+) -> None:
+    """The dry run gives exactly the `Cannot restore` warning ``dry_run_warning``, and the run on
+    the same tree exactly one, starting with ``run_prefix``: the dry run names what it found,
+    where the run's warning goes on with the error its restore met."""
+    assert helpers.restore_warnings(dry_run.stderr) == [dry_run_warning], dry_run.output
+    warnings = helpers.restore_warnings(ran.stderr)
+    assert len(warnings) == 1, ran.output
+    assert warnings[0].startswith(run_prefix), ran.output
+
+
+def _helper_assert_both_refuse(dry_run: Result, ran: Result, link: str) -> None:
+    """The dry run and the run on the same tree each exit 1 on the refusal to link ``link``
+    (the start of what the words "Refusing to link" name), with no `Skipping:` line and no
+    restore warning; the dry run prints no document and the run runs no stage."""
+    for result in (dry_run, ran):
+        assert result.exit_code == 1, result.output
+        assert f"Error: Refusing to link {link}" in result.stderr, result.output
+        assert helpers.skipping_lines(result.stderr) == [], result.output
+        assert helpers.restore_warnings(result.stderr) == [], result.output
+    assert dry_run.stdout == "", dry_run.output
+    assert helpers.completed_stages(ran.stdout) == {}, ran.output
+
+
+def _helper_locked_file_project(
+    runner: CliRunner, root: pathlib.Path, input_name: str
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """kept/read_0 reads data/raw/``input_name`` and alpha/stage_a is healthy. The file
+    data/raw/locked/cached.txt is tracked with the real ``pivot track``, which puts its object in
+    the cache, then removed. Returns data/raw/locked, for a test to lock, and cached.txt."""
+    helpers.write_pipeline(
+        root, "kept", _helper_broken_pipeline_code(1, name="kept", input_name=input_name)
+    )
+    helpers.write_pipeline(root, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+    locked = root / "data" / "raw" / "locked"
+    locked.mkdir(parents=True)
+    cached = locked / "cached.txt"
+    cached.write_text("cached bytes")
+    tracking = runner.invoke(cli.cli, ["track", "data/raw/locked/cached.txt"])
+    assert tracking.exit_code == 0, tracking.output
+    cached.unlink()
+    return locked, cached
 
 
 # dirs/scan reads data/raw/images, a missing tracked directory
@@ -602,25 +656,10 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_rea
     not count the file as present: it lists alpha alone and leaves kept/read_0 out with the same
     line, warning that it cannot write in data/raw/locked."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
-        helpers.write_pipeline(
-            cwd,
-            "kept",
-            _helper_broken_pipeline_code(1, name="kept", input_name="locked/cached.txt"),
-        )
-        helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
-        locked = cwd / "data" / "raw" / "locked"
-        locked.mkdir(parents=True)
-        cached = locked / "cached.txt"
-        cached.write_text("cached bytes")
-        tracking = runner.invoke(cli.cli, ["track", "data/raw/locked/cached.txt"])
-        assert tracking.exit_code == 0, tracking.output
-        cached.unlink()
+        locked, cached = _helper_locked_file_project(runner, cwd, "locked/cached.txt")
 
-        locked.chmod(0o555)
-        try:
+        with _helper_locked(locked, 0o555):
             dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
-        finally:
-            locked.chmod(0o755)
 
         _helper_assert_only_alpha_runs(
             dry_run,
@@ -630,14 +669,12 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_rea
                 + "(path data/raw/locked/cached.txt), which does not exist"
             ],
         )
-        assert helpers.restore_warnings(dry_run.stderr) == [
-            f"Cannot restore {cached}: this user cannot write in {locked}"
-        ], dry_run.output
-        warnings = helpers.restore_warnings(ran.stderr)
-        assert len(warnings) == 1, ran.output
-        assert warnings[0].startswith(
-            f"Cannot restore {cached}: [Errno 13] Permission denied: '{locked}/"
-        ), ran.output
+        _helper_assert_restore_warnings(
+            dry_run,
+            ran,
+            f"Cannot restore {cached}: this user cannot write in {locked}",
+            f"Cannot restore {cached}: [Errno 13] Permission denied: '{locked}/",
+        )
         assert not cached.exists()
 
 
@@ -684,13 +721,11 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_an_un
                 + "(path data/raw/cached.txt), which does not exist"
             ],
         )
-        assert helpers.restore_warnings(dry_run.stderr) == [
-            f"Cannot restore {cached}: [Errno 13] Permission denied: '{cache_object}'"
-        ], dry_run.output
-        warnings = helpers.restore_warnings(ran.stderr)
-        assert len(warnings) == 1, ran.output
-        assert warnings[0].startswith(f"Cannot restore {cached}: [Errno 13] Permission denied: "), (
-            ran.output
+        _helper_assert_restore_warnings(
+            dry_run,
+            ran,
+            f"Cannot restore {cached}: [Errno 13] Permission denied: '{cache_object}'",
+            f"Cannot restore {cached}: [Errno 13] Permission denied: ",
         )
         assert not cached.exists()
 
@@ -756,10 +791,10 @@ def test_tracked_keep_going_and_dry_run_keep_going_read_a_symlink_tree_as_the_re
             "dirs/scan",
         }, linked_dry_run.output
         assert linked_run.exit_code == 0, linked_run.output
-        assert {
-            stage: event["status"]
-            for stage, event in helpers.completed_stages(linked_run.stdout).items()
-        } == {"alpha/stage_a": "ran", "dirs/scan": "ran"}, linked_run.output
+        assert helpers.stage_statuses(linked_run.stdout) == {
+            "alpha/stage_a": "ran",
+            "dirs/scan": "ran",
+        }, linked_run.output
         assert linked, "the restore links the directory to the tree"
         assert (cwd / "data" / "dirs" / "scan.txt").read_text() == "a.png"
         assert helpers.restore_warnings(linked_dry_run.stderr + linked_run.stderr) == []
@@ -769,9 +804,7 @@ def test_tracked_keep_going_and_dry_run_keep_going_read_a_symlink_tree_as_the_re
         }, dry_run.output
         assert helpers.skipping_lines(dry_run.stderr) == _IMAGES_SKIPPED, dry_run.output
         assert ran.exit_code == 0, ran.output
-        assert {
-            stage: event["status"] for stage, event in helpers.completed_stages(ran.stdout).items()
-        } == {"alpha/stage_a": "cached"}, ran.output
+        assert helpers.stage_statuses(ran.stdout) == {"alpha/stage_a": "cached"}, ran.output
         assert helpers.skipping_lines(ran.stderr) == _IMAGES_SKIPPED, ran.output
         warning = f"Cannot restore {images}: [Errno 13] Permission denied: '{member_object}'"
         assert helpers.restore_warnings(dry_run.stderr) == [warning], dry_run.output
@@ -810,55 +843,55 @@ def _helper_register_on_a_read_only_mount(
 
 def _helper_unreadable_member(
     runner: CliRunner, root: pathlib.Path, modes: str
-) -> tuple[pathlib.Path, int] | None:
-    """`_helper_images_tree_project`'s tree, whose member object is to be locked unreadable."""
+) -> contextlib.AbstractContextManager[pathlib.Path | None]:
+    """`_helper_images_tree_project`'s tree, whose member object the lock makes unreadable."""
     _, _, member_object = _helper_images_tree_project(runner, root, modes)
-    return member_object, 0
+    return _helper_locked(member_object, 0)
 
 
 def _helper_read_only_parent(
     runner: CliRunner, root: pathlib.Path, modes: str
-) -> tuple[pathlib.Path, int] | None:
-    """`_helper_images_tree_project`'s tree, whose parent data/raw is to be locked read-only."""
+) -> contextlib.AbstractContextManager[pathlib.Path | None]:
+    """`_helper_images_tree_project`'s tree, whose parent data/raw the lock makes read-only."""
     _helper_images_tree_project(runner, root, modes)
-    return root / "data" / "raw", 0o555
+    return _helper_locked(root / "data" / "raw", 0o555)
 
 
 def _helper_unstattable_tree_without_member(
     runner: CliRunner, root: pathlib.Path, modes: str
-) -> tuple[pathlib.Path, int] | None:
+) -> contextlib.AbstractContextManager[pathlib.Path | None]:
     """`_helper_images_tree_project`'s tree, whose member object is gone from the cache and
-    whose directory is to be locked unsearchable, so its files cannot be stat'd."""
+    whose directory the lock makes unsearchable, so its files cannot be stat'd."""
     _, tree, member_object = _helper_images_tree_project(runner, root, modes)
     member_object.unlink()
-    return tree, 0
+    return _helper_locked(tree, 0)
 
 
 def _helper_images_without_tree(
     runner: CliRunner, root: pathlib.Path, modes: str
-) -> tuple[pathlib.Path, int] | None:
+) -> contextlib.AbstractContextManager[pathlib.Path | None]:
     """`_helper_tracked_images_project` with the checkout modes ``modes`` and no whole tree in
-    the cache, so a restore goes file by file; nothing is to be locked."""
+    the cache, so a restore goes file by file; nothing is locked."""
     (root / ".pivot" / "config.yaml").write_text(f"cache:\n  checkout_mode: [{modes}]\n")
     _helper_tracked_images_project(runner, root)
-    return None
+    return contextlib.nullcontext()
 
 
 def _helper_read_only_parent_without_tree(
     runner: CliRunner, root: pathlib.Path, modes: str
-) -> tuple[pathlib.Path, int] | None:
-    """`_helper_images_without_tree`, whose parent data/raw is to be locked read-only."""
+) -> contextlib.AbstractContextManager[pathlib.Path | None]:
+    """`_helper_images_without_tree`, whose parent data/raw the lock makes read-only."""
     _helper_images_without_tree(runner, root, modes)
-    return root / "data" / "raw", 0o555
+    return _helper_locked(root / "data" / "raw", 0o555)
 
 
 def _helper_empty_listing(
     runner: CliRunner, root: pathlib.Path, modes: str
-) -> tuple[pathlib.Path, int] | None:
+) -> contextlib.AbstractContextManager[pathlib.Path | None]:
     """dirs/scan reads data/raw/images, a directory holding only the empty directory sub/, that
     `pivot track` tracked with the checkout modes ``modes`` and that is then removed, and
     alpha/stage_a is healthy. Its listing holds no file, and the cache no whole tree; nothing is
-    to be locked."""
+    locked."""
     (root / ".pivot" / "config.yaml").write_text(f"cache:\n  checkout_mode: [{modes}]\n")
     helpers.write_pipeline(root, "dirs", _helper_directory_reader_code("images"))
     helpers.write_pipeline(root, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
@@ -867,10 +900,43 @@ def _helper_empty_listing(
     tracking = runner.invoke(cli.cli, ["track", "data/raw/images"])
     assert tracking.exit_code == 0, tracking.output
     shutil.rmtree(images)
-    return None
+    return contextlib.nullcontext()
 
 
-# A warning that the read-only-register agreement test's dry run gives, and the start of the
+# A project builder of the read-only-register agreement tests: it builds the tree with the
+# checkout modes it is given and returns the lock to hold while both run
+type _LockedProject = Callable[
+    [CliRunner, pathlib.Path, str], contextlib.AbstractContextManager[pathlib.Path | None]
+]
+
+# Checkout modes, SYMLINK first, with COPY among them and without
+_COPY_AMONG_MODES = "symlink, hardlink, copy"
+_NO_COPY_MODES = "symlink, hardlink"
+
+
+def _helper_read_only_cache_dry_run_and_run(
+    runner: CliRunner,
+    root: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project: _LockedProject,
+    modes: str,
+) -> tuple[Result, Result, pathlib.Path | None]:
+    """``project``'s tree with the checkout modes ``modes``, whose cache's register is on a
+    read-only mount (``_helper_register_on_a_read_only_mount``): the run cannot register there,
+    so it refuses links into the cache (`naming.naming_unit`), and the dry run reads the mount's
+    flag. Returns the dry run and the run on that tree, each made while ``project``'s lock is
+    held, and the path it locked (None: nothing)."""
+    lock = project(runner, root, modes)
+    _helper_register_on_a_read_only_mount(monkeypatch, root / ".pivot" / "cache")
+    with lock as locked:
+        dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+    assert cache.links_refused(root / ".pivot" / "cache" / "files"), (
+        "the run's registration met the read-only register"
+    )
+    return dry_run, ran, locked
+
+
+# A warning that a read-only-register agreement test's dry run gives, and the start of the
 # run's, for a restore that cannot read the locked member object
 _UNREADABLE_MEMBER = (
     "Cannot restore {images}: [Errno 13] Permission denied: '{locked}'",
@@ -885,152 +951,230 @@ _READ_ONLY_PARENT = (
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads and writes whatever the mode")
 @pytest.mark.parametrize(
-    ("project", "copies", "outcome", "warnings"),
+    ("project", "modes", "warnings"),
     [
         pytest.param(
             _helper_unreadable_member,
-            True,
-            "left_out",
+            _COPY_AMONG_MODES,
             _UNREADABLE_MEMBER,
             id="unreadable_member-copy_among_modes",
         ),
-        pytest.param(_helper_unreadable_member, False, "refused", None, id="unreadable_member"),
         pytest.param(
             _helper_read_only_parent,
-            True,
-            "left_out",
+            _COPY_AMONG_MODES,
             _READ_ONLY_PARENT,
             id="read_only_parent-copy_among_modes",
         ),
-        pytest.param(_helper_read_only_parent, False, "refused", None, id="read_only_parent"),
         pytest.param(
             _helper_read_only_parent_without_tree,
-            True,
-            "left_out",
+            _COPY_AMONG_MODES,
             _READ_ONLY_PARENT,
             id="read_only_parent_file_by_file-copy_among_modes",
         ),
         pytest.param(
             _helper_read_only_parent_without_tree,
-            False,
-            "left_out",
+            _NO_COPY_MODES,
             _READ_ONLY_PARENT,
             id="read_only_parent_file_by_file",
         ),
-        pytest.param(_helper_images_without_tree, False, "refused", None, id="file_by_file"),
         pytest.param(
             _helper_unstattable_tree_without_member,
-            True,
-            "absent",
+            _COPY_AMONG_MODES,
             None,
             id="unstattable_tree_without_member-copy_among_modes",
         ),
         pytest.param(
             _helper_unstattable_tree_without_member,
-            False,
-            "absent",
+            _NO_COPY_MODES,
             None,
             id="unstattable_tree_without_member",
         ),
-        pytest.param(
-            _helper_empty_listing, True, "restored", None, id="empty_listing-copy_among_modes"
-        ),
-        pytest.param(_helper_empty_listing, False, "restored", None, id="empty_listing"),
     ],
 )
-def test_tracked_keep_going_and_dry_run_keep_going_restore_from_a_read_only_cache_as_the_run_does(
+def test_tracked_keep_going_and_dry_run_keep_going_leave_out_what_a_read_only_cache_cannot_restore(
     runner: CliRunner,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    project: Callable[[CliRunner, pathlib.Path, str], tuple[pathlib.Path, int] | None],
-    copies: bool,
-    outcome: str,
+    project: _LockedProject,
+    modes: str,
     warnings: tuple[str, str] | None,
 ) -> None:
     """R1, R5: data/raw/images is a missing tracked directory that dirs/scan reads, and the
-    cache's register is on a read-only mount. The run cannot register there, so it refuses
-    links into the cache (`naming.naming_unit`); the dry run reads the mount's flag. With COPY
-    among the checkout modes (SYMLINK first) the restore copies file by file, opening each
-    object; with no COPY it refuses where it reaches a link, which stops the run before any
-    stage runs, and the dry run refuses there alone, with no document.
+    cache's register is on a read-only mount. With COPY among the checkout modes the restore
+    copies file by file, opening each object; with no COPY it refuses where it reaches a link.
+    On each tree the restore leaves images missing before any refusal: the run leaves dirs/scan
+    out, runs alpha and exits 0, and so does the dry run, each with ``warnings``' warning (the
+    dry run's, and the start of the run's) or with none.
 
-    ``project`` builds the tree and gives the path to lock while both run. In `unreadable_member`
-    the cache holds images' whole tree, searchable, and its member object is unreadable
-    (0o000): the copy fails on it, and the symlink restore refuses at the tree. In
-    `read_only_parent` data/raw is read-only (0o555): the copy cannot stage the directory, and
-    the symlink restore refuses at the tree before it writes there. In `file_by_file` the cache
-    holds no whole tree, so the restore stages the directory and refuses at its first file,
-    a.png; in `read_only_parent_file_by_file` it cannot stage it either way and fails, so the
-    run leaves dirs/scan out with a warning, and so does the dry run. In
+    In `unreadable_member` the cache holds images' whole tree, searchable, and its member object
+    is unreadable (0o000): the copy fails on it. In `read_only_parent` data/raw is read-only
+    (0o555): the copy cannot stage the directory. In `read_only_parent_file_by_file` the cache
+    holds no whole tree, so the restore stages the directory, and cannot, either way. In
     `unstattable_tree_without_member` the cache holds images' whole tree, complete and marked,
     whose directory this user cannot search (0o000), and a.png's object is gone: the restore
     cannot stat the tree's files, so it restores file by file, and finds the object absent
-    before it reaches a link, so the run leaves dirs/scan out with no warning, and so does the
-    dry run. In `empty_listing` images' listing holds only the empty directory sub/: either
-    restore links nothing and brings it back, and dirs/scan runs. The dry run's refusal names
+    before it reaches a link, with no warning."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        images = cwd / "data" / "raw" / "images"
+
+        dry_run, ran, locked = _helper_read_only_cache_dry_run_and_run(
+            runner, cwd, monkeypatch, project, modes
+        )
+
+        _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
+        if warnings is None:
+            for result in (dry_run, ran):
+                assert helpers.restore_warnings(result.stderr) == [], result.output
+        else:
+            assert locked is not None
+            dry_run_warning, run_prefix = (
+                warning.format(images=images, locked=locked) for warning in warnings
+            )
+            _helper_assert_restore_warnings(dry_run, ran, dry_run_warning, run_prefix)
+        assert not images.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads and writes whatever the mode")
+@pytest.mark.parametrize(
+    "project",
+    [
+        pytest.param(_helper_unreadable_member, id="unreadable_member"),
+        pytest.param(_helper_read_only_parent, id="read_only_parent"),
+        pytest.param(_helper_images_without_tree, id="file_by_file"),
+    ],
+)
+def test_tracked_keep_going_and_dry_run_keep_going_refuse_a_link_into_a_read_only_cache_as_the_run_does(
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project: _LockedProject,
+) -> None:
+    """R1, R5: data/raw/images is a missing tracked directory that dirs/scan reads, the cache's
+    register is on a read-only mount and COPY is not among the checkout modes (SYMLINK first).
+    The restore refuses where it reaches a link, which stops the run before any stage runs, and
+    the dry run refuses there alone, with no document.
+
+    In `unreadable_member` the cache holds images' whole tree, searchable, and its member object
+    is unreadable (0o000): the symlink restore refuses at the tree, opening no object. In
+    `read_only_parent` data/raw is read-only (0o555): the symlink restore refuses at the tree
+    before it writes there. In `file_by_file` the cache holds no whole tree, so the restore
+    stages the directory and refuses at its first file, a.png. The dry run's refusal names
     images and the cache's object store, where the run's names the tree or the file it links,
     so only the words before those are compared."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         images = cwd / "data" / "raw" / "images"
-        locked = project(runner, cwd, "symlink, hardlink, copy" if copies else "symlink, hardlink")
-        _helper_register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
 
-        if locked is None:
-            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
-        else:
-            locked_path, locked_mode = locked
-            mode = stat.S_IMODE(locked_path.stat().st_mode)
-            locked_path.chmod(locked_mode)
-            try:
-                dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
-            finally:
-                locked_path.chmod(mode)
-
-        assert cache.links_refused(cwd / ".pivot" / "cache" / "files"), (
-            "the run's registration met the read-only register"
+        dry_run, ran, _ = _helper_read_only_cache_dry_run_and_run(
+            runner, cwd, monkeypatch, project, _NO_COPY_MODES
         )
-        if outcome == "left_out":
-            assert locked is not None and warnings is not None
-            _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
-            dry_run_warning, run_warning = (
-                warning.format(images=images, locked=locked[0]) for warning in warnings
-            )
-            assert helpers.restore_warnings(dry_run.stderr) == [dry_run_warning], dry_run.output
-            ran_warnings = helpers.restore_warnings(ran.stderr)
-            assert len(ran_warnings) == 1, ran.output
-            assert ran_warnings[0].startswith(run_warning), ran.output
-            assert not images.exists()
-        elif outcome == "refused":
-            for result in (dry_run, ran):
-                assert result.exit_code == 1, result.output
-                assert f"Error: Refusing to link {images}" in result.stderr, result.output
-                assert helpers.skipping_lines(result.stderr) == [], result.output
-                assert helpers.restore_warnings(result.stderr) == [], result.output
-            assert dry_run.stdout == "", dry_run.output
-            assert helpers.completed_stages(ran.stdout) == {}, ran.output
-            assert not images.exists()
-        elif outcome == "absent":
-            _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
-            for result in (dry_run, ran):
-                assert helpers.restore_warnings(result.stderr) == [], result.output
-            assert not images.exists()
-        else:
-            assert dry_run.exit_code == 0, dry_run.output
-            assert json.loads(dry_run.stdout) == {
-                "stages": {
-                    "alpha/stage_a": {"would_run": True, "reason": "No previous run"},
-                    "dirs/scan": {"would_run": True, "reason": "No previous run"},
-                }
-            }, dry_run.output
-            assert ran.exit_code == 0, ran.output
-            assert {
-                stage: event["status"]
-                for stage, event in helpers.completed_stages(ran.stdout).items()
-            } == {"alpha/stage_a": "ran", "dirs/scan": "ran"}, ran.output
-            for result in (dry_run, ran):
-                assert helpers.skipping_lines(result.stderr) == [], result.output
-                assert helpers.restore_warnings(result.stderr) == [], result.output
-            assert (cwd / "data" / "dirs" / "scan.txt").read_text() == "sub"
+
+        _helper_assert_both_refuse(dry_run, ran, str(images))
+        assert not images.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads and writes whatever the mode")
+@pytest.mark.parametrize(
+    "modes",
+    [
+        pytest.param(_COPY_AMONG_MODES, id="empty_listing-copy_among_modes"),
+        pytest.param(_NO_COPY_MODES, id="empty_listing"),
+    ],
+)
+def test_tracked_keep_going_and_dry_run_keep_going_restore_an_empty_listing_from_a_read_only_cache(
+    runner: CliRunner, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, modes: str
+) -> None:
+    """R1, R5: data/raw/images is a missing tracked directory that dirs/scan reads, whose
+    listing holds only the empty directory sub/, and the cache's register is on a read-only
+    mount. With COPY among the checkout modes or not, the restore links nothing and brings
+    images back: dirs/scan and alpha run, and the dry run lists both."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        dry_run, ran, _ = _helper_read_only_cache_dry_run_and_run(
+            runner, cwd, monkeypatch, _helper_empty_listing, modes
+        )
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {
+                "alpha/stage_a": {"would_run": True, "reason": "No previous run"},
+                "dirs/scan": {"would_run": True, "reason": "No previous run"},
+            }
+        }, dry_run.output
+        assert ran.exit_code == 0, ran.output
+        assert helpers.stage_statuses(ran.stdout) == {
+            "alpha/stage_a": "ran",
+            "dirs/scan": "ran",
+        }, ran.output
+        for result in (dry_run, ran):
+            assert helpers.skipping_lines(result.stderr) == [], result.output
+            assert helpers.restore_warnings(result.stderr) == [], result.output
+        assert (cwd / "data" / "dirs" / "scan.txt").read_text() == "sub"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads and writes whatever the mode")
+@pytest.mark.parametrize(
+    ("read_only_register", "modes"),
+    [
+        pytest.param(False, _COPY_AMONG_MODES, id="links"),
+        pytest.param(True, _NO_COPY_MODES, id="read_only_register"),
+    ],
+)
+def test_tracked_keep_going_and_dry_run_keep_going_fail_a_tree_restore_that_cannot_make_its_directory(
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_only_register: bool,
+    modes: str,
+) -> None:
+    """R1, R5 (SYMLINK first): data/raw/images.pvt names sub/images, so dirs/scan reads the
+    missing tracked directory data/raw/sub/images, whose directory sub/ does not exist, and
+    data/raw is read-only (0o555): no restore can make sub/. The cache holds the directory's
+    whole tree, complete and marked, whose directory this user cannot search (0o000), and
+    a.png's object is gone. A restore that starts from the whole tree makes the directory that
+    holds its path before it reads the tree, so the run's restore fails there, with a warning,
+    before it would find the tree's files unstattable, restore file by file and find the object
+    absent. The run leaves dirs/scan out and runs alpha, and so does the dry run, warning that
+    it cannot write in data/raw. So it is with the cache's links allowed (`links`), and with its
+    register on a read-only mount and no COPY among the checkout modes, where the restore would
+    refuse its link (`read_only_register`)."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _, tree, member_object = _helper_images_tree_project(runner, cwd, modes)
+        member_object.unlink()
+        raw = cwd / "data" / "raw"
+        pvt_path = raw / "images.pvt"
+        record = track.read_pvt_file(pvt_path)
+        assert record is not None and "nfiles" in record
+        track.write_pvt_file(
+            pvt_path,
+            track.PvtData(
+                path="sub/images", hash=record["hash"], size=record["size"], nfiles=record["nfiles"]
+            ),
+        )
+        # No committed listing can lie beside a path whose directory does not exist
+        (raw / "images.pvt.listing").unlink()
+        (cwd / "dirs" / "pipeline.py").write_text(_helper_directory_reader_code("sub/images"))
+        images = raw / "sub" / "images"
+        if read_only_register:
+            _helper_register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
+
+        with _helper_locked(tree, 0), _helper_locked(raw, 0o555):
+            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+
+        assert cache.links_refused(cwd / ".pivot" / "cache" / "files") == read_only_register
+        _helper_assert_only_alpha_runs(
+            dry_run,
+            ran,
+            [
+                "Skipping: Stage 'dirs/scan' depends on input 'sub/images' "
+                + "(path data/raw/sub/images), which does not exist"
+            ],
+        )
+        _helper_assert_restore_warnings(
+            dry_run,
+            ran,
+            f"Cannot restore {images}: this user cannot write in {raw}",
+            f"Cannot restore {images}: [Errno 13] Permission denied: '{raw}/",
+        )
+        assert not images.exists()
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes in a read-only directory")
@@ -1049,20 +1193,10 @@ def test_tracked_keep_going_and_dry_run_keep_going_refuse_a_file_link_as_the_run
     dry run, warning that it cannot write in data/raw/locked."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         input_name = "locked/sub/cached.txt" if nested else "locked/cached.txt"
-        helpers.write_pipeline(
-            cwd, "kept", _helper_broken_pipeline_code(1, name="kept", input_name=input_name)
-        )
-        helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
         (cwd / ".pivot" / "config.yaml").write_text(
             "cache:\n  checkout_mode: [hardlink, symlink]\n"
         )
-        locked = cwd / "data" / "raw" / "locked"
-        locked.mkdir(parents=True)
-        cached = locked / "cached.txt"
-        cached.write_text("cached bytes")
-        tracking = runner.invoke(cli.cli, ["track", "data/raw/locked/cached.txt"])
-        assert tracking.exit_code == 0, tracking.output
-        cached.unlink()
+        locked, cached = _helper_locked_file_project(runner, cwd, input_name)
         if nested:
             pvt_path = track.get_pvt_path(cached)
             record = track.read_pvt_file(pvt_path)
@@ -1074,11 +1208,8 @@ def test_tracked_keep_going_and_dry_run_keep_going_refuse_a_file_link_as_the_run
             cached = locked / "sub" / "cached.txt"
         _helper_register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
 
-        locked.chmod(0o555)
-        try:
+        with _helper_locked(locked, 0o555):
             dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
-        finally:
-            locked.chmod(0o755)
 
         assert cache.links_refused(cwd / ".pivot" / "cache" / "files"), (
             "the run's registration met the read-only register"
@@ -1092,22 +1223,14 @@ def test_tracked_keep_going_and_dry_run_keep_going_refuse_a_file_link_as_the_run
                     + f"(path data/raw/{input_name}), which does not exist"
                 ],
             )
-            assert helpers.restore_warnings(dry_run.stderr) == [
-                f"Cannot restore {cached}: this user cannot write in {locked}"
-            ], dry_run.output
-            warnings = helpers.restore_warnings(ran.stderr)
-            assert len(warnings) == 1, ran.output
-            assert warnings[0].startswith(
-                f"Cannot restore {cached}: [Errno 13] Permission denied: '{locked}/"
-            ), ran.output
+            _helper_assert_restore_warnings(
+                dry_run,
+                ran,
+                f"Cannot restore {cached}: this user cannot write in {locked}",
+                f"Cannot restore {cached}: [Errno 13] Permission denied: '{locked}/",
+            )
         else:
-            for result in (dry_run, ran):
-                assert result.exit_code == 1, result.output
-                assert f"Error: Refusing to link {cached} to " in result.stderr, result.output
-                assert helpers.skipping_lines(result.stderr) == [], result.output
-                assert helpers.restore_warnings(result.stderr) == [], result.output
-            assert dry_run.stdout == "", dry_run.output
-            assert helpers.completed_stages(ran.stdout) == {}, ran.output
+            _helper_assert_both_refuse(dry_run, ran, f"{cached} to ")
         assert not cached.exists()
 
 
@@ -1398,12 +1521,13 @@ def test_repro_all_dry_run_keep_going_checkout_missing_counts_a_cached_file_as_p
         assert without.exit_code == 0, without.output
         assert json.loads(without.stdout)["stages"].keys() == {"alpha/stage_a"}, without.output
         assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
+        assert helpers.stage_statuses(ran.stdout) == {
             "alpha/stage_a": "cached",
             "kept/read_0": "ran",
         }, ran.output
-        assert completed["kept/read_0"]["reason"] == "Input dependencies changed", ran.output
+        assert helpers.completed_stages(ran.stdout)["kept/read_0"]["reason"] == (
+            "Input dependencies changed"
+        ), ran.output
         assert cached.read_text() == "cached bytes"
 
 
@@ -1437,8 +1561,7 @@ def test_repro_all_dry_run_keep_going_checkout_missing_counts_a_file_reached_thr
         }, dry_run.output
         assert helpers.skipping_lines(dry_run.stderr) == [], dry_run.output
         assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
+        assert helpers.stage_statuses(ran.stdout) == {
             "alpha/stage_a": "ran",
             "kept/read_0": "ran",
         }, ran.output
@@ -1483,8 +1606,7 @@ def test_repro_all_dry_run_keep_going_checkout_missing_follows_the_restored_dire
         }, dry_run.output
         assert helpers.skipping_lines(dry_run.stderr) == skipped, dry_run.output
         assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
+        assert helpers.stage_statuses(ran.stdout) == {
             "alpha/stage_a": "ran",
             "dirs/scan": "ran",
         }, ran.output
@@ -1554,10 +1676,7 @@ def test_repro_all_dry_run_keep_going_target_naming_no_stage_lists_what_the_run_
         }, dry_run.output
         assert helpers.skipping_lines(dry_run.stderr) == [_READER_SKIPPED], dry_run.output
         assert ran.exit_code == 0, ran.output
-        completed = helpers.completed_stages(ran.stdout)
-        assert {stage: event["status"] for stage, event in completed.items()} == {
-            "alpha/stage_a": "ran"
-        }, ran.output
+        assert helpers.stage_statuses(ran.stdout) == {"alpha/stage_a": "ran"}, ran.output
 
 
 @pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "run"])

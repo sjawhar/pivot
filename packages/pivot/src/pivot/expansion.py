@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 import lmdb
 
-from pivot import exceptions, project, registry, types
+from pivot import exceptions, incremental_checks, project, registry, types
 from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, listing, lock, ownership
 from pivot.storage import state as state_mod
@@ -62,8 +62,8 @@ class Expansion(TypedDict):
             With a run's ``checks`` and, for a ``--no-commit`` run, its ``workspace``, these are
             the templates that run fails, with the reasons it gives: it skips the same
             producers or runs a pulled one again, reads the keys read here, and plans and adds
-            the instances as here. A template mapped over the instances of one of them is not in
-            it: the run blocks that one.
+            the instances as here. A template mapped over the instances of one of them, directly
+            or through other templates, is not in it: the run blocks that template.
     """
 
     expanded: dict[str, list[str]]
@@ -151,13 +151,10 @@ def plan_instances(
     instance's name. The instances of the keys kept (``registry.instantiate``) fail it when an
     output is, lies inside or contains a missing tracked file, whose sidecar its write would
     delete (``ownership.tracked_output_refusal``), and when an incremental output on disk is not
-    in the cache or was restarted by an older pivot (``executor.core.incremental_refusal``),
+    in the cache or was restarted by an older pivot (``incremental_checks.incremental_refusal``),
     each given by ``refusal_reason``. Adding the instances can still fail, on a name or an
     output path another stage holds (``registry.StageRegistry.expand``).
     """
-    # executor.core imports this module (through executor.worker and pivot.remote.sync)
-    from pivot.executor import core as executor_core
-
     name = template["info"]["name"]
     if name in checks.wanted:
         wanted = checks.wanted[name]
@@ -182,7 +179,7 @@ def plan_instances(
             else None
         )
         if refusal is None:
-            refusal = executor_core.incremental_refusal(
+            refusal = incremental_checks.incremental_refusal(
                 list(planned),
                 planned,
                 allow_uncached_incremental=checks.allow_uncached_incremental,

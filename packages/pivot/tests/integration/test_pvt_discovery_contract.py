@@ -271,12 +271,12 @@ def test_repro_keep_going_fails_a_mapped_stage_over_a_missing_file_tracked_insid
 
         assert repro.exit_code == 1, repro.output
         events = [json.loads(line) for line in repro.stdout.splitlines()]
-        completed = {event["stage"]: event for event in events if event["type"] == "stage_complete"}
-        assert {stage: event["status"] for stage, event in completed.items()} == {
+        assert helpers.stage_statuses(repro.stdout) == {
             "p/plan": "cached",
             "p/cut": "failed",
         }, repro.output
-        reason = completed["p/cut"]["reason"]
+        reason = helpers.completed_stages(repro.stdout)["p/cut"]["reason"]
+        assert isinstance(reason, str)
         assert "The following tracked files are missing:" in reason, reason
         assert f"{tracked_path}: {overlap}" in reason, reason
         assert not [event for event in events if event["type"] == "stages_expanded"]

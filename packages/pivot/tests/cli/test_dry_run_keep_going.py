@@ -210,7 +210,7 @@ def test_dry_run_keep_going_leaves_out_a_mapped_stage_and_its_orphan(
     ], stderr
     assert ran.returncode == 0, ran.stdout + ran.stderr
     assert helpers.skipping_lines(ran.stderr) == helpers.skipping_lines(stderr), ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {
         "left/plan": "ran" if stale else "cached",
         "healthy/plan": "cached",
@@ -255,12 +255,8 @@ def test_dry_run_keep_going_names_a_failed_restore_under_a_mapped_stage_as_the_r
         cache_object.chmod(0o444)
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
-    completed = helpers.completed_stages(ran.stdout)
-    assert {stage: event["status"] for stage, event in completed.items()} == {
-        "p/plan": "cached",
-        "p/cut": "failed",
-    }, ran.stdout
-    reason = completed["p/cut"]["reason"]
+    assert helpers.stage_statuses(ran.stdout) == {"p/plan": "cached", "p/cut": "failed"}, ran.stdout
+    reason = helpers.completed_stages(ran.stdout)["p/cut"]["reason"]
     assert isinstance(reason, str)
     assert (
         "data/p/cut@a.txt: it is output 'data/p/cut@a.txt' of stage 'p/cut@a'; its restore "
@@ -298,7 +294,7 @@ def test_dry_run_keep_going_checks_only_the_instances_a_target_names(
         }
     }, stderr
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {"p/plan": "cached", "p/cut@b": "ran"}, ran.stdout
     assert statuses.keys() == document["stages"].keys()
     assert (root / "data" / "p" / "cut@b.txt").read_text() == "b"
@@ -342,7 +338,7 @@ def test_dry_run_keep_going_plans_only_the_keys_an_instance_target_names(
         }
     }, stderr
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {"p/plan": "cached", "p/cut@a": "ran"}, ran.stdout
     assert statuses.keys() == document["stages"].keys()
 
@@ -365,7 +361,9 @@ def test_dry_run_keep_going_removes_no_instance_of_a_key_its_targets_leave_out(
         "stages": {"p/plan": helpers.UNCHANGED_ROW, "p/cut@a": helpers.UNCHANGED_ROW}
     }, stderr
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    assert helpers.stage_statuses(events) == {"p/plan": "cached", "p/cut@a": "cached"}, ran.stdout
+    assert helpers.stage_statuses(ran.stdout) == {"p/plan": "cached", "p/cut@a": "cached"}, (
+        ran.stdout
+    )
     assert [event for event in events if event["type"] == "stages_expanded"] == [
         {"type": "stages_expanded", "template": "p/cut", "stages": ["p/cut@a"]}
     ], ran.stdout
@@ -376,15 +374,15 @@ def test_dry_run_keep_going_fails_a_mapped_stage_whose_incremental_output_is_not
     tmp_path: pathlib.Path,
 ) -> None:
     """p/cut@a's incremental output is on disk but not in the cache: the run fails p/cut with the
-    refusal ``executor.core.incremental_refusal`` gives, runs no instance and exits 1, and the
-    dry run shows p/cut as a stage that would fail, with that reason, and no instance."""
+    refusal ``incremental_checks.incremental_refusal`` gives, runs no instance and exits 1, and
+    the dry run shows p/cut as a stage that would fail, with that reason, and no instance."""
     root, home = helpers.uncached_incremental_project(tmp_path, _INCREMENTAL_MAPPED_PIPELINE)
 
     document, stderr = helpers.dry_run_keep_going(root, home)
     ran, events = helpers.run_keep_going(root, home)
 
     assert ran.returncode == 1, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {"p/plan": "cached", "p/cut": "failed"}, ran.stdout
     reason = helpers.completed_stages(ran.stdout)["p/cut"]["reason"]
     assert isinstance(reason, str)
@@ -411,7 +409,7 @@ def test_dry_run_keep_going_expands_a_mapped_stage_over_an_uncached_incremental_
     ran, events = helpers.run_keep_going(root, home, "--allow-uncached-incremental")
 
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    statuses = helpers.stage_statuses(events)
+    statuses = helpers.stage_statuses(ran.stdout)
     assert statuses == {"p/plan": "cached", "p/cut@a": "ran", "p/cut@b": "cached"}, ran.stdout
     assert document == {
         "stages": {

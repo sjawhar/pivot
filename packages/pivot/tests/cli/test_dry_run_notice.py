@@ -788,24 +788,44 @@ def _helper_executable_file_read(runner: CliRunner, cwd: pathlib.Path) -> None:
     holds each file's executable bit, and a single file's .pvt records none: the restore gives
     f.txt back from the cache object, which ``pivot track`` stored read-only and not executable.
     """
-    helpers.write_pipeline(cwd, "p", _MAPPED_OVER_A_READ_DIRECTORY_CODE)
-    helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
-    tracked = _helper_track(runner, cwd, "data/raw/dir/f.txt", "f")
-    (tracked.parent / "present.txt").write_text("present")
-    # Unlinked, not written through: it may be a link to the cache object
-    tracked.unlink()
+    # Unlinked by the helper, not written through: it may be a link to the cache object
+    tracked = _helper_restore_limit_project(
+        runner, cwd, _MAPPED_OVER_A_READ_DIRECTORY_CODE, ran=False
+    )
     tracked.write_text("f")
     tracked.chmod(0o755)
     _helper_first_run(runner)
     tracked.unlink()
 
 
+def _helper_file_added(runner: CliRunner, cwd: pathlib.Path) -> None:
+    """p/plan reads data/raw/dir/, which holds the tracked file f.txt. After the first run
+    new.txt is added to dir."""
+    tracked = _helper_restore_limit_project(runner, cwd, _MAPPED_OVER_A_READ_DIRECTORY_CODE)
+    (tracked.parent / "new.txt").write_text("new")
+
+
+def _helper_file_tracked_after_the_run(runner: CliRunner, cwd: pathlib.Path) -> None:
+    """p/plan reads data/raw/dir/, and its first run reads present.txt alone. After it f.txt is
+    created in dir and tracked with the real ``pivot track``, then removed: p/plan never read
+    it, and its .pvt is a new file of dir."""
+    helpers.write_pipeline(cwd, "p", _MAPPED_OVER_A_READ_DIRECTORY_CODE)
+    helpers.write_pipeline(cwd, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+    held = cwd / "data" / "raw" / "dir"
+    held.mkdir(parents=True)
+    (held / "present.txt").write_text("present")
+    _helper_first_run(runner)
+    _helper_track(runner, cwd, "data/raw/dir/f.txt", "f").unlink()
+
+
 @pytest.mark.parametrize(
     "setup",
     [
         pytest.param(_helper_other_file_changed, id="another-file-of-the-read-directory-changed"),
+        pytest.param(_helper_file_added, id="a-file-was-added-to-the-read-directory"),
         pytest.param(_helper_file_tracked_again, id="the-file-was-tracked-again-with-new-contents"),
         pytest.param(_helper_executable_file_read, id="the-restored-file-is-not-executable"),
+        pytest.param(_helper_file_tracked_after_the_run, id="the-producer-never-read-the-file"),
     ],
 )
 def test_repro_all_dry_run_keep_going_checkout_missing_notice_limit_restore_differs(

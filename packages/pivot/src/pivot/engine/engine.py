@@ -28,6 +28,7 @@ from pivot import (
     expansion,
     fingerprint,
     ignore,
+    incremental_checks,
     parameters,
     path_policy,
     project,
@@ -1755,7 +1756,7 @@ class Engine:
 
         # Check for uncached incremental output files that would be lost, and for incremental
         # stages an older pivot may have restarted from empty.
-        refusal = executor_core.incremental_refusal(
+        refusal = incremental_checks.incremental_refusal(
             stage_order,
             self._get_all_stages(),
             allow_uncached_incremental=allow_uncached_incremental,

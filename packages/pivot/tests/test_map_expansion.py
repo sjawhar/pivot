@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     import pathlib
     from collections.abc import Callable
 
+    from pivot.types import DirHash
+
 
 def _stage_plan(
     plan: dict[str, int],
@@ -181,6 +183,17 @@ def _remove_plan_listing(root: pathlib.Path) -> None:
         listing.unlink()
 
 
+def _plan_record(pipeline: compose.Pipeline) -> DirHash:
+    """The record p/_stage_plan's lock keeps for its directory output."""
+    producer = pipeline.get_stage("p/_stage_plan")
+    record = expansion.recorded_directory(
+        producer["outs"][0].identity,
+        expansion.stage_lock(producer, config.locate_state_dir()).read(),
+    )
+    assert record is not None
+    return record
+
+
 def _corrupt_plan_listing(root: pathlib.Path) -> None:
     for listing in (root / ".pivot" / "stages" / "p").glob("_stage_plan=*.listing"):
         listing.write_bytes(listing.read_bytes() + b"junk\n")
@@ -219,12 +232,7 @@ def test_a_producer_current_only_through_pull_excuses_only_a_listing_that_cannot
     executor.run(pipeline=_pipeline(root))
     pipeline = _pipeline(root)
     monkeypatch.setattr(remote_config, "list_remotes", lambda: {"origin": "s3://bucket/cache"})
-    producer = pipeline.get_stage("p/_stage_plan")
-    record = expansion.recorded_directory(
-        producer["outs"][0].identity,
-        expansion.stage_lock(producer, config.locate_state_dir()).read(),
-    )
-    assert record is not None
+    record = _plan_record(pipeline)
     _empty_cache(root)
     plan_dir = root / "data" / "p" / "_stage_plan"
     for name in os.listdir(plan_dir):
@@ -244,15 +252,9 @@ def test_a_listing_neither_committed_nor_cached_is_named_for_pull_to_fetch(
 ) -> None:
     root, pipeline = ran
     monkeypatch.setattr(remote_config, "list_remotes", lambda: {"origin": "s3://bucket/cache"})
-    producer = pipeline.get_stage("p/_stage_plan")
-    record = expansion.recorded_directory(
-        producer["outs"][0].identity,
-        expansion.stage_lock(producer, config.locate_state_dir()).read(),
-    )
-    assert record is not None
+    record = _plan_record(pipeline)
     _empty_cache(root)
-    for listing in (root / ".pivot" / "stages" / "p").glob("_stage_plan=*.listing"):
-        listing.unlink()
+    _remove_plan_listing(root)
 
     result, _ = status.expand_current(pipeline)
 
@@ -285,15 +287,9 @@ def test_every_template_over_a_missing_listing_names_it_for_pull_to_fetch(
     executor.run(pipeline=twin_pipeline())
     pipeline = twin_pipeline()
     monkeypatch.setattr(remote_config, "list_remotes", lambda: {"origin": "s3://bucket/cache"})
-    producer = pipeline.get_stage("p/_stage_plan")
-    record = expansion.recorded_directory(
-        producer["outs"][0].identity,
-        expansion.stage_lock(producer, config.locate_state_dir()).read(),
-    )
-    assert record is not None
+    record = _plan_record(pipeline)
     _empty_cache(root)
-    for listing in (root / ".pivot" / "stages" / "p").glob("_stage_plan=*.listing"):
-        listing.unlink()
+    _remove_plan_listing(root)
 
     result, _ = status.expand_current(pipeline)
 
@@ -306,19 +302,13 @@ def test_a_missing_listing_names_the_run_that_writes_it_again(
     """A producer whose listing neither its stage directory nor the cache holds leaves its
     templates unexpanded, in a command and in a run, saying `pivot repro --force` fixes it."""
     root, pipeline = ran
-    producer = pipeline.get_stage("p/_stage_plan")
-    record = expansion.recorded_directory(
-        producer["outs"][0].identity,
-        expansion.stage_lock(producer, config.locate_state_dir()).read(),
-    )
-    assert record is not None
+    record = _plan_record(pipeline)
     cached = cache.resolve_cache_object_path(
         config.locate_cache_dir() / "files", record["hash"], notice=False
     )
     assert cached is not None
     cached.unlink()
-    for listing in (root / ".pivot" / "stages" / "p").glob("_stage_plan=*.listing"):
-        listing.unlink()
+    _remove_plan_listing(root)
 
     result, _ = status.expand_current(pipeline)
     run = executor.run(pipeline=_pipeline(root))
