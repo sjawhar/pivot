@@ -253,7 +253,7 @@ else is pickled again, and a stage that reads none pays nothing.
   of the stage reads it: the walk records what the stage's code can read, not what one run reads.
   An import that fails in the worker after it worked in Pivot's own process (import-time code
   that cannot run twice, a file broken during the run) logs one warning in the stage's output,
-  naming the module and the last line of what the import raised (`Could not import module
+  naming the module and the error's type and message, on one line (`Could not import module
   'company.local', which the stage reads through its package: RuntimeError: a second import. The
   module is not bound on its package, so code that reads it through the package fails.`), binds
   nothing for it, and the stage runs. A stage that reads the module then fails with
@@ -272,7 +272,7 @@ nothing and adds nothing to `sys.modules`, so the import checks see what they se
 After the stage, also when it fails, the worker removes each binding it made where the package
 still holds that module, so no later stage of the worker finds it.
 
-Stated limits, which Pivot 0.10.4 has too (a limit gives 0.10.4's outcome where it differs):
+Stated limits, which Pivot 0.10.4 has too, with the same outcome unless the item says otherwise:
 
 - A submodule whose pickling alone raises (it holds a `threading.Lock`) is not sent. Code the
   worker gets by reference that reads it through its package (a helper in a `PYTHONPATH` entry)

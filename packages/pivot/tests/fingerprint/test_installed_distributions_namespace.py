@@ -177,7 +177,7 @@ with Pipeline("p") as pipeline:
     other()
 """
 # The warning, word for word, that a stage's output holds where its worker's import of
-# `company.local`, sent by name, raised what `{raised}` names: the last line of what it raised.
+# `company.local`, sent by name, raised: `{raised}` is the error's type and message, on one line.
 _IMPORT_FAILED = (
     "WARNING: Could not import module 'company.local', which the stage reads through its package: "
     + "{raised}. The module is not bound on its package, so code that reads it through the package "
@@ -479,9 +479,22 @@ def test_the_projects_part_of_a_shared_package_reaches_the_worker_as_the_coordin
         pytest.param(
             'raise RuntimeError("a second import")', "RuntimeError: a second import", id="raises"
         ),
+        # The warning gives a message of two lines on one line, joined by a space.
+        pytest.param(
+            'raise RuntimeError("first\\nsecond")',
+            "RuntimeError: first second",
+            id="raises-on-two-lines",
+        ),
+        # The warning leaves out a note the error carries.
+        pytest.param(
+            'error = RuntimeError("a second import"); error.add_note("a note"); raise error',
+            "RuntimeError: a second import",
+            id="raises-with-a-note",
+        ),
         pytest.param("raise SystemExit(3)", "SystemExit: 3", id="exits"),
         pytest.param("raise KeyboardInterrupt", "KeyboardInterrupt", id="is-interrupted"),
-        # `traceback.format_exception_only` gives a line naming where it was raised first.
+        # The error's description starts with a line naming where it was raised, which the
+        # warning leaves out.
         pytest.param('exec("return")', "SyntaxError: 'return' outside function", id="syntax-error"),
     ],
 )
@@ -491,16 +504,18 @@ def test_a_module_sent_by_name_whose_import_fails_warns_and_fails_only_a_stage_t
     """`company-client` is installed into site-packages from its path. The project's part of
     `company`, `company/local.py`, lies in a `PYTHONPATH` entry, so cloudpickle pickles it by
     reference, and a second import of it, after `pipeline.py`'s, leaves a file `second` beside it
-    and raises `RuntimeError` (`raises`), `SystemExit(3)` (`exits`), `KeyboardInterrupt`
-    (`is-interrupted`) or a `SyntaxError`, whose description starts with a line naming where it
-    was raised (`syntax-error`). Two workers (`core.max_workers 2`) run three stages: `reads`,
-    which reads the module through the package's name inside a lambda alone, so the coordinator
-    sends its name; `skips`, which reads it so only where `READ_COMPANY_LOCAL` is set, which it is
-    not in this run, so the coordinator sends its name too; and `other`, which reads nothing of
-    `company` and runs until that file appears. `pivot repro --keep-going --show-output` exits 1.
-    The worker's import of the module fails before each of `reads` and `skips`, and that stage's
-    output holds one warning, on one line, that names the module and the last line of what the
-    import raised and says the module is not bound: `reads` then fails with
+    and raises `RuntimeError` (`raises`), one whose message has two lines
+    (`raises-on-two-lines`), one that carries a note (`raises-with-a-note`), `SystemExit(3)`
+    (`exits`), `KeyboardInterrupt` (`is-interrupted`) or a `SyntaxError`, whose description starts
+    with a line naming where it was raised (`syntax-error`). Two workers (`core.max_workers 2`)
+    run three stages: `reads`, which reads the module through the package's name inside a lambda
+    alone, so the coordinator sends its name; `skips`, which reads it so only where
+    `READ_COMPANY_LOCAL` is set, which it is not in this run, so the coordinator sends its name
+    too; and `other`, which reads nothing of `company` and runs until that file appears.
+    `pivot repro --keep-going --show-output` exits 1. The worker's import of the module fails
+    before each of `reads` and `skips`, and that stage's output holds one warning that names the
+    module and the error's type and message, on one line, with both lines of a two-line message
+    and without the note, and says the module is not bound: `reads` then fails with
     `AttributeError: module 'company' has no attribute 'local'`, as in Pivot 0.10.4, which binds
     nothing on the package; `skips` runs and writes `skipped`, as in 0.10.4; `other` runs and
     writes `other`, and its output holds no warning. Were a failed import to fail the stage,

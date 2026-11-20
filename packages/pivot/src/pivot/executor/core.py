@@ -634,18 +634,17 @@ def _sent_submodules(
     """The submodules of `names` (`RegistryStageInfo.read_submodules`, a package before its
     submodules) that the coordinator sends with the stage (`worker.WorkerStageInfo.
     sent_submodules`), in that order, each a module its package in this process holds bound
-    (`fingerprint.bound_submodule`, so not one an import session took out of `sys.modules` since
-    the walk). Each is a module `sys.modules` holds under its name, so cloudpickle pickles it by
-    reference unless it or a package of it is registered by value, never as a module no process
-    could import. One that cloudpickle pickles by reference (`loaded_source.pickled_by_value`:
-    neither it nor a package of it is registered by value) is sent by its name, with no trial
-    pickle, for the worker to import before anything of the stage runs, not as it unpickles the
-    call, where an import that fails would break the pool; where that import fails, the worker
-    logs a warning and binds nothing for it, and the stage runs. One that cloudpickle pickles by
-    value is sent as the module, in the stage's pickle, where it pickles alone (`_pickles_alone`).
-    A module whose pickling raises, as one holding a `threading.Lock` does, is not sent: the
-    worker's call, which would carry it whole, could not be pickled. Why:
-    `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs"."""
+    (`fingerprint.bound_submodule`): `sys.modules` holds it under its name, so cloudpickle never
+    pickles it as a module no process could import, and it is none an import session took out of
+    `sys.modules` since the walk. One that cloudpickle pickles by reference
+    (`loaded_source.pickled_by_value`: neither it nor a package of it is registered by value) is
+    sent by its name, with no trial pickle, for the worker to import before anything of the stage
+    runs (`worker._sent_submodules_bound`), not as it unpickles the call, where an import that
+    fails would break the pool. One that cloudpickle pickles by value is sent as the module, in
+    the stage's pickle, where it pickles alone (`_pickles_alone`). A module whose pickling raises,
+    as one holding a `threading.Lock` does, is not sent: the worker's call, which would carry it
+    whole, could not be pickled. Why: `docs/architecture/fingerprinting.md`, "Imports a Stage
+    Makes While It Runs"."""
     by_value = cloudpickle.list_registry_pickle_by_value()
     sent = list[_stdlib_types.ModuleType | str]()
     for name in names:

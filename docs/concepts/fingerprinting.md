@@ -525,15 +525,16 @@ this run of the stage reads it: Pivot records what the stage's code can read,
 not what one run reads. When that import fails in the worker after it worked
 in Pivot's own process (import-time code that cannot run twice, a file broken
 during the run), the stage's output holds one warning that names the module and
-the last line of the error (`Could not import module 'company.local', which the
-stage reads through its package: RuntimeError: ...`), Pivot binds nothing for
-the module, and the stage runs. A stage that reads the module then fails with
+the error's type and message, on one line (`Could not import module
+'company.local', which the stage reads through its package: RuntimeError:
+...`), Pivot binds nothing for the module, and the stage runs. A stage that
+reads the module then fails with
 `AttributeError: module 'company' has no attribute 'local'`, as in Pivot
 0.10.4, with the warning in its output; a stage that does not read it in that
 run runs, as in 0.10.4. Other stages run on.
 
-Its limits, each of which Pivot 0.10.4 has too, with the same outcome unless the
-item says otherwise
+The limits of sending your module, each of which Pivot 0.10.4 has too, with the
+same outcome unless the item says otherwise
 ([Imports a Stage Makes While It Runs](../architecture/fingerprinting.md#imports-a-stage-makes-while-it-runs)):
 
 - A module that cannot be pickled (one holding a `threading.Lock`) is not

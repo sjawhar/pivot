@@ -949,15 +949,6 @@ class WorkerStageInfo(TypedDict):
     sent_submodules: NotRequired[tuple[ModuleType | str, ...]]
 
 
-# The warning the worker logs where its import of a module sent by name
-# (`WorkerStageInfo.sent_submodules`) raised, with the module's name and the last line
-# `traceback.format_exception_only` gives of what the import raised (`_sent_submodules_bound`).
-_SUBMODULE_IMPORT_WARNING = (
-    "Could not import module '%s', which the stage reads through its package: %s. The module is "
-    + "not bound on its package, so code that reads it through the package fails."
-)
-
-
 @contextlib.contextmanager
 def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[None]:
     """Bind each of `submodules` (`WorkerStageInfo.sent_submodules`, a package before its
@@ -970,12 +961,12 @@ def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[
     A module sent by name is imported here (`importlib.import_module`), which binds it on its
     package where it loads it; `sys.modules` holds what that import put there, as after any
     import. Where that import raises (any `Exception`, `SystemExit` or `KeyboardInterrupt`), one
-    warning, logged into the stage's output (`_queue_logging`), names the module and the last line
-    of what it raised (`_SUBMODULE_IMPORT_WARNING`), nothing is bound for it, and the stage runs:
-    code that reads the module through its package fails there with `AttributeError`, as in Pivot
-    0.10.4, which binds nothing on the package; a run that does not read it runs. An interrupt of
-    the run (`WorkerTerminated`) stays one. A module sent by value is bound as it came, with no
-    import, and adds nothing to `sys.modules`. A module is bound only where this process holds its
+    warning, logged into the stage's output (`_queue_logging`), names the module and the error's
+    type and message, on one line, nothing is bound for it, and the stage runs: code that reads
+    the module through its package fails there with `AttributeError`, as in Pivot 0.10.4, which
+    binds nothing on the package; a run that does not read it runs. An interrupt of the run
+    (`WorkerTerminated`) stays one. A module sent by value is bound as it came, with no import,
+    and adds nothing to `sys.modules`. A module is bound only where this process holds its
     package (`sys.modules`) and the package holds no attribute of that name, read through `vars`
     so no `__getattr__` runs: a module an import in this process bound there (a helper the worker
     imports by name that runs `from company.local import Mode`) is the copy that code holds, and
@@ -995,8 +986,19 @@ def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[
                 except WorkerTerminated:
                     raise
                 except (Exception, SystemExit, KeyboardInterrupt) as exc:
-                    raised = traceback.format_exception_only(exc)[-1].rstrip()
-                    logger.warning(_SUBMODULE_IMPORT_WARNING, submodule, raised)
+                    # The error's type and message, on one line: the last entry of its
+                    # description (a `SyntaxError`'s follows the lines that place it), its notes
+                    # left out and a message of several lines joined by spaces.
+                    described = traceback.TracebackException.from_exception(exc)
+                    described.__notes__ = None
+                    raised = " ".join(list(described.format_exception_only())[-1].splitlines())
+                    logger.warning(
+                        "Could not import module '%s', which the stage reads through its "
+                        + "package: %s. The module is not bound on its package, so code that "
+                        + "reads it through the package fails.",
+                        submodule,
+                        raised,
+                    )
                     continue
             package, _, attribute = module.__name__.rpartition(".")
             parent = sys.modules.get(package)

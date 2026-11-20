@@ -14,8 +14,9 @@ a class of the module (`from company.local import Mode`) while other code reads 
 the worker imports by name that imports the module itself, when a later stage in the same worker
 reads the module, and when a second import of the module would fail; and an edit of the module
 after discovery reruns the stage on the next run. A module sent by name whose import fails in the
-worker is warned of in the output of each stage it is sent with and binds nothing, so only a stage
-that reads it fails, with `AttributeError`: `test_installed_distributions_namespace.py`.
+worker is warned of in the output of each stage it is sent with, and the worker binds nothing for
+it, so only a stage that reads it fails, with `AttributeError`:
+`test_installed_distributions_namespace.py`.
 
 The stated limits (`docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs")
 that a test here pins, each of which pivot 0.10.4 has too: a module that cannot be pickled is
@@ -24,10 +25,7 @@ fails the stage that reads it so itself; code pickled by value and code imported
 hold the module hold two copies; a module's import-time code does not run in the worker (pivot
 0.10.4 fails that test's stage earlier, with `AttributeError`, as it binds nothing on the
 package); and a `@no_fingerprint` stage's scan does not read a helper module it calls. The other
-stated limits are documented only, pinned by no test: a stage body that imports the library's
-package itself, a function of a sent module that rebinds one of its globals (`global COUNT`), a
-project package below the shared one (`company.proj`), and cloudpickle's import, as the worker
-unpickles the call, of a submodule it pickles by reference that the stage's own code names.
+stated limits are pinned by no test here (`tests/fingerprint/README.md`).
 
 Each test makes its own venv with uv over this test environment (`tests.installed_dists`,
 `tests.shared_namespace`) and its own pivot project. The file runs pivot only through its CLI and
