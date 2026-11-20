@@ -682,18 +682,6 @@ def _pickles_alone(module: _stdlib_types.ModuleType, pickle_trials: PickleTrials
 # =========================================================================
 
 
-def _tracked_path_kind(path: pathlib.Path) -> Literal["file", "directory"] | None:
-    """The pre-flight's existence rule: what is at a tracked path (symlinks followed), or None
-    when neither a file nor a directory is, and the path is missing. The run
-    (``verify_tracked_files``) and the dry run (``find_missing_tracked_files``) both apply it,
-    so they find the same files missing."""
-    if path.is_file():
-        return "file"
-    if path.is_dir():
-        return "directory"
-    return None
-
-
 def _refuse_control_restores(
     project_root: pathlib.Path, tracked_files: Mapping[str, track.PvtData]
 ) -> None:
@@ -714,7 +702,9 @@ def verify_tracked_files(
     tolerate_missing: bool = False,
     outputs: Mapping[pathlib.Path, str] | None = None,
 ) -> ownership.MissingTracked:
-    """Verify all .pvt tracked files exist and warn on hash mismatches.
+    """Verify all .pvt tracked files exist and warn on hash mismatches. A tracked path is
+    missing unless it holds a regular file or a directory, symlinks followed
+    (``track.present_kind``).
 
     Args:
         project_root: Project root directory.
@@ -726,8 +716,9 @@ def verify_tracked_files(
             restore, unless one of them overlaps a path of ``outputs``. A restore that fails
             then leaves its path missing, with a warning
             (``tracked_restore.restore_tracked``): a directory whose listing is unavailable
-            (``exceptions.ListingUnavailableError``), or a read or write that fails with
-            ``OSError``.
+            (``exceptions.ListingUnavailableError``), an entry the restore does not replace
+            in its place (a socket, a FIFO or a device, or a symlink to one), or a read or
+            write that fails with ``OSError``.
         outputs: The ``ownership.normalized`` path of each output of the loaded stages, with
             the stage that writes it (``ownership.stage_output_paths``); an empty mapping for
             none. Read only with ``tolerate_missing``, which requires it.
@@ -781,7 +772,7 @@ def verify_tracked_files(
 
             # Try to hash the file - handles race conditions where file disappears
             try:
-                kind = _tracked_path_kind(path)
+                kind = track.present_kind(path)
                 if kind is None:
                     raise FileNotFoundError(data_path)
                 if kind == "directory":
@@ -850,12 +841,13 @@ class MissingTrackedFiles(NamedTuple):
     Without ``checkout_missing``, every missing one, none of them failed."""
     restorable: dict[str, track.PvtData]
     """Each missing tracked path that the restore brings back, with its ``.pvt`` data, in sorted
-    order (``tracked_restore.check_tracked``): the local cache holds every object its restore
-    links and this user can read each one as the restore reads it, the restore can write the
-    path (the nearest existing directory above it is one this user can write in and search),
-    and a tracked directory's listing is available (neither a committed listing that is stale,
-    empty or unreadable with no cached copy, nor a cached copy this user cannot read). Empty
-    without ``checkout_missing``."""
+    order (``tracked_restore.check_tracked``): no entry the restore does not replace stands at
+    the path (a socket, a FIFO or a device, or a symlink to one), the local cache holds every
+    object its restore links and this user can read each one as the restore reads it, the
+    restore can write the path (the nearest existing directory above it is one this user can
+    write in and search), and a tracked directory's listing is available (neither a committed
+    listing that is stale, empty or unreadable with no cached copy, nor a cached copy this user
+    cannot read). Empty without ``checkout_missing``."""
     restored: dict[str, set[tuple[str, ...]]]
     """Each path of ``restorable``, with every path its restore creates inside it, as the parts
     of that path relative to it (``tracked_restore.Check.created``): for a directory, each file
@@ -872,22 +864,23 @@ def find_missing_tracked_files(
     """The dry run's view of the pre-flight in leave-out mode (``verify_tracked_files`` with
     ``tolerate_missing``), reading only.
 
-    Finds the tracked files the pre-flight finds missing, with its existence rule
-    (``_tracked_path_kind``), and with ``checkout_missing`` splits off those its restore brings
-    back, and those whose restore fails, as ``tracked_restore.check_tracked`` predicts, warning
-    as the restore would for each that fails. It discovers with ``track.discover_pvt_files``,
-    which never writes the memo. It restores nothing, registers in no cache and writes no state
-    database or workspace file; it predicts whether the run's registration refuses links into
-    the cache (``naming.register_refuses_links``). With ``checkout_missing`` it raises where the
-    pre-flight raises: the refusal of a control path, ``CorruptListingError`` for a missing
-    directory whose listing is corrupt but not unavailable, and, from a cache that refuses links
-    with no COPY among the checkout modes, the refusal to link where the restore reaches a link
-    (``tracked_restore.check_tracked``). ``skip`` is as for ``verify_tracked_files``.
+    Finds the tracked files the pre-flight finds missing, by the one rule for whether a tracked
+    path is present (``track.present_kind``), and with ``checkout_missing`` splits off those its
+    restore brings back, and those whose restore fails, as ``tracked_restore.check_tracked``
+    predicts, warning as the restore would for each that fails. It discovers with
+    ``track.discover_pvt_files``, which never writes the memo. It restores nothing, registers in
+    no cache and writes no state database or workspace file; it predicts whether the run's
+    registration refuses links into the cache (``naming.register_refuses_links``). With
+    ``checkout_missing`` it raises where the pre-flight raises: the refusal of a control path,
+    ``CorruptListingError`` for a missing directory whose listing is corrupt but not
+    unavailable, and, from a cache that refuses links with no COPY among the checkout modes, the
+    refusal to link where the restore reaches a link (``tracked_restore.check_tracked``).
+    ``skip`` is as for ``verify_tracked_files``.
     """
     tracked_files = track.discover_pvt_files(project_root, skip=skip)
     if checkout_missing and tracked_files:
         _refuse_control_restores(project_root, tracked_files)
-    found = sorted(path for path in tracked_files if _tracked_path_kind(pathlib.Path(path)) is None)
+    found = sorted(path for path in tracked_files if track.present_kind(pathlib.Path(path)) is None)
     if not checkout_missing or not found:
         return MissingTrackedFiles(
             missing=ownership.MissingTracked(paths=found, checkout_attempted=checkout_missing),

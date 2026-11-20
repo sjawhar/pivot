@@ -165,10 +165,11 @@ def validate_dependency_sources(
     unresolvable deps.  With *store=None*, only structural checks run (wrong
     output key on a known stage); external-dep existence is silently skipped.
     With *present*, each dependency that no stage produces and that exists on disk is
-    appended to it with its stage, in iteration order (``get_runnable_stages`` reads these
-    for the directories that hold a missing tracked file). With *created*, a dependency missing
-    from disk whose path it accepts counts as one that exists: a restore creates that path
-    (``get_runnable_stages``' ``restored_tracked``, a dry run's view of ``--checkout-missing``).
+    appended to it with its stage, in iteration order (``get_runnable_stages`` reads these for
+    the missing tracked files each is, lies inside or holds). With *created*, a dependency
+    missing from disk whose path it accepts counts as one that exists: a restore creates that
+    path (``get_runnable_stages``' ``restored_tracked``, a dry run's view of
+    ``--checkout-missing``).
     """
     from pivot import exceptions
 
@@ -359,11 +360,13 @@ def get_runnable_stages(
     dependency, and the stages are None.
 
     ``missing_tracked`` holds the tracked files still missing, as the absolute normalized paths
-    discovery gives (``executor.core.verify_tracked_files``). A stage reads such a file when a
-    dependency is the file, lies inside it, or is an existing directory that holds it, and it
-    gets one error per such file. ``restored_tracked`` maps each missing tracked path that a
-    restore brings back to every path the restore creates inside it, as its parts relative to
-    that path (``executor.core.find_missing_tracked_files``, for a dry run with
+    discovery gives (``executor.core.verify_tracked_files``, by ``storage.track.present_kind``):
+    the one source of which tracked paths are missing, whatever the store's existence test says
+    of them (a socket or a FIFO at a tracked path exists, but the path is missing). A stage reads
+    such a file when a dependency is the file, lies inside it, or is an existing directory that
+    holds it, and it gets one error per such file. ``restored_tracked`` maps each missing tracked
+    path that a restore brings back to every path the restore creates inside it, as its parts
+    relative to that path (``executor.core.find_missing_tracked_files``, for a dry run with
     ``--checkout-missing``): a missing dependency the restore creates, or that holds a path the
     restore creates, counts as one that exists, as the run finds it after its restore
     (``_restore_creates``), so a directory among them that holds a missing tracked file leaves
@@ -374,8 +377,8 @@ def get_runnable_stages(
     """
     from pivot import exceptions
 
-    # The dependencies on disk, or created by the restore, read for the directories that hold a
-    # missing tracked file
+    # The dependencies on disk, or created by the restore, read for the missing tracked files
+    # each is, lies inside or holds
     if present is None:
         present = list[tuple[str, pivot_types.ArtifactRef]]()
     errors = validate_dependency_sources(
@@ -414,14 +417,18 @@ def _tracked_file_errors(
     stage has one error per missing tracked file it reads.
 
     ``validate_dependency_sources`` reports each dependency that is a missing tracked file or
-    lies inside one: of a stage's errors for one tracked file, the first stays. A dependency of
-    ``present`` (one no stage produces, found on disk or created by a restore, with its stage)
-    that is a directory holding missing tracked files gets one error per such file the stage has
-    no error for yet. Each path counts in both its forms, normalized and resolved
-    (``os.path.realpath``, which resolves a missing path's existing ancestors), as a watch run
-    waits for a missing input (``Engine``'s ``_MissingDependencyRun.awaits``): a dependency that
-    reaches a missing tracked file through a symlink reads it. Path parts decide containment,
-    never a string prefix: ``data-backup/x`` is not inside ``data``.
+    lies inside one and does not exist: of a stage's errors for one tracked file, the first
+    stays. A dependency of ``present`` (one no stage produces, found on disk or created by a
+    restore, with its stage) that is a missing tracked file or lies inside one (an entry is
+    there, but neither a regular file nor a directory, so ``storage.track.present_kind`` counts
+    the file missing: a socket, a FIFO) gets the error ``validate_dependency_sources`` gives a
+    missing one, unless the stage has one for that file; and one that is a directory holding
+    missing tracked files gets one error per such file the stage has no error for yet. Each path
+    counts in both its forms, normalized and resolved (``os.path.realpath``, which resolves a
+    missing path's existing ancestors), as a watch run waits for a missing input (``Engine``'s
+    ``_MissingDependencyRun.awaits``): a dependency that reaches a missing tracked file through a
+    symlink reads it. Path parts decide containment, never a string prefix: ``data-backup/x`` is
+    not inside ``data``.
     """
     from pivot import exceptions
 
@@ -438,13 +445,29 @@ def _tracked_file_errors(
                 reported.add((error.stage, tracked))
         kept.append(error)
 
-    # The missing tracked files each directory holds, sorted, by its normalized path
-    held_by_directory = dict[pathlib.Path, list[str]]()
+    # The missing tracked file each present dependency is or lies inside, and those it holds,
+    # sorted, by its normalized path
+    found_by_path = dict[pathlib.Path, tuple[str | None, list[str]]]()
     for stage_name, dep in present:
-        directory = project.normalize_path(store.checkout(dep))
-        if directory not in held_by_directory:
-            held_by_directory[directory] = _held_paths(missing, _forms(directory))
-        for tracked in held_by_directory[directory]:
+        input_path = store.checkout(dep)
+        path = project.normalize_path(input_path)
+        if path not in found_by_path:
+            forms = _forms(path)
+            found_by_path[path] = (_enclosing_path(missing, forms), _held_paths(missing, forms))
+        enclosing, held = found_by_path[path]
+        if enclosing is not None and (stage_name, enclosing) not in reported:
+            reported.add((stage_name, enclosing))
+            kept.append(
+                exceptions.DependencyNotFoundError(
+                    stage=stage_name,
+                    dep=pivot_types.identity_key(_dep_identity(dep)),
+                    # The tracked file's data is the fix, not an output name it resembles
+                    available_outputs=None,
+                    input_path=input_path,
+                    input_path_display=project.to_relative_path(input_path),
+                )
+            )
+        for tracked in held:
             if (stage_name, tracked) in reported:
                 continue
             reported.add((stage_name, tracked))
@@ -456,8 +479,8 @@ def _tracked_file_errors(
                     available_outputs=None,
                     input_path=pathlib.Path(tracked),
                     input_path_display=project.to_relative_path(tracked),
-                    directory=directory,
-                    directory_display=project.to_relative_path(directory),
+                    directory=path,
+                    directory_display=project.to_relative_path(path),
                 )
             )
     return kept

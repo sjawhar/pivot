@@ -1,5 +1,7 @@
 import logging
+import os
 import pathlib
+import socket
 
 import pytest
 import xxhash
@@ -7,6 +9,7 @@ import yaml
 
 from pivot import exceptions, types
 from pivot.storage import listing, track
+from tests import helpers
 
 _A = xxhash.xxh64(b"a").hexdigest()
 _RUN = xxhash.xxh64(b"#!/bin/sh\n").hexdigest()
@@ -318,6 +321,85 @@ def test_get_data_path_invalid_suffix_raises() -> None:
 
     with pytest.raises(ValueError, match=r"\.pvt"):
         track.get_data_path(not_pvt)
+
+
+# present_kind
+
+
+def _helper_make_entry(kind: str, path: pathlib.Path) -> None:
+    """Put an entry of ``kind`` at ``path``, a name in the working directory beside the file
+    target.txt and the directory target_dir. A socket is bound by its name: an address holds at
+    most 108 bytes, and its file stays once the socket is closed."""
+    match kind:
+        case "regular_file":
+            path.write_text("data")
+        case "directory":
+            path.mkdir()
+        case "symlink_to_file":
+            path.symlink_to("target.txt")
+        case "symlink_to_directory":
+            path.symlink_to("target_dir")
+        case "dangling_symlink":
+            path.symlink_to("nowhere")
+        case "symlink_loop":
+            path.symlink_to(path.name)
+        case "socket":
+            with socket.socket(socket.AF_UNIX) as bound:
+                bound.bind(path.name)
+        case "fifo":
+            os.mkfifo(path)
+        case _:
+            assert kind == "nothing", kind
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("regular_file", "file"),
+        ("directory", "directory"),
+        ("symlink_to_file", "file"),
+        ("symlink_to_directory", "directory"),
+        ("dangling_symlink", None),
+        ("symlink_loop", None),
+        ("socket", None),
+        ("fifo", None),
+        ("nothing", None),
+    ],
+)
+def test_present_kind_counts_only_a_regular_file_or_a_directory_as_present(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str, expected: str | None
+) -> None:
+    """The one rule for whether a tracked path is present: a regular file or a directory,
+    symlinks followed, and nothing else. A symlink to nothing or to itself, a socket, a FIFO or
+    no entry at all is missing. It never opens the path: on a FIFO, whose open for reading
+    waits for a writer, it returns at once."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "target.txt").write_text("target")
+    (tmp_path / "target_dir").mkdir()
+    path = tmp_path / "tracked"
+    _helper_make_entry(kind, path)
+
+    found = helpers.call_without_waiting(lambda: track.present_kind(path), path, timeout=10)
+
+    assert found == expected
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a directory whatever its mode")
+def test_present_kind_raises_a_stat_error_other_than_no_such_file(tmp_path: pathlib.Path) -> None:
+    """A tracked path whose ``stat`` fails for another reason than "no such file" is neither
+    present nor missing: below a directory this user cannot search, ``PermissionError`` is
+    raised, as ``Path.is_file()`` raises it on Python 3.13, so the pre-flight stops there
+    rather than count the file missing and leave its readers out."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "data.csv").write_text("data")
+
+    locked.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            track.present_kind(locked / "data.csv")
+    finally:
+        locked.chmod(0o755)
 
 
 # discover_pvt_files

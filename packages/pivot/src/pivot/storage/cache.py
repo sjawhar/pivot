@@ -371,8 +371,9 @@ def _links_to_object(link: pathlib.Path, cache_path: pathlib.Path, cache_root: C
 # check that would restore over the link) does not catch it. They test errno themselves, not
 # through pathlib: from Python 3.14 ``Path.is_file()`` is ``os.path.isfile``, which hides every
 # error: https://github.com/python/cpython/blob/v3.14.0/Lib/pathlib/__init__.py#L690-L696
-_NO_FILE_ERRNO = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
-_NOT_A_LINK_ERRNO = _NO_FILE_ERRNO | {errno.EINVAL}
+# ``track.present_kind`` reads the same errors as "a tracked path is missing".
+NO_FILE_ERRNO = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+_NOT_A_LINK_ERRNO = NO_FILE_ERRNO | {errno.EINVAL}
 
 
 def _symlink_cache_key(path: str | os.PathLike[str], cache_root: CacheRoot) -> str | None:
@@ -409,7 +410,7 @@ def _cache_object_key(path: str | os.PathLike[str], cache_root: CacheRoot | None
     at another name in it, at a directory, at nothing, or in a loop is a user symlink, even when
     it ends at a file named like a hash. A file-by-file symlink checkout restores each directory
     member as a link to its object. ``cache_root`` is None for no cache. An error that leaves
-    the link unclassified raises ``UnreadableLinkError`` (``_NO_FILE_ERRNO``).
+    the link unclassified raises ``UnreadableLinkError`` (``NO_FILE_ERRNO``).
     """
     if cache_root is None:
         return None
@@ -419,7 +420,7 @@ def _cache_object_key(path: str | os.PathLike[str], cache_root: CacheRoot | None
     try:
         is_file = stat.S_ISREG(os.stat(path).st_mode)
     except OSError as e:
-        if e.errno not in _NO_FILE_ERRNO:
+        if e.errno not in NO_FILE_ERRNO:
             raise exceptions.UnreadableLinkError(os.fspath(path), e.strerror or str(e)) from e
         return None
     return key if is_file else None
@@ -455,7 +456,7 @@ def walk_artifact_members(
     stored and is appended to ``left_out``. The walk never follows a symlink, so every regular
     file it collects lies inside the directory. An error that leaves an entry unclassified
     propagates, since a partial hash would be wrong; for a symlink it is ``UnreadableLinkError``
-    (EIO, EACCES; see ``_NO_FILE_ERRNO``).
+    (EIO, EACCES; see ``NO_FILE_ERRNO``).
 
     Args:
         directory: Directory to scan

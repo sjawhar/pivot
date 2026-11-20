@@ -2,7 +2,8 @@
 pipeline.py text, tracked files with no data or removed once tracked, a cache's whole-directory
 trees and a cache register on a read-only mount, git projects that the installed `pivot` runs in,
 the output of `pivot repro --jsonl` and its restore warnings, the dry run and the run of `pivot
-repro --all --keep-going`, sockets, and venvs that CI-only tests install with uv."""
+repro --all --keep-going`, sockets, a call that must not wait on a FIFO, and venvs that CI-only
+tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
@@ -19,6 +20,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import threading
 import typing
 from typing import TYPE_CHECKING, Any
 
@@ -294,6 +296,58 @@ def skipping_lines(output: str) -> list[str]:
 def restore_warnings(stderr: str) -> list[str]:
     """Each `Cannot restore` warning line of ``stderr``: a tracked path a restore left missing."""
     return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
+
+
+def call_without_waiting[T](call: Callable[[], T], fifo: pathlib.Path, timeout: float = 120) -> T:
+    """``call()``, run in a thread, and what it returns or raises. When it is still running
+    after ``timeout`` seconds, as an open of a FIFO for reading waits for a writer, the FIFO that
+    ``fifo`` leads to is freed (``_free_fifo``), and the test fails instead of hanging."""
+    outcome = list[T | BaseException]()
+
+    def _run() -> None:
+        try:
+            outcome.append(call())
+        except BaseException as error:  # re-raised in the test's thread below
+            outcome.append(error)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    waited = thread.is_alive()
+    if waited:
+        _free_fifo(fifo)
+        thread.join(timeout)
+    assert not waited, f"the call was still running after {timeout} s"
+    (result,) = outcome
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _free_fifo(path: pathlib.Path) -> None:
+    """Free each open for reading that waits on the FIFO ``path`` leads to (symlinks followed),
+    and put an empty regular file in its place, so that no later open waits either (a stage's
+    worker hashes an input, then opens it again to load it). Nothing where ``path`` leads to no
+    FIFO: a call that waits elsewhere fails its test all the same."""
+    fifo = pathlib.Path(os.path.realpath(path))
+    try:
+        if not stat.S_ISFIFO(os.lstat(fifo).st_mode):
+            return
+    except FileNotFoundError:
+        return
+    try:
+        # A writer frees each open for reading that waits
+        writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno != errno.ENXIO:  # ENXIO: no open for reading waits
+            raise
+        writer = None
+    try:
+        fifo.unlink()
+        fifo.touch()
+    finally:
+        if writer is not None:
+            os.close(writer)
 
 
 def completed_stages(stdout: str) -> dict[str, dict[str, object]]:

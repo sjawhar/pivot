@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import socket
 import stat
 from typing import TYPE_CHECKING
 
@@ -429,3 +430,83 @@ def test_a_restore_that_cannot_read_its_cache_object_leaves_its_path_missing_in_
         == _NONE_MISSING
     )
     assert data_path.exists()
+
+
+def _helper_occupy(path: pathlib.Path, occupant: str) -> str:
+    """Put ``occupant`` where the missing tracked path ``path``, a name in the working directory,
+    belongs: a socket (bound by its name: an address holds at most 108 bytes, and its file stays
+    once the socket is closed), a FIFO, or a symlink to the FIFO ``pipe`` beside it. Returns how
+    the restore's warning names it."""
+    match occupant:
+        case "socket":
+            with socket.socket(socket.AF_UNIX) as bound:
+                bound.bind(path.name)
+            return "a socket"
+        case "fifo":
+            os.mkfifo(path)
+            return "a FIFO"
+        case _:
+            assert occupant == "symlink_to_fifo", occupant
+            os.mkfifo(path.parent / "pipe")
+            path.symlink_to("pipe")
+            return "a symlink to a FIFO"
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+@pytest.mark.parametrize("occupant", ["socket", "fifo", "symlink_to_fifo"])
+def test_an_entry_the_restore_does_not_replace_leaves_its_path_missing_in_leave_out_mode_only(
+    pipeline_dir: pathlib.Path,
+    runner: click.testing.CliRunner,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+    occupant: str,
+) -> None:
+    """With checkout_missing, a missing tracked path whose objects the cache holds, at which a
+    socket, a FIFO or a symlink to a FIFO stands (``track.present_kind`` counts the path
+    missing), is not restored in leave-out mode: the restore neither replaces nor opens that
+    entry. The dry run's view and the leave-out restore (tolerate_missing) each return at once
+    and leave the path missing, as a failed restore, with one warning naming the path and what
+    stands there; the entry stays. A restore outside leave-out mode replaces the entry and
+    brings the path back, as in 0.10.4."""
+    if kind == "file":
+        data_path = pipeline_dir / "cached.csv"
+        data_path.write_text("cached data")
+    else:
+        data_path = pipeline_dir / "images"
+        data_path.mkdir()
+        (data_path / "a.jpg").write_bytes(b"image1")
+    helpers.track_then_remove(runner, pipeline_dir, data_path.name)
+    named = _helper_occupy(data_path, occupant)
+    entry = stat.S_IFMT(os.lstat(data_path).st_mode)
+
+    with _caught_warnings(caplog) as dry_run_warnings:
+        found = helpers.call_without_waiting(
+            lambda: executor_core.find_missing_tracked_files(pipeline_dir, checkout_missing=True),
+            data_path,
+        )
+    with _caught_warnings(caplog) as run_warnings:
+        missing = helpers.call_without_waiting(
+            lambda: executor_core.verify_tracked_files(
+                pipeline_dir, checkout_missing=True, tolerate_missing=True, outputs={}
+            ),
+            data_path,
+        )
+    left = stat.S_IFMT(os.lstat(data_path).st_mode)
+    restored = helpers.call_without_waiting(
+        lambda: executor_core.verify_tracked_files(pipeline_dir, checkout_missing=True),
+        data_path,
+    )
+
+    assert found == executor_core.MissingTrackedFiles(
+        missing=_failed(data_path), restorable={}, restored={}
+    )
+    assert missing == _failed(data_path)
+    warning = (
+        f"Cannot restore {data_path}: {named} is in its place, which the restore does not replace"
+    )
+    assert dry_run_warnings == [warning]
+    assert run_warnings == [warning]
+    assert left == entry, "the leave-out restore replaced the entry"
+    assert restored == _NONE_MISSING
+    restored_file = data_path if kind == "file" else data_path / "a.jpg"
+    assert restored_file.read_bytes() == (b"cached data" if kind == "file" else b"image1")

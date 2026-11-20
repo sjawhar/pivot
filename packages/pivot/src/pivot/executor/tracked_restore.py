@@ -3,10 +3,12 @@
 The pre-flight's ``--checkout-missing`` restore (``executor.core.verify_tracked_files``) restores
 through ``restore_tracked``. The dry run in leave-out mode
 (``executor.core.find_missing_tracked_files``) asks ``check_tracked``, which writes nothing. Both
-find what the restore links through one read, ``_source``. ``check_tracked`` predicts the rest of
-the restore (how it checks each cache object out, which objects it reads, whether it can write
-the path, and where it refuses to link from a cache it could not register in) from reads alone;
-the agreement tests, which give a dry run and a run the same tree, guard that prediction.
+find, through one read, ``_occupied``, an entry at the path that the restore in leave-out mode
+does not replace, and what the restore links, through another, ``_source``. ``check_tracked``
+predicts the rest of the restore (how it checks each cache object out, which objects it reads,
+whether it can write the path, and where it refuses to link from a cache it could not register
+in) from reads alone; the agreement tests, which give a dry run and a run the same tree, guard
+that prediction.
 """
 
 from __future__ import annotations
@@ -14,7 +16,9 @@ from __future__ import annotations
 import enum
 import itertools
 import logging
+import os
 import pathlib
+import stat
 from typing import TYPE_CHECKING, NamedTuple
 
 from pivot import config, exceptions, types
@@ -22,8 +26,6 @@ from pivot import state_dir as state_dir_mod
 from pivot.storage import cache, ownership, track
 
 if TYPE_CHECKING:
-    import os
-
     from pivot.storage import listing
 
 logger = logging.getLogger(__name__)
@@ -40,7 +42,8 @@ class Outcome(enum.Enum):
     directory's listing that no committed listing file holds either."""
     FAILED = enum.auto()
     """The restore failed, which only leave-out mode tolerates, with a ``Cannot restore``
-    warning naming the path and why: the directory's listing is unavailable
+    warning naming the path and why: an entry it does not replace stands at the path
+    (``_occupied``), the directory's listing is unavailable
     (``exceptions.ListingUnavailableError``), or reading the cache or writing the path fails
     with ``OSError``."""
 
@@ -117,11 +120,15 @@ def restore_tracked(
     Each restored file is appended to ``recorded`` for the caller to record in StateDB
     (``cache.restore_from_cache``). A directory is restored from its committed listing file,
     else the cache's listing object (``_source``). With ``tolerate_missing`` (leave-out mode),
-    a directory whose listing is unavailable and a restore that fails with ``OSError`` give
-    ``Outcome.FAILED``, leaving the path missing, each with a warning naming the path; a refusal
-    (a ``PivotError``, never an ``OSError``) and a corrupt listing still raise. Without it, they
-    raise.
+    an entry the restore does not replace at the path (``_occupied``: a socket, a FIFO or a
+    device, or a symlink to one), a directory whose listing is unavailable and a restore that
+    fails with ``OSError`` give ``Outcome.FAILED``, leaving the path as it is, missing, each with
+    a warning naming the path; a refusal (a ``PivotError``, never an ``OSError``) and a corrupt
+    listing still raise. Without it, they raise, and the restore replaces such an entry, as in
+    0.10.4.
     """
+    if tolerate_missing and _occupied(path):
+        return Outcome.FAILED
     source = _source(path, track_data, cache_dir, tolerate_missing=tolerate_missing)
     if isinstance(source, Outcome):
         return source
@@ -171,11 +178,12 @@ def check_tracked(
     restored from the cache ``cache_root``, predicted from reads alone, warning as the restore
     would that it fails.
 
-    The restore's own source (``_source``) must be found: an unavailable listing fails, a
-    missing one is absent. The restore must be able to read each cache object it links, as it
-    checks them out with ``checkout_modes``: where it links no whole tree of a directory as it
-    is (``_linked_tree``), each object is found (``cache.missing_linked_objects``) and opened
-    for reading, as the checkout opens it;
+    No entry the restore does not replace may stand at the path (``_occupied``, the read the
+    restore makes first). The restore's own source (``_source``) must be found: an unavailable
+    listing fails, a missing one is absent. The restore must be able to read each cache object
+    it links, as it checks them out with ``checkout_modes``: where it links no whole tree of a
+    directory as it is (``_linked_tree``), each object is found (``cache.missing_linked_objects``)
+    and opened for reading, as the checkout opens it;
     an ``OSError`` from that lookup or open (an object or a directory of the cache this user
     cannot read) fails it, with the warning the restore gives for the error. A symlink restore
     of a directory whose whole tree the cache holds opens none. And the restore must be able to
@@ -196,6 +204,8 @@ def check_tracked(
         CacheError: With ``links_refused`` and no COPY among ``checkout_modes``, the refusal
             the restore raises where it reaches a link (``_check_refusing``).
     """
+    if _occupied(path):
+        return Check(Outcome.FAILED, set())
     cache_dir = cache_root / "files"
     source = _source(path, track_data, cache_dir, tolerate_missing=True)
     if isinstance(source, Outcome):
@@ -350,6 +360,41 @@ def _write_failure(path: pathlib.Path) -> Check | None:
     entry, _ = problem
     _warn_failed(path, f"this user cannot write in {entry}")
     return Check(Outcome.FAILED, set())
+
+
+def _occupied(path: pathlib.Path) -> bool:
+    """Whether the restore of missing tracked path ``path`` in leave-out mode fails before it
+    reads the cache, warning that it fails (``_warn_failed``): an entry stands at the path,
+    symlinks followed, that is neither a regular file nor a directory, so the pre-flight counts
+    the path missing (``track.present_kind``): a socket, a FIFO or a device, or a symlink to one.
+    The restore never replaces such an entry, which another program may be using, and never
+    opens it; the run leaves its readers out. Where nothing is at the path, or a symlink to
+    nothing (a symlink checkout whose cache object is gone leaves one), the restore goes on and
+    replaces it. One ``stat`` decides; an ``OSError`` of it other than "no such file"
+    (``cache.NO_FILE_ERRNO``) fails the restore too."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as e:
+        if e.errno in cache.NO_FILE_ERRNO:
+            return False
+        _warn_failed(path, e)
+        return True
+    if stat.S_ISREG(mode) or stat.S_ISDIR(mode):
+        # A file or directory that landed after the pre-flight found the path missing: the
+        # restore's own check at its swap meets it (``ownership.swap_refusal``)
+        return False
+    if stat.S_ISSOCK(mode):
+        kind = "a socket"
+    elif stat.S_ISFIFO(mode):
+        kind = "a FIFO"
+    elif stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
+        kind = "a device"
+    else:
+        kind = "an entry that is neither a file nor a directory"
+    if os.path.islink(path):
+        kind = f"a symlink to {kind}"
+    _warn_failed(path, f"{kind} is in its place, which the restore does not replace")
+    return True
 
 
 def _warn_failed(path: pathlib.Path, reason: object) -> None:

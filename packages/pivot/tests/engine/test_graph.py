@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import pickle
 import random
 from typing import TYPE_CHECKING
@@ -867,6 +868,43 @@ def test_get_runnable_stages_reports_a_missing_tracked_file_reached_through_a_sy
     assert error.stage == "p/read"
     assert error.input_path == set_project_root / "data" / "alias" / "a.csv"
     assert found.left_out == {"p/read": error}
+
+
+def test_get_runnable_stages_reports_a_missing_tracked_file_a_fifo_stands_in_once_per_stage(
+    set_project_root: Path,
+) -> None:
+    """A FIFO where the tracked file data/dir/x.csv belongs exists on disk, but the pre-flight
+    counts the file missing (``track.present_kind``), and that list decides: a stage reading
+    the file is left out with the error a missing file gives, and not again for the directory
+    that holds it; a stage reading the symlink ``alias`` to it reads it too, by its resolved
+    path. Neither the pre-flight's view nor the check opens the FIFO."""
+    fifo = set_project_root / "data" / "dir" / "x.csv"
+    helpers.track_without_data(fifo)
+    os.mkfifo(fifo)
+    (set_project_root / "data" / "alias").symlink_to("dir/x.csv")
+    missing = helpers.call_without_waiting(
+        lambda: executor_core.find_missing_tracked_files(set_project_root).missing.paths, fifo
+    )
+    stages = {
+        "ok/a": _create_stage("ok/a", [], [_output("ok/a")]),
+        "p/read": _helper_input_stage("p/read", ["x", "dir"]),
+        "p/link": _helper_input_stage("p/link", ["alias"]),
+    }
+    store = _helper_store(
+        set_project_root, {"x": "data/dir/x.csv", "dir": "data/dir", "alias": "data/alias"}
+    )
+
+    found = helpers.call_without_waiting(lambda: _helper_runnable(stages, store, missing), fifo)
+
+    assert missing == [str(fifo)]
+    assert found.stages is not None
+    assert set(found.stages) == {"ok/a"}
+    assert [str(error) for error in found.errors] == [
+        "Stage 'p/read' depends on input 'x' (path data/dir/x.csv), which does not exist",
+        "Stage 'p/link' depends on input 'alias' (path data/alias), which does not exist",
+    ]
+    assert [error.directory for error in found.errors] == [None, None]
+    assert found.left_out == {"p/read": found.errors[0], "p/link": found.errors[1]}
 
 
 def test_get_runnable_stages_leaves_out_downstream_stages_with_their_first_upstream_error(

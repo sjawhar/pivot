@@ -7,8 +7,9 @@ A seed gives one case (``_generate``): a project of one or two pipelines of plai
 directory producers and mapped stages over them (``Pipeline.map``, and chains of them), reading
 raw files and directories, some tracked with `pivot track`, and of two pipelines the first may
 read the second's stages through their handles (``_compose_across``); the changes made after a
-first full run (``_Change``); and the run's options and targets. A failure names the seed and
-prints the case and its pipelines, and the seed alone builds the same case again. Not
+first full run (``_Change``), among them a FIFO where a deleted tracked path was (``_occupy``);
+and the run's options and targets. A failure names the seed and prints the case and its
+pipelines, and the seed alone builds the same case again. Not
 generated: a cache whose object store is a mount of its own, which takes a mount the test
 cannot make for a command it starts (`test_tracked_keep_going_and_dry_run_keep_going_refuse_a_
 cache_whose_store_is_its_own_mount` in tests/integration/test_all_pipelines.py fakes the mount
@@ -67,6 +68,9 @@ _FIXED_SEEDS = (
     # A chained stage mapped over another pipeline's chained stage, which pivot 0.10.4 registered
     # before the mapped stage it is mapped over and, expanding in that order, left not expanded
     817,
+    # A FIFO, which the pre-flight counts as missing, where a tracked file a stage reads was,
+    # its object kept, with --checkout-missing: the run once ran its reader over it
+    1647,
 )
 
 # The keys every producer writes, and the key a dropping producer wrote in the first run alone
@@ -153,8 +157,9 @@ class _Change(NamedTuple):
     detail: dict[str, str]
     """How the change is made, by what it changes: for `delete_tracked`, what happens to each
     cache object the restore reads (``_OBJECTS``), to the committed listing and to the
-    directory holding the path (``_tracked_detail``); for `lose_outputs`, what else the stage
-    loses (``_lost_detail``); for `edit_listed`, the edit; for any other, nothing."""
+    directory holding the path (``_tracked_detail``), and what stands in the path's place
+    (``_occupy``); for `lose_outputs`, what else the stage loses (``_lost_detail``); for
+    `edit_listed`, the edit; for any other, nothing."""
 
 
 class _Case(NamedTuple):
@@ -221,7 +226,9 @@ def _generate(seed: int, *, locked_out: bool) -> _Case:
         remote=rng.random() < 0.5,
         dropping=tuple(name for name in producers if rng.random() < 0.25),
     )
-    changes = _generate_changes(rng, project, locked_out=locked_out)
+    changes = _occupy(
+        random.Random(f"{seed}:occupant"), _generate_changes(rng, project, locked_out=locked_out)
+    )
     options = tuple(
         option
         for option, chance in (("--no-commit", 0.4), ("--checkout-missing", 0.5))
@@ -358,6 +365,11 @@ _MEMBER_FATES = _OBJECT_FATES[:3]
 _COMMITTED = ("intact", "stale", "empty", "missing")
 # What it does to the directory that holds the tracked path
 _PARENTS = ("writable", "read_only")
+# What stands where the tracked path was: nothing, or a FIFO, which the pre-flight counts as
+# missing (``track.present_kind``), the restore does not replace, and nothing may open
+_OCCUPANTS = ("none", "fifo")
+# How likely a FIFO is to stand where a deleted tracked path was
+_FIFO_CHANCE = 0.1
 
 
 def _tracked_detail(rng: random.Random, *, directory: bool) -> dict[str, str]:
@@ -374,6 +386,21 @@ def _tracked_detail(rng: random.Random, *, directory: bool) -> dict[str, str]:
         "members": rng.choice(_MEMBER_FATES),
         "parent": parent,
     }
+
+
+def _occupy(rng: random.Random, changes: tuple[_Change, ...]) -> tuple[_Change, ...]:
+    """``changes``, with what stands where each `delete_tracked` change's path was in its detail,
+    as ``_OCCUPANTS`` says: nothing, or, in one case of ``1 / _FIFO_CHANCE``, a FIFO. ``rng`` is
+    this alone's, so a case with no FIFO is the one its seed gave before FIFOs were generated."""
+    return tuple(
+        change._replace(
+            detail=change.detail
+            | {"occupant": _OCCUPANTS[1] if rng.random() < _FIFO_CHANCE else _OCCUPANTS[0]}
+        )
+        if change.kind == "delete_tracked"
+        else change
+        for change in changes
+    )
 
 
 def _lost_detail(rng: random.Random, *, producer: bool) -> dict[str, str]:
@@ -653,8 +680,9 @@ def _apply_delete_lock(change: _Change, root: pathlib.Path, case: _Case) -> _Mod
 
 
 def _apply_delete_tracked(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
-    """Delete tracked path ``change.subject`` from the workspace and change what its restore
-    reads, as ``change.detail`` says (``_tracked_detail``)."""
+    """Delete tracked path ``change.subject`` from the workspace, change what its restore reads,
+    and put what stands in its place there, as ``change.detail`` says (``_tracked_detail``,
+    ``_occupy``)."""
     details = change.detail
     path = root / change.subject
     pvt = track.get_pvt_path(path)
@@ -680,6 +708,8 @@ def _apply_delete_tracked(change: _Change, root: pathlib.Path, case: _Case) -> _
         elif details["committed"] == "missing":
             committed.unlink()
     cache.remove_output(path)
+    if details["occupant"] == "fifo":
+        os.mkfifo(path)
     for part, found in reads.items():
         if details[part] == "removed":
             # After `empty_cache`, every object is gone already
@@ -865,22 +895,32 @@ def _restores(case: _Case) -> bool:
     )
 
 
-def _restored_read(case: _Case, change: _Change) -> str | None:
-    """What a stage of ``case`` reads that the restore of `delete_tracked` ``change`` brings
-    back, as ``_COVERED`` names it, or None. The directory that holds the tracked path must be
-    writable and a stage must read the input: a file, whose object is kept; a member of a
-    directory (``_Input.tracked`` "member"), whose object is kept, read through that directory;
-    or a whole directory, whose member objects are kept and whose listing the restore reads: its
-    cached listing object is kept, or removed beside an intact committed listing."""
-    item = next(
+def _deleted_input(case: _Case, change: _Change) -> _Input:
+    """The input of ``case`` that `delete_tracked` ``change`` deletes: the tracked path itself,
+    or the directory that holds it (``_tracked_path``)."""
+    return next(
         item
         for item in case.project.inputs
         if item.tracked != "no" and _tracked_path(item) == change.subject
     )
+
+
+def _is_read(case: _Case, item: _Input) -> bool:
+    """Whether a stage of ``case`` reads input ``item``."""
+    return any(item.path in stage.reads for stage in case.project.stages)
+
+
+def _restored_read(case: _Case, change: _Change) -> str | None:
+    """What a stage of ``case`` reads that the restore of `delete_tracked` ``change`` brings
+    back, as ``_COVERED`` names it, or None. Nothing may stand in the path's place, the
+    directory that holds the tracked path must be writable and a stage must read the input: a
+    file, whose object is kept; a member of a directory (``_Input.tracked`` "member"), whose
+    object is kept, read through that directory; or a whole directory, whose member objects are
+    kept and whose listing the restore reads: its cached listing object is kept, or removed
+    beside an intact committed listing."""
+    item = _deleted_input(case, change)
     detail = change.detail
-    if detail["parent"] != "writable" or not any(
-        item.path in stage.reads for stage in case.project.stages
-    ):
+    if detail["occupant"] != "none" or detail["parent"] != "writable" or not _is_read(case, item):
         return None
     if item.tracked == "member":
         read = "a restorable member read through its directory"
@@ -895,6 +935,12 @@ def _restored_read(case: _Case, change: _Change) -> str | None:
         read = "a restorable file"
         restorable = detail["object"] == "kept"
     return read if restorable else None
+
+
+def _fifo_read(case: _Case, change: _Change) -> bool:
+    """Whether a FIFO stands in the place of `delete_tracked` ``change``'s path (``_occupy``) and
+    a stage of ``case`` reads it, or the directory that holds it."""
+    return change.detail["occupant"] == "fifo" and _is_read(case, _deleted_input(case, change))
 
 
 def _across(case: _Case) -> set[str]:
@@ -917,7 +963,9 @@ def test_dry_run_keep_going_fixed_seeds_cover_every_kind() -> None:
     as CI's; root gets the same cases but for the modes). What a deleted tracked path's restore
     meets counts only in a case that restores it (``_restores``), so each detail of it is
     compared as the restore reads it: among them a file, a member of a directory and a whole
-    directory that the restore brings back for the stage reading it (``_restored_read``)."""
+    directory that the restore brings back for the stage reading it (``_restored_read``), and
+    a FIFO in its place; and a FIFO stands where a tracked path a stage reads was
+    (``_fifo_read``)."""
     cases = [_generate(seed, locked_out=True) for seed in _FIXED_SEEDS]
     tracked = [
         (case, change)
@@ -929,6 +977,12 @@ def test_dry_run_keep_going_fixed_seeds_cover_every_kind() -> None:
 
     found = {
         *(f"change {change.kind}" for case in cases for change in case.changes),
+        *(
+            "a FIFO a stage reads in place of its tracked path"
+            for case in cases
+            for change in case.changes
+            if change.kind == "delete_tracked" and _fifo_read(case, change)
+        ),
         *(
             f"{change.kind} {key}={value}"
             for _, change in tracked
@@ -962,6 +1016,8 @@ _COVERED = {
     *(f"delete_tracked members={value}" for value in _MEMBER_FATES),
     *(f"delete_tracked committed={value}" for value in _COMMITTED),
     *(f"delete_tracked parent={value}" for value in _PARENTS),
+    *(f"delete_tracked occupant={value}" for value in _OCCUPANTS),
+    "a FIFO a stage reads in place of its tracked path",
     "a restorable file",
     "a restorable member read through its directory",
     "a restorable directory",
