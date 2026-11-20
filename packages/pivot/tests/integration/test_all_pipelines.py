@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import stat
 import threading
 from typing import TYPE_CHECKING
@@ -381,6 +382,30 @@ def test_repro_all_tracked_keep_going_leaves_out_a_mapped_stage_whose_shared_inp
         }, result.output
         assert not [event for event in events if event["type"] == "stages_expanded"]
         assert (cwd / "data" / "m" / "plan" / "a.txt").read_text() == "a"
+
+
+def test_repro_all_tracked_keep_going_leaves_out_the_reader_of_a_tracked_path_that_is_no_file(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R1, R2, R5: the pre-flight counts a tracked path that is neither a regular file nor a
+    directory as missing (here a Unix socket where data/raw/missing.txt should be; a FIFO is the
+    same case, and its reader would block for ever). The stage that reads that path is left out
+    with one `Skipping:` line, as the reader of a tracked file with no data is, and alpha runs;
+    the dry run on the same tree lists alpha alone. It must not run the reader over the socket."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_reader_project(cwd)
+        with socket.socket(socket.AF_UNIX) as node:
+            # A relative path: an AF_UNIX address holds at most 108 bytes
+            node.bind("data/raw/missing.txt")
+            dry_run = runner.invoke(cli.cli, helpers.DRY_RUN_KEEP_GOING)
+            result = runner.invoke(cli.cli, ["repro", "--all", "--keep-going"])
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert list(json.loads(dry_run.stdout)["stages"]) == ["alpha/stage_a"], dry_run.output
+        assert result.exit_code == 0, result.output
+        assert helpers.skipping_lines(result.output) == [_READER_SKIPPED], result.output
+        assert (cwd / "data" / "alpha" / "stage_a.txt").read_text() == "stage_a output"
+        assert not (cwd / "data" / "broken" / "read_0.txt").exists(), "the reader must not run"
 
 
 def _helper_checkout_missing_dry_run_and_run(runner: CliRunner) -> tuple[Result, Result]:
