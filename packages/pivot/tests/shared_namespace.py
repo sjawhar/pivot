@@ -4,14 +4,15 @@ portion `company.client` of `company-client` (`CLIENT`, `CLIENT_FILES`) makes su
 `company-client` and `Fix_Lib` installed into a venv from their paths
 (`install_client_and_fixlib`), the files of a `company-client` that shares `company.sub` too
 (`CLIENT_AND_SUB_FILES`), the project's `company/local.py` that also holds a lock
-(`LOCAL_WITH_LOCK`), or that runs code of a test's when a second import runs it (`SECOND_IMPORT`),
-a project module that reads it through the package's name (`READS_LOCAL`), a `PYTHONPATH` entry
-from which a worker imports by name (`pythonpath_entry`), a project with those installs and files
-in its root and in such an entry (`project_with`), what the stage of such a project writes
-(`SHARED_OUTPUT`, the project's value then `LIBRARY_VALUES`), the `pipeline.py` whose stage reads
-`company.local` through the package's name (`TOP_NAME_PIPELINE`), what one `pivot repro --json`
-gives of that stage (`repro_outcome`) and a run that writes it and reruns on an edit
-(`assert_runs_then_reruns_on_an_edit`).
+(`LOCAL_WITH_LOCK`), or that leaves a file beside it and runs code of a test's when a second import
+runs it (`SECOND_IMPORT`), a project module that reads it through the package's name
+(`READS_LOCAL`), a `PYTHONPATH` entry from which a worker imports by name (`pythonpath_entry`), a
+project with those installs and files in its root and in such an entry (`project_with`), what the
+stage of such a project writes (`SHARED_OUTPUT`, the project's value then `LIBRARY_VALUES`), the
+`pipeline.py` whose stage reads `company.local` through the package's name (`TOP_NAME_PIPELINE`),
+the last line of the failure of a stage that reads it so where nothing binds it (`MISSING`), what
+one `pivot repro --json` gives of that stage (`repro_outcome`) and a run that writes it and reruns
+on an edit (`assert_runs_then_reruns_on_an_edit`).
 
 It imports only the standard library and `tests.installed_dists` (pytest for type checking alone),
 so the tests that use it still collect when `packages/pivot/src` is pivot 0.10.4's.
@@ -49,12 +50,14 @@ CLIENT_AND_SUB_FILES: Mapping[str, str] = {
 # the package's name.
 LOCAL_WITH_LOCK = "import threading\n\n_LOCK = threading.Lock()\n\n\n" + LOCAL
 READS_LOCAL = "import company.local\n\n\ndef value():\n    return company.local.value()\n"
-# The project's `company/local.py`, with the `value()` of `LOCAL`, that runs `{second}` when a
-# second import in the project runs it: the first, in pivot's own process, leaves a file beside it.
+# The project's `company/local.py`, with the `value()` of `LOCAL`, that leaves a file `second`
+# beside it and then runs `{second}` when a second import in the project runs it: the first, in
+# pivot's own process, leaves a file `imported` beside it.
 SECOND_IMPORT = """\
 import pathlib
 
 if pathlib.Path(__file__).with_name("imported").exists():
+    pathlib.Path(__file__).with_name("second").touch()
     {second}
 pathlib.Path(__file__).with_name("imported").touch()
 
@@ -73,6 +76,9 @@ TOP_NAME_PIPELINE = installed_dists.pipeline_text(
     "import company.client\nimport company.local\nimport fixlib",
     "company.local.value()" + LIBRARY_VALUES,
 )
+# The last line of the failure of a stage that reads `company.local` through the package where
+# nothing in its worker binds it there.
+MISSING = "AttributeError: module 'company' has no attribute 'local'"
 
 
 def install_client_and_fixlib(

@@ -13,14 +13,21 @@ when code cloudpickle pickles by value reads the module through the package, whe
 a class of the module (`from company.local import Mode`) while other code reads it so, also code
 the worker imports by name that imports the module itself, when a later stage in the same worker
 reads the module, and when a second import of the module would fail; and an edit of the module
-after discovery reruns the stage on the next run. A module sent by name whose import fails fails
-only the stage that reads it: `test_installed_distributions_namespace.py`. Each stated limit
-(`docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs") is pivot 0.10.4's
-behaviour, and a test pins it: a module that cannot be pickled is missing where only code the
-worker imports by name reads it, without importing it itself, and fails the stage that reads it so
-itself; code pickled by value and code imported by name that both hold the module hold two copies;
-a module's import-time code does not run in the worker; and a `@no_fingerprint` stage's scan does
-not read a helper module it calls.
+after discovery reruns the stage on the next run. A module sent by name whose import fails in the
+worker is warned of in the output of each stage it is sent with and binds nothing, so only a stage
+that reads it fails, with `AttributeError`: `test_installed_distributions_namespace.py`.
+
+The stated limits (`docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs")
+that a test here pins, each of which pivot 0.10.4 has too: a module that cannot be pickled is
+missing where only code the worker imports by name reads it, without importing it itself, and
+fails the stage that reads it so itself; code pickled by value and code imported by name that both
+hold the module hold two copies; a module's import-time code does not run in the worker (pivot
+0.10.4 fails that test's stage earlier, with `AttributeError`, as it binds nothing on the
+package); and a `@no_fingerprint` stage's scan does not read a helper module it calls. The other
+stated limits are documented only, pinned by no test: a stage body that imports the library's
+package itself, a function of a sent module that rebinds one of its globals (`global COUNT`), a
+project package below the shared one (`company.proj`), and cloudpickle's import, as the worker
+unpickles the call, of a submodule it pickles by reference that the stage's own code names.
 
 Each test makes its own venv with uv over this test environment (`tests.installed_dists`,
 `tests.shared_namespace`) and its own pivot project. The file runs pivot only through its CLI and
@@ -320,9 +327,6 @@ def make(ready: str) -> str:
 with Pipeline("p") as pipeline:
     make(edit())
 """
-# The last line of the failure of a stage that reads `company.local` through the package where
-# nothing in its worker binds it there.
-_MISSING = "AttributeError: module 'company' has no attribute 'local'"
 
 
 def _helper_two_stages_outcome(
@@ -429,7 +433,7 @@ def test_a_submodule_that_cannot_be_pickled_is_missing_where_its_reader_imports_
 
     found, shown = shared_namespace.repro_outcome(project)
 
-    assert found == (1, "failed", _MISSING), shown
+    assert found == (1, "failed", shared_namespace.MISSING), shown
 
 
 def test_a_lambda_of_a_module_sent_by_reference_that_reads_the_projects_part_gets_it(
@@ -886,7 +890,7 @@ def test_an_edit_of_the_projects_part_after_discovery_runs_the_loaded_code_and_r
             "helper.value()" + shared_namespace.LIBRARY_VALUES,
             {"helper.py": shared_namespace.READS_LOCAL, "company/local.py": shared_namespace.LOCAL},
             {},
-            (1, "failed", _MISSING),
+            (1, "failed", shared_namespace.MISSING),
             id="limit-helper-under-the-root",
         ),
         # Pivot 0.10.4's outcome, a stated limit.
@@ -895,7 +899,7 @@ def test_an_edit_of_the_projects_part_after_discovery_runs_the_loaded_code_and_r
             "helper.value()" + shared_namespace.LIBRARY_VALUES,
             {"company/local.py": shared_namespace.LOCAL},
             {"helper.py": _IMPORTS_THE_PACKAGE},
-            (1, "failed", _MISSING),
+            (1, "failed", shared_namespace.MISSING),
             id="limit-helper-importing-the-package-alone",
         ),
     ],

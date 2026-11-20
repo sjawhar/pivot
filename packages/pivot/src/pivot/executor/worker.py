@@ -944,72 +944,70 @@ class WorkerStageInfo(TypedDict):
     # (`executor.core.prepare_worker_info`), set when there is one: the name of each that
     # cloudpickle pickles by reference, which the worker imports, and each it pickles by value that
     # pickles alone, the module itself, sent in the stage's pickle. The worker binds them on their
-    # packages while the stage runs (`_bind_submodules`). Why:
+    # packages while the stage runs (`_sent_submodules_bound`). Why:
     # `docs/architecture/fingerprinting.md`, "Imports a Stage Makes While It Runs".
     sent_submodules: NotRequired[tuple[ModuleType | str, ...]]
 
 
-class _SubmoduleImportError(Exception):
-    """The import of a submodule sent by name (`WorkerStageInfo.sent_submodules`) raised: the
-    stage fails with this, which names the module and what its import raised."""
-
-    def __init__(self, name: str, raised: BaseException) -> None:
-        described = "".join(traceback.format_exception_only(raised)).rstrip()
-        super().__init__(
-            f"Could not import module '{name}', which the stage reads through its package: "
-            + described
-        )
+# The warning the worker logs where its import of a module sent by name
+# (`WorkerStageInfo.sent_submodules`) raised, with the module's name and the last line
+# `traceback.format_exception_only` gives of what the import raised (`_sent_submodules_bound`).
+_SUBMODULE_IMPORT_WARNING = (
+    "Could not import module '%s', which the stage reads through its package: %s. The module is "
+    + "not bound on its package, so code that reads it through the package fails."
+)
 
 
 @contextlib.contextmanager
-def _submodule_bindings() -> Generator[list[tuple[ModuleType, str, ModuleType]]]:
-    """The bindings `_bind_submodules` makes for one stage, each (package, attribute, module). On
-    the way out, also when the stage fails, each is removed where the package still holds that
-    module, so no later stage of this worker finds it."""
-    bound = list[tuple[_stdlib_types.ModuleType, str, _stdlib_types.ModuleType]]()
-    try:
-        yield bound
-    finally:
-        for parent, attribute, module in reversed(bound):
-            if vars(parent).get(attribute) is module:
-                delattr(parent, attribute)
-
-
-def _bind_submodules(
-    submodules: Sequence[ModuleType | str], bound: list[tuple[ModuleType, str, ModuleType]]
-) -> None:
+def _sent_submodules_bound(submodules: Sequence[ModuleType | str]) -> Generator[None]:
     """Bind each of `submodules` (`WorkerStageInfo.sent_submodules`, a package before its
-    submodules) on its package, as the import of a submodule binds it there, before the stage's
-    parameter overrides, input loaders, the stage and its output writers run, and add each binding
-    made to `bound` (`_submodule_bindings`, which removes them after the stage). Code that
+    submodules) on its package, as the import of a submodule binds it there, for everything of
+    the stage: its parameter overrides, input loaders, the stage and its output writers. Code that
     cloudpickle sent by value runs none of its module's imports, and so finds through the package
     (`company.local.f()`, after `import company.local` in its module) only what is bound there, as
     a plain run of that code finds what its import bound.
 
     A module sent by name is imported here (`importlib.import_module`), which binds it on its
     package where it loads it; `sys.modules` holds what that import put there, as after any
-    import. An import that raises raises `_SubmoduleImportError`, which fails this stage alone and
-    names the module; an interrupt of the run (`WorkerTerminated`) stays one. A module sent by
-    value is bound as it came, with no import, and adds nothing to `sys.modules`. A module is bound
-    only where this process holds its package (`sys.modules`) and the package holds no attribute
-    of that name, read through `vars` so no `__getattr__` runs: a module an import in this process
-    bound there (a helper the worker imports by name that runs `from company.local import Mode`)
-    is the copy that code holds, and stays."""
-    for submodule in submodules:
-        if isinstance(submodule, _stdlib_types.ModuleType):
-            module = submodule
-        else:
-            try:
-                module = importlib.import_module(submodule)
-            except WorkerTerminated:
-                raise
-            except (Exception, SystemExit, KeyboardInterrupt) as exc:
-                raise _SubmoduleImportError(submodule, exc) from exc
-        package, _, attribute = module.__name__.rpartition(".")
-        parent = sys.modules.get(package)
-        if isinstance(parent, _stdlib_types.ModuleType) and attribute not in vars(parent):
-            setattr(parent, attribute, module)
-            bound.append((parent, attribute, module))
+    import. Where that import raises (any `Exception`, `SystemExit` or `KeyboardInterrupt`), one
+    warning, logged into the stage's output (`_queue_logging`), names the module and the last line
+    of what it raised (`_SUBMODULE_IMPORT_WARNING`), nothing is bound for it, and the stage runs:
+    code that reads the module through its package fails there with `AttributeError`, as in Pivot
+    0.10.4, which binds nothing on the package; a run that does not read it runs. An interrupt of
+    the run (`WorkerTerminated`) stays one. A module sent by value is bound as it came, with no
+    import, and adds nothing to `sys.modules`. A module is bound only where this process holds its
+    package (`sys.modules`) and the package holds no attribute of that name, read through `vars`
+    so no `__getattr__` runs: a module an import in this process bound there (a helper the worker
+    imports by name that runs `from company.local import Mode`) is the copy that code holds, and
+    stays.
+
+    On the way out, also when the stage fails or an interrupt leaves before the stage starts, each
+    binding made here is removed where the package still holds that module, so no later stage of
+    this worker finds it."""
+    bound = list[tuple[_stdlib_types.ModuleType, str, _stdlib_types.ModuleType]]()
+    try:
+        for submodule in submodules:
+            if isinstance(submodule, _stdlib_types.ModuleType):
+                module = submodule
+            else:
+                try:
+                    module = importlib.import_module(submodule)
+                except WorkerTerminated:
+                    raise
+                except (Exception, SystemExit, KeyboardInterrupt) as exc:
+                    raised = traceback.format_exception_only(exc)[-1].rstrip()
+                    logger.warning(_SUBMODULE_IMPORT_WARNING, submodule, raised)
+                    continue
+            package, _, attribute = module.__name__.rpartition(".")
+            parent = sys.modules.get(package)
+            if isinstance(parent, _stdlib_types.ModuleType) and attribute not in vars(parent):
+                setattr(parent, attribute, module)
+                bound.append((parent, attribute, module))
+        yield
+    finally:
+        for parent, attribute, module in reversed(bound):
+            if vars(parent).get(attribute) is module:
+                delattr(parent, attribute)
 
 
 def _make_result(
@@ -1072,22 +1070,17 @@ def _execute_stage(
 
     # Ensure worker has correct cwd for this stage (workers in reusable pool
     # may have stale cwd from previous execution in different project).
-    # _queue_logging captures log messages to the output queue (for TUI display).
-    # _submodule_bindings removes on the way out the bindings of the submodules sent with the
-    # stage that _bind_submodules makes below, for everything of the stage.
+    # _queue_logging captures log messages to the output queue (for TUI display), among them the
+    # warning of a submodule sent by name whose import fails.
+    # _sent_submodules_bound binds the submodules sent with the stage first, before the parameter
+    # overrides, for everything of the stage, and removes the bindings on the way out. It imports
+    # a submodule sent by name here, not as loky unpickles the call, where an import that raises
+    # breaks the pool and fails every stage it runs.
     with (
         contextlib.chdir(project_root),
         _queue_logging(stage_name, output_queue),
-        _submodule_bindings() as bound,
+        _sent_submodules_bound(stage_info.get("sent_submodules", ())),
     ):
-        # First, before the parameter overrides: a submodule sent by name is imported here, not as
-        # loky unpickles the call, where an import that raises breaks the pool and fails every
-        # stage it runs; here it fails this stage alone, naming the module.
-        try:
-            _bind_submodules(stage_info.get("sent_submodules", ()), bound)
-        except _SubmoduleImportError as exc:
-            return _make_result(StageStatus.FAILED, str(exc), ring_buffer)
-
         no_commit = stage_info["no_commit"]
 
         production_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_info["state_dir"]))

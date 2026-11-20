@@ -519,10 +519,21 @@ when Pivot can pickle it alone, and any other (a module outside the project
 root, say) by its name, which the worker imports before the stage runs. The
 worker puts it on the package while the stage runs, so the stage runs as a
 plain `python` run of your code does, and an edit to the module reruns it.
-When the worker's import of a module sent by name fails, only that stage fails,
-with a reason that names the module.
 
-These cases behave as in Pivot 0.10.4
+The worker imports each module sent by name before the stage, whether or not
+this run of the stage reads it: Pivot records what the stage's code can read,
+not what one run reads. When that import fails in the worker after it worked
+in Pivot's own process (import-time code that cannot run twice, a file broken
+during the run), the stage's output holds one warning that names the module and
+the last line of the error (`Could not import module 'company.local', which the
+stage reads through its package: RuntimeError: ...`), Pivot binds nothing for
+the module, and the stage runs. A stage that reads the module then fails with
+`AttributeError: module 'company' has no attribute 'local'`, as in Pivot
+0.10.4, with the warning in its output; a stage that does not read it in that
+run runs, as in 0.10.4. Other stages run on.
+
+Its limits, each of which Pivot 0.10.4 has too, with the same outcome unless the
+item says otherwise
 ([Imports a Stage Makes While It Runs](../architecture/fingerprinting.md#imports-a-stage-makes-while-it-runs)):
 
 - A module that cannot be pickled (one holding a `threading.Lock`) is not
@@ -537,7 +548,9 @@ These cases behave as in Pivot 0.10.4
   another copy of it than the helper: `company.local.run(Mode.FAST)` then
   compares the stage's `Mode.FAST` with the helper's copy of `Mode`.
 - The module's import-time code does not run in the worker: a class it
-  registers with a library as it is imported is not registered there.
+  registers with a library as it is imported is not registered there. Pivot
+  0.10.4 fails here earlier, with `AttributeError`, as it binds nothing on the
+  package.
 - A stage body that imports the library's package itself (`import company`
   inside the stage) gets it without your module. Only a library package whose
   `__init__` calls `pkgutil.extend_path` reaches this: Pivot refuses such an
@@ -547,7 +560,9 @@ These cases behave as in Pivot 0.10.4
   there puts it (see `@pivot.no_fingerprint()` below).
 - A function of the module that rebinds one of its globals (`global COUNT`)
   changes the copy its functions read: code that then reads
-  `company.local.COUNT` through the package still sees the old value.
+  `company.local.COUNT` through the package still sees the old value. Pivot
+  0.10.4 fails here earlier, with `AttributeError`, as it binds nothing on the
+  package.
 - A package of yours below the shared one (`company/proj/__init__.py`) one of
   whose modules a helper outside the project root imports itself
   (`import company.proj.other`) is the helper's copy in the worker, which holds

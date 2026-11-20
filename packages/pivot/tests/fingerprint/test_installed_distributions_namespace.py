@@ -12,9 +12,11 @@ pickles the project's part by value, as it pickles every module under the projec
 stage and the project's code it holds carry one copy of each class and the values the coordinator
 holds. A stage that reaches the module by another name (`from company import local`, or only
 `from company.local import value`) runs too. Where the worker's import of a module sent by name
-fails, the stage that reads it fails, naming the module, and a stage running beside it in another
-worker finishes. How the worker gets the module, case by case, against a plain run, and the
-stated limits: `test_installed_distributions_namespace_worker.py`.
+fails, the output of each stage it is sent with holds a warning that names the module, the worker
+binds nothing for it, and the stage runs: a stage that reads the module fails with
+`AttributeError`, as in pivot 0.10.4, one that does not read it in that run runs, and a stage
+running beside them finishes. How the worker gets the module, case by case, against a plain run,
+and the stated limits: `test_installed_distributions_namespace_worker.py`.
 
 A namespace package's directory under the interpreter's prefix but in no `site-packages`
 directory, as a `uv pip install --target` directory that a `.pth` file in `site-packages` puts on
@@ -127,14 +129,15 @@ _MODE_PIPELINE = installed_dists.pipeline_text(
     'import company.config\nfrom company.config import mode\n\ncompany.config.MODE = "prod"',
     "mode()",
 )
-# What `shared_namespace.SECOND_IMPORT` runs first at a second import: it leaves a file `second`
-# beside the module.
-_LEAVES_SECOND = 'pathlib.Path(__file__).with_name("second").touch()\n    '
-# Two stages of `Pipeline("p")`, after `import company.local`: `make` reads `company.local` through
-# the package's name inside a lambda alone, whose names cloudpickle does not follow, so nothing of
-# the module is pickled with it; `other` reads nothing of `company`, and returns `other` one second
-# after the file `{second}` appears, so that it runs while `make`'s worker imports the module.
+# Three stages of `Pipeline("p")`, after `import company.local`: `reads` reads `company.local`
+# through the package's name inside a lambda alone, whose names cloudpickle does not follow, so
+# nothing of the module is pickled with it; `skips` reads it so only where the variable
+# `_READ_LOCAL` names is set, and otherwise returns `skipped`; `other` reads nothing of `company`,
+# and returns `other` one second after the file `{marker}` appears, so that it runs while a worker
+# imports the module.
+_READ_LOCAL = "READ_COMPANY_LOCAL"
 _OVERLAPPING_STAGES = """\
+import os
 import pathlib
 import time
 
@@ -142,18 +145,25 @@ import company.local
 
 from pivot import Pipeline, stage
 
-SECOND = {second!r}
+MARKER = {marker!r}
 
 
 @stage
-def make() -> str:
+def reads() -> str:
     return (lambda: company.local.value())()
+
+
+@stage
+def skips() -> str:
+    if os.environ.get({read_local!r}):
+        return (lambda: company.local.value())()
+    return "skipped"
 
 
 @stage
 def other() -> str:
     deadline = time.monotonic() + 60
-    while not pathlib.Path(SECOND).exists():
+    while not pathlib.Path(MARKER).exists():
         if time.monotonic() > deadline:
             raise TimeoutError("no worker imported company.local a second time")
         time.sleep(0.05)
@@ -162,9 +172,17 @@ def other() -> str:
 
 
 with Pipeline("p") as pipeline:
-    make()
+    reads()
+    skips()
     other()
 """
+# The warning, word for word, that a stage's output holds where its worker's import of
+# `company.local`, sent by name, raised what `{raised}` names: the last line of what it raised.
+_IMPORT_FAILED = (
+    "WARNING: Could not import module 'company.local', which the stage reads through its package: "
+    + "{raised}. The module is not bound on its package, so code that reads it through the package "
+    + "fails."
+)
 
 
 def _helper_in_site_packages(venv: installed_dists.Venv) -> tuple[pathlib.Path, list[str]]:
@@ -463,49 +481,69 @@ def test_the_projects_part_of_a_shared_package_reaches_the_worker_as_the_coordin
         ),
         pytest.param("raise SystemExit(3)", "SystemExit: 3", id="exits"),
         pytest.param("raise KeyboardInterrupt", "KeyboardInterrupt", id="is-interrupted"),
+        # `traceback.format_exception_only` gives a line naming where it was raised first.
+        pytest.param('exec("return")', "SyntaxError: 'return' outside function", id="syntax-error"),
     ],
 )
-def test_a_module_sent_by_name_whose_import_fails_fails_only_the_stage_that_reads_it(
+def test_a_module_sent_by_name_whose_import_fails_warns_and_fails_only_a_stage_that_reads_it(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, second: str, raised: str
 ) -> None:
     """`company-client` is installed into site-packages from its path. The project's part of
     `company`, `company/local.py`, lies in a `PYTHONPATH` entry, so cloudpickle pickles it by
     reference, and a second import of it, after `pipeline.py`'s, leaves a file `second` beside it
-    and raises `RuntimeError` (`raises`), `SystemExit(3)` (`exits`) or `KeyboardInterrupt`
-    (`is-interrupted`). Two workers (`core.max_workers 2`) run the stage `make`, which reads the
-    module through the package's name inside a lambda alone, so the coordinator sends its name, and
-    the stage `other`, which reads nothing of `company` and runs until that file appears. `pivot
-    repro` exits 1: `make` fails, with a reason that names the module and what its import raised,
-    and `other` runs and writes `other`. Were the module sent as a module object, `make`'s worker
-    would import it as it unpickles the call, which breaks the pool, and `other` would fail too,
-    with loky's `A task has failed to un-serialize`."""
-    second_file = tmp_path / "extra" / "company" / "second"
-    local = shared_namespace.SECOND_IMPORT.format(second=_LEAVES_SECOND + second)
+    and raises `RuntimeError` (`raises`), `SystemExit(3)` (`exits`), `KeyboardInterrupt`
+    (`is-interrupted`) or a `SyntaxError`, whose description starts with a line naming where it
+    was raised (`syntax-error`). Two workers (`core.max_workers 2`) run three stages: `reads`,
+    which reads the module through the package's name inside a lambda alone, so the coordinator
+    sends its name; `skips`, which reads it so only where `READ_COMPANY_LOCAL` is set, which it is
+    not in this run, so the coordinator sends its name too; and `other`, which reads nothing of
+    `company` and runs until that file appears. `pivot repro --keep-going --show-output` exits 1.
+    The worker's import of the module fails before each of `reads` and `skips`, and that stage's
+    output holds one warning, on one line, that names the module and the last line of what the
+    import raised and says the module is not bound: `reads` then fails with
+    `AttributeError: module 'company' has no attribute 'local'`, as in Pivot 0.10.4, which binds
+    nothing on the package; `skips` runs and writes `skipped`, as in 0.10.4; `other` runs and
+    writes `other`, and its output holds no warning. Were a failed import to fail the stage,
+    `skips` would fail too; were the module sent as a module object, the worker would import it
+    as it unpickles the call, which breaks the pool, and each stage running would fail with
+    loky's `A task has failed to un-serialize`."""
+    monkeypatch.delenv(_READ_LOCAL, raising=False)
+    # So wide a console prints each line a stage logs on one line.
+    monkeypatch.setenv("COLUMNS", "1000")
     project = shared_namespace.project_with(
         tmp_path,
         monkeypatch,
         shared_namespace.CLIENT_FILES,
         {},
-        {"company/local.py": local},
-        _OVERLAPPING_STAGES.format(second=str(second_file)),
+        {"company/local.py": shared_namespace.SECOND_IMPORT.format(second=second)},
+        _OVERLAPPING_STAGES.format(
+            marker=str(tmp_path / "extra" / "company" / "second"), read_local=_READ_LOCAL
+        ),
     )
     installed_dists.pivot_ok(project, "config", "set", "core.max_workers", "2")
 
-    ran = installed_dists.run_pivot(project, "repro", "--json")
+    ran = installed_dists.run_pivot(project, "repro", "--keep-going", "--show-output")
 
-    events = installed_dists.stage_complete_events(ran)
-    reasons = {event["stage"]: event["reason"] for event in events if event["status"] == "failed"}
-    other = project.root / "data" / "p" / "other.txt"
+    lines = ran.stdout.splitlines()
+    data = project.root / "data" / "p"
+    outputs = {stage: data / f"{stage}.txt" for stage in ("reads", "skips", "other")}
+    written = {
+        stage: path.read_text() if path.exists() else None for stage, path in outputs.items()
+    }
     found = (
         ran.returncode,
-        {event["stage"]: event["status"] for event in events},
-        reasons,
-        other.read_text() if other.exists() else None,
+        written,
+        sorted(line for line in lines if line.startswith("[p/")),
+        [line.strip() for line in lines].count(shared_namespace.MISSING),
+        "Summary: 2 ran, 0 cached, 0 blocked, 1 failed" in ran.stderr,
+        "Failed stages:\n  p/reads\n" in ran.stderr,
     )
-    reason = (
-        "Could not import module 'company.local', which the stage reads through its package: "
-        + raised
-    )
-    assert found == (1, {"p/make": "failed", "p/other": "ran"}, {"p/make": reason}, "other"), (
-        installed_dists.shown(ran)
-    )
+    warning = _IMPORT_FAILED.format(raised=raised)
+    assert found == (
+        1,
+        {"reads": None, "skips": "skipped", "other": "other"},
+        [f"[p/reads] {warning}", f"[p/skips] {warning}"],
+        1,
+        True,
+        True,
+    ), installed_dists.shown(ran)
