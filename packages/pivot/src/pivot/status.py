@@ -351,21 +351,22 @@ def expand_current(
     allow_missing: bool = False,
     fetched: Mapping[str, listing.DirListing] | None = None,
     restorable: Mapping[str, PvtData] | None = None,
-    plan: expansion.InstancePlan | None = None,
+    checks: expansion.InstanceChecks | None = None,
     no_commit: bool = False,
     not_current: set[str] | None = None,
 ) -> tuple[expansion.Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage (``Pipeline.map``) of ``pipeline`` whose producer is current,
     as a run would before running its instances (``expansion.expand_current``, which takes a
-    listing the cache lacks from ``fetched``, and adds the instances ``plan`` plans).
+    listing the cache lacks from ``fetched``, and adds the instances
+    ``expansion.plan_instances`` plans over ``checks``).
 
     Whether a producer is current is the explain path's decision (``get_pipeline_explanations``
     over the producers and their upstream stages): its explanation, its upstream counted, says it
     would not run; or, with a remote configured, only that it and its stale upstream stages are
     pullable (``pullable_stages``, by each explanation's ``recovery``): its lock matches, and pull
-    restores what it lacks. A run never pulls, so a refusal of a template whose producer is
-    current only so is not ``refused`` (``expansion.expand_current``'s ``pulled``). Every other
-    template stays unexpanded, naming what it waits for.
+    restores what it lacks. Every other template stays unexpanded, naming what it waits for. A
+    run never pulls, so a template whose producer is current only so and whose listing cannot
+    be read is not ``refused`` (``expansion.expand_current``'s ``pulled``).
     ``restorable`` holds the missing tracked files the cache can restore, which the explanations
     count as present (``_explanations_for``). ``no_commit`` reads the keys a listing gives as a
     ``--no-commit`` run reads them, from the workspace where neither the committed file nor the
@@ -381,9 +382,7 @@ def expand_current(
     pipeline.reset_expansions()
     templates = pipeline.list_templates()
     if not templates:
-        return expansion.Expansion(
-            expanded={}, listed={}, not_expanded={}, listings={}, refused={}
-        ), {}
+        return expansion.empty_expansion(), {}
     _t = metrics.start()
     try:
         with state_dir_mod.entry_invocation(pipeline.resolved_state_dirs):
@@ -439,7 +438,7 @@ def expand_current(
                 default_state_dir=default_state_dir,
                 cache_dir=files_dir,
                 fetched=fetched,
-                plan=plan,
+                checks=checks,
                 pulled=current - unchanged,
                 workspace=_make_workspace_store(pipeline) if no_commit else None,
             )

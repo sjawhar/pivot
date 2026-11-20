@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
     from pivot.cli import CliContext
-    from pivot.expansion import Expansion, InstancePlan
+    from pivot.expansion import Expansion, InstanceChecks
     from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.storage import listing, track
     from pivot.storage.store import WorkspaceStore
@@ -87,17 +87,17 @@ def expand_mapped_stages(
     allow_missing: bool = False,
     fetched: Mapping[str, listing.DirListing] | None = None,
     restorable: Mapping[str, track.PvtData] | None = None,
-    plan: InstancePlan | None = None,
+    checks: InstanceChecks | None = None,
     no_commit: bool = False,
     not_current: set[str] | None = None,
 ) -> tuple[Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage of the Pipeline in context whose producer is current, as a run
     would (``status.expand_current``, a listing the cache lacks taken from ``fetched``, the
-    missing tracked files of ``restorable`` counted as present, the instances ``plan`` plans
-    added, the keys read as a ``--no-commit`` run reads them with ``no_commit``, each stage of
-    the producers' execution order that is not current given to ``not_current``), and return the
-    expansion with the explanations it read. A command that lists stages calls it first, so the
-    stages it lists hold the instances."""
+    missing tracked files of ``restorable`` counted as present, the instances
+    ``expansion.plan_instances`` plans over ``checks`` added, the keys read as a ``--no-commit``
+    run reads them with ``no_commit``, each stage of the producers' execution order that is not
+    current given to ``not_current``), and return the expansion with the explanations it read. A
+    command that lists stages calls it first, so the stages it lists hold the instances."""
     from pivot import status as status_mod
 
     return status_mod.expand_current(
@@ -106,7 +106,7 @@ def expand_mapped_stages(
         allow_missing=allow_missing,
         fetched=fetched,
         restorable=restorable,
-        plan=plan,
+        checks=checks,
         no_commit=no_commit,
         not_current=not_current,
     )

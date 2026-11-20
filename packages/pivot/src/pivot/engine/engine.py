@@ -186,11 +186,9 @@ class _MapRun:
 
     A template is a node of the run's schedule with no resources. When its upstream stages
     have finished, its producer among them, the engine reads the producer's recorded listing of
-    the directory and adds the instances ``expansion.plan_instances`` plans over ``checks``: one
-    per file, or, for a template in ``checks.wanted``, the instance of each key it names; none
-    whose output is, lies inside or contains a file of ``checks.missing_tracked``, or whose
-    incremental output the run would lose. ``stage_order``, ``all_stages`` and
-    ``committed_before`` are the run's own records, which each expansion extends.
+    the directory and adds the instances ``expansion.plan_instances`` plans over ``checks``, or
+    the template fails with its reason. ``stage_order``, ``all_stages`` and ``committed_before``
+    are the run's own records, which each expansion extends.
     """
 
     templates: set[str]
@@ -198,8 +196,7 @@ class _MapRun:
     # expand over the same keys; the engine's own record, kept after the run
     # (``Engine.expansion_keys``)
     keys: dict[types.ArtifactIdentity, list[tuple[str, str]]]
-    # What each template's instances are checked against before they are added: the keys the
-    # run's targets name, the tracked files the run start left missing, and the run's flags
+    # The run's checks, which ``expansion.plan_instances`` plans each template's instances over
     checks: expansion.InstanceChecks
     stage_order: list[str]
     all_stages: dict[str, RegistryStageInfo]
@@ -1855,7 +1852,6 @@ class Engine:
                     wanted=wanted,
                     missing_tracked=missing_tracked,
                     restore_failed=restore_failed,
-                    project_root=project_root,
                     checkout_missing=checkout_missing,
                     allow_uncached_incremental=allow_uncached_incremental,
                     force=force,
@@ -2523,16 +2519,14 @@ class Engine:
 
         Its upstream stages have finished, its producer among them, so the producer's directory
         holds what the producer wrote or restored. The instances are those
-        ``expansion.plan_instances`` plans over the run's checks (``_MapRun.checks``): one per
-        file (``registry.map_instance_keys``), or, when the run's targets name instances, one per
-        file of a key they name; each is added to the registry, the run's graph and its schedule.
-        The template then completes, so a template mapped over its instances can expand next. A
-        refusal (a listing that cannot be read, a file whose key cannot name a stage, a refusal
-        of ``expansion.plan_instances``, an instance whose name or output path another stage
-        holds) fails the template with the reason and adds none of its instances. When the
-        expansion succeeds, each instance whose key left the producer's listing is removed
-        (``_remove_orphans``) before the new instances are scheduled, unless the run commits
-        nothing; a refused expansion removes nothing.
+        ``expansion.plan_instances`` plans over the run's checks (``_MapRun.checks``), each added
+        to the registry, the run's graph and its schedule. The template then completes, so a
+        template mapped over its instances can expand next. A refusal (a listing that cannot be
+        read, a file whose key cannot name a stage, a refusal of ``expansion.plan_instances``,
+        an instance whose name or output path another stage holds) fails the template with the
+        reason and adds none of its instances. When the expansion succeeds, each instance whose
+        key left the producer's listing is removed (``_remove_orphans``) before the new instances
+        are scheduled, unless the run commits nothing; a refused expansion removes nothing.
         """
         pipeline = self._require_pipeline()
         template = pipeline.get_template(name)

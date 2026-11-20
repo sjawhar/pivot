@@ -181,6 +181,37 @@ with Pipeline("p") as pipeline:
     cut(pipeline.map(plan()), pipeline.previous())
 """
 
+# _CHAIN_PIPELINE with p/cut's output incremental, as _INCREMENTAL_MAPPED_PIPELINE has it
+_INCREMENTAL_CHAIN_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, incremental, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str, previous: str) -> Annotated[str, incremental]:
+    return previous + entry
+
+
+@stage
+def build(cut: str) -> str:
+    return cut + "!"
+
+
+@stage
+def final(build: str) -> str:
+    return build + "?"
+
+
+with Pipeline("p") as pipeline:
+    final(build(cut(pipeline.map(plan()), pipeline.previous())))
+"""
+
 # _CHAIN_PIPELINE's mapped stages, each standing for its instances while not expanded
 _CHAIN_TEMPLATES = ["p/cut", "p/build", "p/final"]
 
@@ -606,60 +637,82 @@ def test_dry_run_keep_going_removes_no_instance_of_a_key_its_targets_leave_out(
     assert (root / ".pivot" / "stages" / "p" / "cut@b.lock").is_file(), "p/cut@b is kept"
 
 
-@pytest.mark.parametrize("allow", [False, True], ids=["refused", "allowed"])
-def test_dry_run_keep_going_fails_a_mapped_stage_whose_incremental_output_is_not_cached(
-    tmp_path: pathlib.Path, allow: bool
-) -> None:
-    """p/cut's instances keep an incremental output. Once p/cut@a's lock is gone, its output
-    data/p/cut@a.txt is on disk but not in the cache: the run fails p/cut with the refusal
-    ``executor.core.incremental_refusal`` gives, runs no instance and exits 1, and the dry run
-    shows p/cut as a stage that would fail, with that reason, and no instance. With
-    --allow-uncached-incremental the run expands p/cut, runs p/cut@a and skips p/cut@b, and the
-    dry run lists them so."""
+def _uncached_incremental_project(
+    tmp_path: pathlib.Path, code: str = _INCREMENTAL_MAPPED_PIPELINE
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """``code``'s p/cut instances keep an incremental output, and every stage ran; then p/cut@a's
+    lock is gone, so its output data/p/cut@a.txt is on disk but not in the cache."""
     root, home = _git_project(tmp_path)
-    (root / "pipeline.py").write_text(_INCREMENTAL_MAPPED_PIPELINE)
+    (root / "pipeline.py").write_text(code)
     _ok(helpers.run_pivot(root, home, "repro"))
     (root / ".pivot" / "stages" / "p" / "cut@a.lock").unlink()
-    flags = ["--allow-uncached-incremental"] if allow else []
+    return root, home
 
-    document, stderr = _dry_run(root, home, *flags)
-    ran, events = _run(root, home, *flags)
 
+def test_dry_run_keep_going_fails_a_mapped_stage_whose_incremental_output_is_not_cached(
+    tmp_path: pathlib.Path,
+) -> None:
+    """p/cut@a's incremental output is on disk but not in the cache: the run fails p/cut with the
+    refusal ``executor.core.incremental_refusal`` gives, runs no instance and exits 1, and the
+    dry run shows p/cut as a stage that would fail, with that reason, and no instance."""
+    root, home = _uncached_incremental_project(tmp_path)
+
+    document, stderr = _dry_run(root, home)
+    ran, events = _run(root, home)
+
+    assert ran.returncode == 1, ran.stdout + ran.stderr
     statuses = _statuses(events)
-    if allow:
-        assert ran.returncode == 0, ran.stdout + ran.stderr
-        assert statuses == {"p/plan": "cached", "p/cut@a": "ran", "p/cut@b": "cached"}
-        assert document == {
-            "stages": {
-                "p/plan": _UNCHANGED,
-                "p/cut@a": {"would_run": True, "reason": "No previous run"},
-                "p/cut@b": _UNCHANGED,
-            }
-        }, stderr
-    else:
-        assert ran.returncode == 1, ran.stdout + ran.stderr
-        assert statuses == {"p/plan": "cached", "p/cut": "failed"}, ran.stdout
-        reason = next(
-            event["reason"]
-            for event in events
-            if event["type"] == "stage_complete" and event["stage"] == "p/cut"
-        )
-        assert reason.startswith(
-            "cannot expand over the files of 'p/plan': The following incremental output files "
-            + "exist but are not in cache:\n  - p/cut@a: "
-        ), reason
-        assert "cut@a.txt\n\nRunning the pipeline will DELETE these files" in reason, reason
-        assert document == {
-            "stages": {"p/plan": _UNCHANGED, "p/cut": {"would_run": False, "reason": reason}}
-        }, stderr
+    assert statuses == {"p/plan": "cached", "p/cut": "failed"}, ran.stdout
+    reason = next(
+        event["reason"]
+        for event in events
+        if event["type"] == "stage_complete" and event["stage"] == "p/cut"
+    )
+    assert reason.startswith(
+        "cannot expand over the files of 'p/plan': The following incremental output files "
+        + "exist but are not in cache:\n  - p/cut@a: "
+    ), reason
+    assert "cut@a.txt\n\nRunning the pipeline will DELETE these files" in reason, reason
+    assert document == {
+        "stages": {"p/plan": _UNCHANGED, "p/cut": {"would_run": False, "reason": reason}}
+    }, stderr
     assert statuses.keys() == document["stages"].keys()
+
+
+def test_dry_run_keep_going_expands_a_mapped_stage_over_an_uncached_incremental_output_if_allowed(
+    tmp_path: pathlib.Path,
+) -> None:
+    """p/cut@a's incremental output is on disk but not in the cache. With
+    --allow-uncached-incremental the run expands p/cut, runs p/cut@a and skips p/cut@b, and the
+    dry run lists them so."""
+    root, home = _uncached_incremental_project(tmp_path)
+
+    document, stderr = _dry_run(root, home, "--allow-uncached-incremental")
+    ran, events = _run(root, home, "--allow-uncached-incremental")
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    statuses = _statuses(events)
+    assert statuses == {"p/plan": "cached", "p/cut@a": "ran", "p/cut@b": "cached"}, ran.stdout
+    assert document == {
+        "stages": {
+            "p/plan": _UNCHANGED,
+            "p/cut@a": {"would_run": True, "reason": "No previous run"},
+            "p/cut@b": _UNCHANGED,
+        }
+    }, stderr
+    assert statuses.keys() == document["stages"].keys()
+
+
+def _empty_cache(root: pathlib.Path) -> None:
+    """Remove every cache object."""
+    for entry in (root / ".pivot" / "cache" / "files").iterdir():
+        shutil.rmtree(entry)
 
 
 def _lose_plan_listing(root: pathlib.Path) -> None:
     """Remove every cache object and p/plan's committed listing, as a clone that never pulled
     holds neither."""
-    for entry in (root / ".pivot" / "cache" / "files").iterdir():
-        shutil.rmtree(entry)
+    _empty_cache(root)
     (root / ".pivot" / "stages" / "p" / "plan=.listing").unlink()
 
 
@@ -705,6 +758,62 @@ def test_dry_run_keep_going_leaves_a_mapped_stage_not_expanded_over_a_producer_o
     assert {registry.template_of(stage, _CHAIN_TEMPLATES) or stage for stage in statuses} == (
         stages.keys()
     )
+
+
+@pytest.mark.parametrize("refusal", ["overlap", "uncached-incremental"])
+def test_dry_run_keep_going_fails_a_mapped_stage_over_a_producer_only_pullable(
+    tmp_path: pathlib.Path, refusal: str
+) -> None:
+    """p/plan's lock matches, but its directory and the cache objects are gone, and its
+    committed listing stays. A remote is configured, so the dry run counts p/plan current, as a
+    pull would bring it up to date, and reads p/cut's keys from that listing. The run never
+    pulls: it runs p/plan again and plans p/cut over the keys p/plan writes, the ones that
+    listing gives. In `overlap` data/p/cut@a.txt, p/cut@a's output, is a missing tracked file
+    with no cache object; in `uncached-incremental` p/cut@a's incremental output is on disk but
+    not in the cache. Either way the run fails p/cut, blocks p/build and p/final and exits 1.
+    Only a listing it cannot read shows p/cut as not yet expanded, so the dry run shows p/cut as
+    a stage that would fail, with the run's reason, and p/build and p/final as blocked."""
+    if refusal == "overlap":
+        root, home = _git_project(tmp_path)
+        (root / "pipeline.py").write_text(_CHAIN_PIPELINE)
+        _ok(helpers.run_pivot(root, home, "repro"))
+        tracked = root / "data" / "p" / "cut@a.txt"
+        tracked.unlink()
+        helpers.track_without_data(tracked)
+        refused = "The following tracked files are missing:\n"
+        named = "data/p/cut@a.txt: it is output 'data/p/cut@a.txt' of stage 'p/cut@a'"
+    else:
+        root, home = _uncached_incremental_project(tmp_path, _INCREMENTAL_CHAIN_PIPELINE)
+        refused = "The following incremental output files exist but are not in cache:\n"
+        named = "  - p/cut@a: "
+    _ok(helpers.run_pivot(root, home, "config", "set", "remotes.origin", "s3://bucket/x"))
+    _empty_cache(root)
+    shutil.rmtree(root / "data" / "p" / "plan")
+
+    document, stderr = _dry_run(root, home)
+    ran, events = _run(root, home)
+
+    assert ran.returncode == 1, ran.stdout + ran.stderr
+    completed = {event["stage"]: event for event in events if event["type"] == "stage_complete"}
+    statuses = {stage: event["status"] for stage, event in completed.items()}
+    assert statuses == {
+        "p/plan": "ran",
+        "p/cut": "failed",
+        "p/build": "blocked",
+        "p/final": "blocked",
+    }, ran.stdout
+    reason = completed["p/cut"]["reason"]
+    assert reason.startswith(f"cannot expand over the files of 'p/plan': {refused}"), reason
+    assert named in reason, reason
+    assert document == {
+        "stages": {
+            "p/plan": {"would_run": True, "reason": "Outputs missing from cache"},
+            "p/cut": {"would_run": False, "reason": reason},
+            "p/build": _BLOCKED,
+            "p/final": _BLOCKED,
+        }
+    }, stderr
+    assert statuses.keys() == document["stages"].keys()
 
 
 @pytest.mark.parametrize("tree", ["listing_lost", "file_added"])
