@@ -182,8 +182,17 @@ and a thread native code starts outside `_thread`:
   dynamically. Upgrading from 0.10.4, a stage that reaches a library installed
   from git, a local directory or a local wheel or sdist gains that library's
   `dist:` key, so it reruns once as Code changed, and a stage that reaches none
-  keeps its lock; the fingerprint caches' schema goes from 43 to 45, so Pivot
-  computes each stage's manifest once more, which reruns nothing. Upgrading
+  keeps its lock, with three exceptions, each of which reruns once as Code
+  changed: a stage in a virtual environment uv built with
+  `UV_LINK_MODE=symlink`, where 0.10.4 took every library as user code; a
+  stage that reaches a file linked into `site-packages` that no editable
+  install's RECORD lists (a link you made yourself); and a stage that reads the
+  project's part of a package it shares with an installed library through the
+  package's name (`company.local.f()`), whose module Pivot now walks, so a
+  value in it that no fingerprint records refuses the stage, as it does in a
+  top-level module (`core.unsafe_fingerprinting` turns that into a warning).
+  The fingerprint caches' schema goes from 43 to 45, so Pivot computes each
+  stage's manifest once more, which reruns nothing by itself. Upgrading
   from 0.5.6 or earlier, every stage with outputs reruns
   once as Code changed, because each output's tag (`out:<key>:tag`) joined the
   manifest; that run is checked, so it marks a stage that imports dynamically.
