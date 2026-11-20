@@ -635,7 +635,7 @@ def _sent_submodules(
     submodules) that the coordinator sends with the stage (`worker.WorkerStageInfo.
     sent_submodules`), in that order, each a module its package in this process holds bound
     (`fingerprint.bound_submodule`): `sys.modules` holds it under its name, so cloudpickle never
-    pickles it as a module no process could import, and it is none an import session took out of
+    pickles it as a module no process could import, and it is not one an import session took out of
     `sys.modules` since the walk. One that cloudpickle pickles by reference
     (`loaded_source.pickled_by_value`: neither it nor a package of it is registered by value) is
     sent by its name, with no trial pickle, for the worker to import before anything of the stage

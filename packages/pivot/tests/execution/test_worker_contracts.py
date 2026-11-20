@@ -35,6 +35,8 @@ import textwrap
 import threading
 import time
 import weakref
+import zipfile
+import zipimport
 from typing import TYPE_CHECKING, Any, cast, override
 
 import joblib.parallel
@@ -279,6 +281,92 @@ def test_worker_waits_for_artifact_lock_the_coordinator_holds(
 
     assert results[0]["status"] == StageStatus.RAN, results[0]["reason"]
     assert "running" in states[states.index("waiting_on_lock") :]
+
+
+# The latin-1 source, as its coding cookie says, of a module whose import runs `raises`. In a zip,
+# `zipimporter.get_source` decodes a module's source as UTF-8, which raises `UnicodeDecodeError`
+# here, so a lookup of any line of the module raises it too.
+_LATIN_1_MODULE = "# -*- coding: latin-1 -*-\n# caf\xe9\n{raises}\n"
+
+
+@pytest.mark.parametrize(
+    ("raises", "raised"),
+    [
+        pytest.param('raise RuntimeError("boom")', "RuntimeError: boom", id="raises"),
+        pytest.param(
+            'raise RuntimeError("boom\\n")', "RuntimeError: boom", id="raises-ending-in-a-newline"
+        ),
+        pytest.param(
+            'raise RuntimeError("boom\\n  again")',
+            "RuntimeError: boom again",
+            id="raises-with-an-indented-line",
+        ),
+        pytest.param(
+            'try:\n    raise KeyError("first")\nexcept KeyError:\n    raise RuntimeError("boom")',
+            "RuntimeError: boom",
+            id="raises-while-handling-an-error",
+        ),
+    ],
+)
+def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raises: str,
+    raised: str,
+) -> None:
+    """The worker holds `sent_zipped`, a package in a zip on `sys.path`. Its submodule
+    `sent_zipped.latin`, sent by name, is latin-1 source with a coding cookie, and its import
+    raises `RuntimeError`: with the message `boom` (`raises`), `boom` and a newline
+    (`raises-ending-in-a-newline`) or `boom`, a newline and `  again`
+    (`raises-with-an-indented-line`), or with `boom` while it handles a `KeyError` it raised
+    (`raises-while-handling-an-error`). Entering `_sent_submodules_bound` logs one warning, which
+    gives the error's type and message on one line (`RuntimeError: boom`, or
+    `RuntimeError: boom again`), each line of the message stripped and no empty line joined,
+    binds nothing and does not raise. Were the warning's text built with a line of the module
+    looked up, for the error's traceback or for the error it chains, the lookup would raise
+    `UnicodeDecodeError` out of `_sent_submodules_bound`."""
+    archive = tmp_path / "lib.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("sent_zipped/__init__.py", "")
+        zf.writestr("sent_zipped/latin.py", _LATIN_1_MODULE.format(raises=raises).encode("latin-1"))
+    # zipimport keeps each archive's directory by its path; the test's archive leaves none there.
+    monkeypatch.setattr(zipimport, "_zip_directory_cache", {})
+    monkeypatch.syspath_prepend(str(archive))
+    spec = importlib.util.find_spec("sent_zipped")
+    assert spec is not None and spec.loader is not None
+    package = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "sent_zipped", package)
+    spec.loader.exec_module(package)
+
+    escaped = None
+    with caplog.at_level(logging.WARNING, logger=worker.logger.name):
+        # An error that leaves the context manager is recorded, not raised: pytest's report of it
+        # would look up the module's line, through the error it chains, and raise again.
+        try:
+            with worker._sent_submodules_bound(["sent_zipped.latin"]):
+                pass
+        except Exception as exc:
+            escaped = f"{type(exc).__name__}: {exc}"
+
+    assert (
+        escaped,
+        [(record.levelno, record.getMessage()) for record in caplog.records],
+        "latin" in vars(package),
+        "sent_zipped.latin" in sys.modules,
+    ) == (
+        None,
+        [
+            (
+                logging.WARNING,
+                "Could not import module 'sent_zipped.latin', which the stage reads through its "
+                + f"package: {raised}. The module is not bound on its package, so code that "
+                + "reads it through the package fails.",
+            )
+        ],
+        False,
+        False,
+    )
 
 
 # =============================================================================
