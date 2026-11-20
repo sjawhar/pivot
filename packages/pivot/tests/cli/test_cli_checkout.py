@@ -696,16 +696,7 @@ def test_checkout_force_reads_a_whole_tree_where_the_restore_starts_from_it(
         (images / "b.txt").write_text("b")
         tracking = runner.invoke(cli.cli, ["track", "images"])
         assert tracking.exit_code == 0, tracking.output
-        helpers.cache_whole_tree(cwd, {"a.txt": "a", "b.txt": "b"})
-        files = cwd / ".pivot" / "cache" / "files"
-        record = track.read_pvt_file(track.get_pvt_path(images))
-        assert record is not None
-        b_hash = next(
-            entry["hash"]
-            for entry in track.tracked_members(images, record, files)["files"]
-            if entry["relpath"] == "b.txt"
-        )
-        cache.get_cache_path(files, b_hash).unlink()
+        b_hash = helpers.cache_whole_tree_lacking(cwd, images, "b.txt")
         if refused:
             helpers.register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
         before = sorted(path.relative_to(cwd).as_posix() for path in images.rglob("*"))
@@ -722,7 +713,10 @@ def test_checkout_force_reads_a_whole_tree_where_the_restore_starts_from_it(
         else:
             assert result.exit_code == 0, result.output
             assert "Restored 2 file(s)" in result.output
-            assert images.resolve() == cache.tree_path(files, record["hash"]).resolve()
+            record = track.read_pvt_file(track.get_pvt_path(images))
+            assert record is not None
+            tree = cache.tree_path(cwd / ".pivot" / "cache" / "files", record["hash"])
+            assert images.resolve() == tree.resolve()
 
 
 # =============================================================================

@@ -173,17 +173,20 @@ def check_tracked(
 
     The restore's own source (``_source``) must be found: an unavailable listing fails, a
     missing one is absent. The restore must be able to read each cache object it links, as it
-    checks them out with ``checkout_modes``: the rule a forced checkout uses
-    (``cache.missing_cache_objects``) finds none absent and opens each one for reading, as the
-    checkout opens it; an ``OSError`` from that lookup or open (an object or a directory of the
-    cache this user cannot read) fails it, with the warning the restore gives for the error. A
-    symlink restore of a directory whose whole tree the cache holds opens none. And the restore
-    must be able to write the path (``_write_failure``): one that starts from the cache's whole
-    tree of a directory makes the directory that holds the path before it reads the tree or
-    looks up any member's object, so that is checked first (``_tree_start_failure``); one that
-    links that tree as it is, into an existing directory it cannot write in, fails at the link
-    and looks each member's object up before it restores file by file
-    (``_tree_link_fails``), so a member the cache lacks makes it absent there, with no warning.
+    checks them out with ``checkout_modes``, by the rule a forced checkout uses
+    (``cache.missing_cache_objects``): where it links no whole tree of a directory as it is
+    (``cache.linked_tree``, as a restore that records what it writes finds it), each object is
+    found (``cache.missing_linked_objects``) and opened for reading, as the checkout opens it;
+    an ``OSError`` from that lookup or open (an object or a directory of the cache this user
+    cannot read) fails it, with the warning the restore gives for the error. A symlink restore
+    of a directory whose whole tree the cache holds opens none. And the restore must be able to
+    write the path (``_write_failure``): one that starts from the cache's whole tree of a
+    directory makes the directory that holds the path before it reads the tree or looks up any
+    member's object, so that is checked first (``_tree_start_failure``); one that links that
+    tree as it is, into an existing directory it cannot write in
+    (``state_dir.nearest_entry_problem``), fails at the link and looks each member's object up
+    before it restores file by file, so a member the cache lacks makes it absent there, with no
+    warning.
 
     With ``links_refused`` (``naming.register_refuses_links``: the run's registration refuses
     links into the cache), the restore checks every object out as ``cache.refused_link_modes``
@@ -208,11 +211,23 @@ def check_tracked(
         failed = _tree_start_failure(path, source, cache_dir, modes)
         if failed is not None:
             return failed
-        absent = cache.missing_cache_objects(
-            source.hash, source.members, cache_dir, modes, readable=True
+        tree = (
+            cache.linked_tree(source.hash, source.members, cache_dir, modes, stat_files=True)
+            if types.is_dir_hash(source.hash) and source.members is not None
+            else None
         )
-        if not absent and _tree_link_fails(path, source, cache_dir, modes):
+        if tree is None:
+            absent = cache.missing_linked_objects(
+                source.hash, source.members, cache_dir, readable=True
+            )
+        elif state_dir_mod.nearest_entry_problem(path.parent) is not None:
+            # The tree's link into a directory it cannot write in fails: the restore then looks
+            # each member's object up, and one the cache lacks makes it absent; else it restores
+            # file by file and fails to stage the directory there (``_write_failure``)
             absent = cache.missing_linked_objects(source.hash, source.members, cache_dir)
+        else:
+            # The restore links the whole tree as it is, opening no object
+            absent = list[str]()
     except OSError as e:
         _warn_failed(path, e)
         return Check(Outcome.FAILED, set())
@@ -318,33 +333,6 @@ def _tree_start_failure(
     ):
         return None
     return _write_failure(path)
-
-
-def _tree_link_fails(
-    path: pathlib.Path,
-    source: _Source,
-    cache_dir: pathlib.Path,
-    checkout_modes: list[cache.CheckoutMode],
-) -> bool:
-    """Whether the restore of missing tracked directory ``path`` from ``source`` with
-    ``checkout_modes``, the modes its checkout uses, links the cache's whole tree of it as it
-    is (``cache.linked_tree``, as a restore that records what it writes finds it) into an
-    existing directory that holds ``path`` and that it cannot write in
-    (``state_dir.nearest_entry_problem``; a missing one the restore makes, where it can write,
-    else it fails first, ``_tree_start_failure``). The link fails there; the restore then looks
-    each member's object up (``cache.missing_linked_objects``), and one the cache lacks makes
-    it absent, else it restores file by file and fails to stage the directory there
-    (``_write_failure``). An ``OSError`` of the tree's lookup is raised, as the restore meets
-    it."""
-    return (
-        types.is_dir_hash(source.hash)
-        and source.members is not None
-        and state_dir_mod.nearest_entry_problem(path.parent) is not None
-        and cache.linked_tree(
-            source.hash, source.members, cache_dir, checkout_modes, stat_files=True
-        )
-        is not None
-    )
 
 
 def _write_failure(path: pathlib.Path) -> Check | None:

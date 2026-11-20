@@ -47,7 +47,11 @@ _SEEDS_VARIABLE = "PIVOT_DIFFERENTIAL_SEEDS"
 # (``test_dry_run_keep_going_fixed_seeds_cover_every_kind``), with the seeds that found the
 # disagreements this test was written for. Since cases compose across pipelines
 # (``_compose_across``), seeds 14, 76, 80 and 1126 generate composed cases, not the ones they were
-# pinned for
+# pinned for. 14, 76 and 80 were pinned for kinds of case that the coverage test still requires
+# of these seeds between them, so it fails if no seed generates one any more. 1126 was pinned,
+# with 435 and 480, for the pulled producer below; after cases composed, each of the three was
+# run again with the dry run's fix for that disagreement undone and still disagreed, so 1126
+# still pins it
 _FIXED_SEEDS = (
     *(4, 13, 14, 18, 39, 48, 52, 61, 76, 80, 106, 117, 193, 380, 522, 729),
     # A pulled producer whose directory a --no-commit dry run read

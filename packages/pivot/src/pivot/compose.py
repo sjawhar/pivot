@@ -1385,32 +1385,20 @@ class Pipeline:
         return reads
 
     def _upstream_closure(self) -> list[tuple[Pipeline, _StageNode]]:
-        """The stages of other pipelines that this pipeline's stages read, directly or through
-        each other, each after every stage it reads.
-
-        They are registered in this order, the order the pipeline lists them in (``list_stages``,
-        ``list_templates``); ``expansion.expand_current`` takes each template after the ones it
-        is mapped over whatever that order is. A depth-first walk from each of this pipeline's
-        stages, through the stages each reads in ``_iter_stage_handles`` order (single-handle
-        inputs, then list inputs), adds a stage once every stage it reads is added: the same
-        order on every load. A stage of this pipeline that one of them reads is not walked; it is
-        registered with this pipeline's own stages, after them.
-        """
+        """Collect foreign stages reachable from this pipeline's handles via DFS."""
         visited = set[int]()
         result = list[tuple[Pipeline, _StageNode]]()
-        roots = [read for node in self._stages for read in self._foreign_reads(node)]
-        # (stage, False): a stage to walk; (stage, True): one whose reads are all added
-        stack = [(read, False) for read in reversed(roots)]
+        stack = [read for node in self._stages for read in self._foreign_reads(node)]
+
         while stack:
-            (foreign_pipeline, stage_node), walked = stack.pop()
-            if walked:
-                result.append((foreign_pipeline, stage_node))
+            foreign_pipeline, stage_node = stack.pop()
+            node_id = id(stage_node)
+            if node_id in visited:
                 continue
-            if id(stage_node) in visited:
-                continue
-            visited.add(id(stage_node))
-            stack.append(((foreign_pipeline, stage_node), True))
-            stack.extend((read, False) for read in reversed(self._foreign_reads(stage_node)))
+            visited.add(node_id)
+            result.append((foreign_pipeline, stage_node))
+            stack.extend(self._foreign_reads(stage_node))
+
         return result
 
     def _merge_foreign_input_bindings(

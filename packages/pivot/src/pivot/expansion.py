@@ -19,7 +19,6 @@ it. A template that does not expand removes nothing, since no plan is known for 
 
 from __future__ import annotations
 
-import heapq
 import pathlib
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
@@ -459,40 +458,24 @@ def expand_current(
 
 
 def _mapped_order(pipeline: registry.PipelineLike) -> list[str]:
-    """The templates of ``pipeline``, each after every template it is mapped over (its
-    ``mapped_deps``), the order a run expands them in: a pipeline can hold a template before
-    the one it is mapped over (one re-entered with ``with`` registers the stages it reads from
-    another pipeline before its own). Of the templates this order lets come next, the first
-    the pipeline holds comes first, so a pipeline that holds each after the ones it is mapped
-    over keeps its order."""
+    """The templates of ``pipeline`` in an order a run could expand them in: each after every
+    template it is mapped over (its ``mapped_deps``). Of the templates that can come next, the
+    one the pipeline holds first comes first."""
+    import networkx as nx
+
     names = pipeline.list_templates()
     position = {name: index for index, name in enumerate(names)}
-    # The templates each one is mapped over that it still waits for; one the pipeline lacks
-    # never expands, so neither does its reader, which reports it (``expand_current``)
-    waiting = {
-        name: {
-            upstream
-            for upstream in pipeline.get_template(name)["mapped_deps"].values()
-            if upstream is not None and upstream in position
-        }
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    graph.add_nodes_from(names)
+    # A template the pipeline lacks never expands, so neither does its reader, which reports it
+    # (``expand_current``)
+    graph.add_edges_from(
+        (upstream, name)
         for name in names
-    }
-    readers = {name: list[str]() for name in names}
-    for name, upstreams in waiting.items():
-        for upstream in upstreams:
-            readers[upstream].append(name)
-    # The positions of the templates that wait for none, the first the pipeline holds on top
-    ready = [position[name] for name in names if not waiting[name]]
-    order = list[str]()
-    while ready:
-        name = names[heapq.heappop(ready)]
-        order.append(name)
-        for reader in readers[name]:
-            waiting[reader].discard(name)
-            if not waiting[reader]:
-                heapq.heappush(ready, position[reader])
-    assert len(order) == len(names), "a template is mapped over instances built before it"
-    return order
+        for upstream in pipeline.get_template(name)["mapped_deps"].values()
+        if upstream is not None and upstream in position
+    )
+    return list(nx.lexicographical_topological_sort(graph, key=position.__getitem__))
 
 
 def _in_order(result: Expansion, names: list[str]) -> Expansion:

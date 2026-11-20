@@ -1698,10 +1698,11 @@ def _repair_tree_dir_layout(
     ``members`` records. ``scanned`` is ``_scan_entries(cache_dir_path)``.
 
     A repair killed midway leaves a temporary file in a tree. The tree's name never changes, so
-    neither _store_directory's ``not cache_dir_path.exists()`` branch nor the symlink_fast_path
-    restore would otherwise revisit it, and an output restored through it would not hash to the
-    hash it was restored for. Changing the tree in place is safe for the reason
-    ``_repair_tree_dir_isexec`` gives; the caller holds the tree's lock.
+    neither _store_directory's ``not cache_dir_path.exists()`` branch nor a restore that links
+    the tree (``_restore_directory_from_cache``) would otherwise revisit it, and an output
+    restored through it would not hash to the hash it was restored for. Changing the tree in
+    place is safe for the reason ``_repair_tree_dir_isexec`` gives; the caller holds the tree's
+    lock.
     """
     found_files, found = scanned
     found_dirs = set(found)
@@ -1934,8 +1935,6 @@ def missing_cache_objects(
     members: listing.DirListing | None,
     cache_dir: pathlib.Path,
     checkout_modes: list[CheckoutMode],
-    *,
-    readable: bool = False,
 ) -> list[str]:
     """Return hashes required to restore an output that are absent from the cache.
 
@@ -1947,23 +1946,15 @@ def missing_cache_objects(
     object is looked up as a restore that links no whole tree looks it up
     (``missing_linked_objects``): so where links are refused and COPY is among the modes, each
     member is looked up, as the restore that copies it does.
-
-    With ``readable``, each object found is also opened for reading, as every checkout of it
-    opens it (a copy reads it, and a link's staged entry is opened through it,
-    ``_fstat_staged``), and an ``OSError`` that open gives is raised, as one the lookup gives is
-    (``_is_cache_object_path``): the restore would fail on it. A whole-directory tree it trusts
-    is linked as it is, opening no object, once each of its files is stat'd as a recording
-    restore stats them (``linked_tree``'s ``stat_files``); a file that cannot be stat'd sends
-    that restore file by file, so then each object is looked up and opened as above.
     """
     if is_dir_hash(output_hash):
         assert members is not None, "a directory is restored from its listing"
         if (
-            linked_tree(output_hash, members, cache_dir, checkout_modes, stat_files=readable)
+            linked_tree(output_hash, members, cache_dir, checkout_modes, stat_files=False)
             is not None
         ):
             return []
-    return missing_linked_objects(output_hash, members, cache_dir, readable=readable)
+    return missing_linked_objects(output_hash, members, cache_dir)
 
 
 def missing_linked_objects(
@@ -1976,9 +1967,11 @@ def missing_linked_objects(
     """Return the hashes of the objects absent from the cache that a restore of an output
     checks out one by one, as it does where it links no whole-directory tree: a file's object,
     or, for a directory, the object of each file of its listing ``members``. Each is looked up
-    as that restore looks it up (``resolve_cache_object_path``); with ``readable``, each one
-    found is also opened for reading, as ``missing_cache_objects`` says. An ``OSError`` of the
-    lookup or the open is raised."""
+    as that restore looks it up (``resolve_cache_object_path``). With ``readable``, each one
+    found is also opened for reading, as every checkout of it opens it (a copy reads it, and a
+    link's staged entry is opened through it, ``_fstat_staged``): the restore would fail on an
+    ``OSError`` that open gives, as on one the lookup gives (``_is_cache_object_path``). An
+    ``OSError`` of the lookup or the open is raised."""
     if is_dir_hash(output_hash):
         assert members is not None, "a directory is restored from its listing"
         hashes = [entry["hash"] for entry in members["files"]]
@@ -2511,8 +2504,7 @@ def _restore_directory_from_cache(
     """Restore a directory atomically. ``recorded`` is as ``restore_from_cache`` says: each
     file's stat is taken in the tree or staging directory, before the swap puts it in place."""
     cache_dir_path = restore_tree(output_hash, cache_dir, checkout_modes)
-    symlink_fast_path = cache_dir_path is not None
-    if not symlink_fast_path:
+    if cache_dir_path is None:
         for entry in members["files"]:
             if resolve_cache_object_path(cache_dir, entry["hash"]) is None:
                 return False
@@ -2539,10 +2531,8 @@ def _restore_directory_from_cache(
         _cleanup_fresh_restore_orphans(path, target_token, before_swap)
     restore_prefix = f"{_RESTORE_TEMP_PREFIX}{target_token}."
 
-    if (
-        cache_dir_path is not None
-        and symlink_fast_path
-        and not _ensure_tree_complete(cache_dir_path, members, cache_dir, repair=False)
+    if cache_dir_path is not None and not _ensure_tree_complete(
+        cache_dir_path, members, cache_dir, repair=False
     ):
         # This is the same content check as _store_directory, but a restore never repairs.
         # A tree that does not match its canonical marker is restored file by file when its
@@ -2553,13 +2543,12 @@ def _restore_directory_from_cache(
             cache_dir_path,
             path,
         )
-        symlink_fast_path = False
+        cache_dir_path = None
         for entry in members["files"]:
             if resolve_cache_object_path(cache_dir, entry["hash"]) is None:
                 return False
 
-    if symlink_fast_path:
-        assert cache_dir_path is not None
+    if cache_dir_path is not None:
         temp_symlink = path.parent / f"{restore_prefix}symlink_{secrets.token_hex(4)}"
         try:
             tree_files = (

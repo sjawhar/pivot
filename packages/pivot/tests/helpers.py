@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     import click.testing
 
     from pivot.registry import PipelineLike
+    from pivot.storage import listing
 
 DepValue = compose.ArtifactHandle | str | list[compose.ArtifactHandle]
 
@@ -102,20 +103,39 @@ def track_then_remove(runner: click.testing.CliRunner, root: pathlib.Path, name:
     cache.remove_output(root / name)
 
 
-def cache_whole_tree(root: pathlib.Path, files: Mapping[str, str]) -> None:
-    """Put in the cache of the project at ``root`` the whole-directory tree of a directory holding
-    ``files`` (each relpath with its text), complete and marked, as a SYMLINK commit of a stage
-    output with the same files leaves it."""
+def cache_whole_tree(root: pathlib.Path, tracked: pathlib.Path) -> listing.DirListing:
+    """Put in the cache of the project at ``root`` the whole-directory tree of tracked directory
+    ``tracked``, complete and marked, as a SYMLINK commit of a stage output with the same files
+    leaves it: the files its ``.pvt`` record lists, built from their cache objects, which hash to
+    that record. Returns the record's listing."""
+    files = root / ".pivot" / "cache" / "files"
+    record = track.read_pvt_file(track.get_pvt_path(tracked))
+    assert record is not None
+    members = track.tracked_members(tracked, record, files)
     twin = root / "twin"
     twin.mkdir()
-    for relpath, text in files.items():
-        (twin / relpath).write_text(text)
-    cache.save_to_cache(
-        twin,
-        root / ".pivot" / "cache" / "files",
-        checkout_modes=[cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY],
+    for entry in members["files"]:
+        member = twin / entry["relpath"]
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_bytes(cache.get_cache_path(files, entry["hash"]).read_bytes())
+        member.chmod(0o755 if entry["isexec"] else 0o644)
+    for relpath in members["empty_dirs"]:
+        (twin / relpath).mkdir(parents=True)
+    saved = cache.save_to_cache(
+        twin, files, checkout_modes=[cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
     )
+    assert saved == track.pvt_to_hash_info(record), "the tree is the tracked directory's"
     twin.unlink()
+    return members
+
+
+def cache_whole_tree_lacking(root: pathlib.Path, tracked: pathlib.Path, relpath: str) -> str:
+    """``cache_whole_tree`` of tracked directory ``tracked`` in the project at ``root``, then the
+    cache object of its member ``relpath`` removed. Returns that object's hash."""
+    members = cache_whole_tree(root, tracked)
+    member_hash = next(entry["hash"] for entry in members["files"] if entry["relpath"] == relpath)
+    cache.get_cache_path(root / ".pivot" / "cache" / "files", member_hash).unlink()
+    return member_hash
 
 
 def register_on_a_read_only_mount(

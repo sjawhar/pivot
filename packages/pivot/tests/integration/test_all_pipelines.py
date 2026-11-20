@@ -742,8 +742,7 @@ def _helper_images_tree_project(
     images = root / "data" / "raw" / "images"
     record = track.read_pvt_file(track.get_pvt_path(images))
     assert record is not None
-    helpers.cache_whole_tree(root, {"a.png": "a"})
-    member_hash = track.tracked_members(images, record, files)["files"][0]["hash"]
+    member_hash = helpers.cache_whole_tree(root, images)["files"][0]["hash"]
     return images, cache.tree_path(files, record["hash"]), cache.get_cache_path(files, member_hash)
 
 

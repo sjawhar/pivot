@@ -457,14 +457,8 @@ def _get_explanations(
     )
     kept = expansion.without_templates(result, plan.left_out)
     # The run's own execution order for its targets, which the orphans it removes and, in
-    # leave-out mode, the stages shown for its targets both follow. Nothing reads it otherwise:
-    # a run that commits nothing removes no orphan, and only leave-out mode with targets shows
-    # its stages by it (``_scheduled``)
-    order = (
-        cli_helpers.run_order(plan.targets, plan.stages)
-        if not no_commit or (leave_out and plan.targets is not None)
-        else list[str]()
-    )
+    # leave-out mode, the stages shown for its targets both follow
+    order = cli_helpers.run_order(plan.targets, plan.stages)
     removing = (
         []
         if no_commit

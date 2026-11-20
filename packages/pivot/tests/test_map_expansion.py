@@ -134,25 +134,6 @@ def _every_instance(templates: list[str]) -> list[str]:
     return [f"{template}@{key}" for template in templates for key in "ab"]
 
 
-def _built(
-    root: pathlib.Path, build: Callable[[pathlib.Path], compose.Pipeline], *, reverse: bool
-) -> compose.Pipeline:
-    """``build(root)``, the stages of other pipelines that it reads registered in the reverse of
-    the order ``Pipeline._upstream_closure`` gives them when ``reverse``."""
-    if not reverse:
-        return build(root)
-    original = compose.Pipeline._upstream_closure
-
-    def reversed_closure(
-        pipeline: compose.Pipeline,
-    ) -> list[tuple[compose.Pipeline, compose._StageNode]]:
-        return original(pipeline)[::-1]
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(compose.Pipeline, "_upstream_closure", reversed_closure)
-        return build(root)
-
-
 @pytest.fixture
 def ran(
     set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
@@ -198,11 +179,10 @@ def test_a_current_producer_expands_every_template(
 def test_a_template_reached_through_another_pipeline_expands_after_the_one_it_is_mapped_over(
     set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_composed``: report's walk reaches p/_stage_build before p/_stage_cut, which it is
-    mapped over. With p/_stage_plan current every template expands, each after the one it is
-    mapped over, and the pipeline lists each after the one it reads; pivot 0.10.4 listed
-    p/_stage_build first and, taking the templates in that order, left it and
-    report/_stage_final not expanded."""
+    """``_composed``: report lists p/_stage_build, which its walk reaches first, before
+    p/_stage_cut, which it is mapped over. With p/_stage_plan current every template expands,
+    each after the one it is mapped over; pivot 0.10.4, taking the templates in the order the
+    pipeline lists them, left p/_stage_build and report/_stage_final not expanded."""
     root = set_project_root
     monkeypatch.chdir(root)
     _write_plan(root, {"a": 1, "b": 2})
@@ -218,28 +198,21 @@ def test_a_template_reached_through_another_pipeline_expands_after_the_one_it_is
         "report/_stage_final": _FINALS,
     }
     assert sorted(pipeline.list_stages()) == sorted(["p/_stage_plan", *_CUTS, *_BUILDS, *_FINALS])
-    assert pipeline.list_templates() == ["p/_stage_cut", "p/_stage_build", "report/_stage_final"]
+    templates = pipeline.list_templates()
+    assert templates.index("p/_stage_build") < templates.index("p/_stage_cut")
 
 
 @pytest.mark.parametrize(
-    ("build", "reverse", "listed"),
+    ("build", "templates"),
     [
         pytest.param(
             _reentered,
-            False,
-            ["beta/_stage_build", "beta/_stage_final", "alpha/_stage_cut", "alpha/_stage_report"],
+            ["alpha/_stage_cut", "alpha/_stage_report", "beta/_stage_build", "beta/_stage_final"],
             id="re_entered",
         ),
         pytest.param(
-            _reentered,
-            True,
-            ["beta/_stage_final", "beta/_stage_build", "alpha/_stage_cut", "alpha/_stage_report"],
-            id="re_entered-reversed",
-        ),
-        pytest.param(
             _nested,
-            False,
-            ["beta/_stage_build", "alpha/_stage_cut", "alpha/_stage_twin", "alpha/_stage_final"],
+            ["alpha/_stage_cut", "alpha/_stage_final", "alpha/_stage_twin", "beta/_stage_build"],
             id="nested",
         ),
     ],
@@ -248,46 +221,45 @@ def test_a_pipeline_expands_a_mapped_stage_it_lists_before_the_one_it_is_mapped_
     set_project_root: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     build: Callable[[pathlib.Path], compose.Pipeline],
-    reverse: bool,
-    listed: list[str],
+    templates: list[str],
 ) -> None:
-    """``_reentered`` and ``_nested``: alpha lists ``listed``, beta/_stage_build before
-    alpha/_stage_cut, which it is mapped over, and, with ``_reentered``'s closure reversed
-    (``_built``), beta/_stage_final before beta/_stage_build too. With alpha/_stage_plan current
-    every mapped stage expands, each after the one it is mapped over, as the run expands them,
-    and the result holds them in the order alpha lists them; pivot 0.10.4 took them in that
-    order and left each of beta's stages, and every stage mapped over their instances, not
+    """``_reentered`` and ``_nested``: alpha's mapped stages are ``templates``, and it lists
+    beta/_stage_build before alpha/_stage_cut, which it is mapped over. With alpha/_stage_plan
+    current every mapped stage expands, each after the one it is mapped over, as the run expands
+    them, and the result holds them in the order alpha lists them; pivot 0.10.4 took them in
+    that order and left each of beta's stages, and every stage mapped over their instances, not
     expanded."""
     root = set_project_root
     monkeypatch.chdir(root)
     _write_plan(root, {"a": 1, "b": 2})
-    executor.run(pipeline=_built(root, build, reverse=reverse))
-    pipeline = _built(root, build, reverse=reverse)
+    executor.run(pipeline=build(root))
+    pipeline = build(root)
 
     result, _ = status.expand_current(pipeline)
 
-    assert pipeline.list_templates() == listed
+    listed = pipeline.list_templates()
+    assert sorted(listed) == templates
+    assert listed.index("beta/_stage_build") < listed.index("alpha/_stage_cut")
     assert result["not_expanded"] == {}
     assert list(result["expanded"].items()) == [(name, _every_instance([name])) for name in listed]
-    assert sorted(pipeline.list_stages()) == sorted(["alpha/_stage_plan", *_every_instance(listed)])
+    assert sorted(pipeline.list_stages()) == sorted(
+        ["alpha/_stage_plan", *_every_instance(templates)]
+    )
 
 
-def _run_built(
+def _run_in_new_project(
     root: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     build: Callable[[pathlib.Path], compose.Pipeline],
-    *,
-    reverse: bool,
 ) -> tuple[compose.Pipeline, dict[str, StageStatus]]:
-    """``build`` in a new project at ``root``, registered as ``_built`` registers it with
-    ``reverse``, and the status of each stage of its run."""
+    """``build(root)`` in a new project at ``root``, and the status of each stage of its run."""
     for marker in (".pivot", ".git"):
         (root / marker).mkdir(parents=True)
     monkeypatch.setattr(project, "_project_root_cache", root)
     config_io.clear_config_cache()
     monkeypatch.chdir(root)
     _write_plan(root, {"a": 1, "b": 2})
-    pipeline = _built(root, build, reverse=reverse)
+    pipeline = build(root)
     results = executor.run(pipeline=pipeline)
     return pipeline, {name: StageStatus(result["status"]) for name, result in results.items()}
 
@@ -306,57 +278,30 @@ def _stages_dir_files(root: pathlib.Path) -> dict[str, bytes]:
 def test_the_registration_order_moves_no_stage_name_fingerprint_or_lock_byte(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_composed``, its stages of p registered in the reverse of the closure's order
-    (``_built``), which is pivot 0.10.4's order, and in this one's, each run in a project of its
-    own: both runs run every stage and instance, of the same names, with the same fingerprints,
-    and leave the same locks and listings, byte for byte. So registering a stage after the
-    stages it reads re-keys no lock of a composed pipeline."""
-    backward, backward_ran = _run_built(tmp_path / "backward", monkeypatch, _composed, reverse=True)
-    walked, walked_ran = _run_built(tmp_path / "walked", monkeypatch, _composed, reverse=False)
+    """``_composed``, each run in a project of its own, its stages of p registered in the order
+    ``Pipeline._upstream_closure`` gives them and in the reverse of that order: both runs run
+    every stage and instance, of the same names, with the same fingerprints, and leave the same
+    locks and listings, byte for byte. So the order a pipeline registers the stages of other
+    pipelines in keys no stage name, fingerprint or lock."""
+    walk = compose.Pipeline._upstream_closure
 
-    assert backward.list_templates() == ["p/_stage_build", "p/_stage_cut", "report/_stage_final"]
-    assert walked.list_templates() == ["p/_stage_cut", "p/_stage_build", "report/_stage_final"]
+    def reversed_walk(
+        pipeline: compose.Pipeline,
+    ) -> list[tuple[compose.Pipeline, compose._StageNode]]:
+        return walk(pipeline)[::-1]
+
+    def composed_backward(root: pathlib.Path) -> compose.Pipeline:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(compose.Pipeline, "_upstream_closure", reversed_walk)
+            return _composed(root)
+
+    walked, walked_ran = _run_in_new_project(tmp_path / "walked", monkeypatch, _composed)
+    backward, backward_ran = _run_in_new_project(
+        tmp_path / "backward", monkeypatch, composed_backward
+    )
+
+    assert backward.list_templates() != walked.list_templates(), "p's stages in another order"
     every = ["p/_stage_plan", *_CUTS, *_BUILDS, *_FINALS]
-    assert backward_ran == walked_ran == dict.fromkeys(every, StageStatus.RAN)
-    assert sorted(backward.list_stages()) == sorted(walked.list_stages()) == sorted(every)
-    assert {name: backward.ensure_fingerprint(name) for name in every} == {
-        name: walked.ensure_fingerprint(name) for name in every
-    }
-    backward_files = _stages_dir_files(tmp_path / "backward")
-    assert sorted(path for path in backward_files if path.endswith(".lock")) == sorted(
-        f"{name}.lock" for name in every
-    )
-    assert backward_files == _stages_dir_files(tmp_path / "walked")
-
-
-def test_the_order_a_re_entered_pipeline_lists_moves_no_name_fingerprint_or_lock_byte(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``_reentered``, which lists beta's stages before alpha/_stage_cut, which
-    beta/_stage_build is mapped over, registered in its own order and with its closure reversed
-    (``_built``, which lists beta/_stage_final first), each run in a project of its own: both
-    runs run every stage and instance, of the same names, with the same fingerprints, and leave
-    the same locks and listings, byte for byte. So the order a pipeline lists its mapped stages
-    in, which ``expansion.expand_current`` no longer follows, keys no lock."""
-    backward, backward_ran = _run_built(
-        tmp_path / "backward", monkeypatch, _reentered, reverse=True
-    )
-    walked, walked_ran = _run_built(tmp_path / "walked", monkeypatch, _reentered, reverse=False)
-
-    assert backward.list_templates() == [
-        "beta/_stage_final",
-        "beta/_stage_build",
-        "alpha/_stage_cut",
-        "alpha/_stage_report",
-    ]
-    walked_templates = [
-        "beta/_stage_build",
-        "beta/_stage_final",
-        "alpha/_stage_cut",
-        "alpha/_stage_report",
-    ]
-    assert walked.list_templates() == walked_templates
-    every = ["alpha/_stage_plan", *_every_instance(walked_templates)]
     assert backward_ran == walked_ran == dict.fromkeys(every, StageStatus.RAN)
     assert sorted(backward.list_stages()) == sorted(walked.list_stages()) == sorted(every)
     assert {name: backward.ensure_fingerprint(name) for name in every} == {

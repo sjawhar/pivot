@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, cast
 
 from pivot import cli, project, types
 from pivot.remote import sync as transfer
-from pivot.storage import cache, track
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -226,16 +225,7 @@ def test_get_downloads_a_member_a_whole_tree_holds_where_links_are_refused(
     (images / "b.txt").write_text("b")
     helpers.track_then_remove(runner, repo_path, "images")
     sha = commit("track images")
-    helpers.cache_whole_tree(repo_path, {"a.txt": "a", "b.txt": "b"})
-    files = repo_path / ".pivot" / "cache" / "files"
-    record = track.read_pvt_file(track.get_pvt_path(images))
-    assert record is not None
-    b_hash = next(
-        entry["hash"]
-        for entry in track.tracked_members(images, record, files)["files"]
-        if entry["relpath"] == "b.txt"
-    )
-    cache.get_cache_path(files, b_hash).unlink()
+    b_hash = helpers.cache_whole_tree_lacking(repo_path, images, "b.txt")
     remote = _ObjectRemote({b_hash: b"b"})
 
     def open_remote(name: str | None) -> tuple[RemoteStorage, str]:
