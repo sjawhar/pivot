@@ -8,6 +8,15 @@ other one, and an edit to the project's file would read `cached`. Fingerprinting
 (`loaded_source.check_worker_imports`): a cheap prediction, confirmed in a new interpreter
 started as a worker starts before it raises.
 
+A submodule the program holds bound on a library package, which a stage reads through the
+package's name, is what the walk follows and records, so that the coordinator sends it with the
+stage where it pickles alone, for its worker to bind on the package (`fingerprint.bound_submodule`,
+`fingerprint.read_submodules`): a plain module with a source file, or a namespace package of the
+project's, that `sys.modules` holds under its name, re-read on a manifest cache hit, and, for a
+`@no_fingerprint` stage, found by a scan of the stage's own code. Discovery registers every module
+under the project root for pickling by value, the project's part of a library's package too, as
+pivot 0.10.4 does (`discovery._track_root_modules`).
+
 Each test names its modules uniquely: the test process puts `packages/pivot/tests` (with its own
 `helpers.py`) on `sys.path`.
 """
@@ -15,6 +24,7 @@ Each test names its modules uniquely: the test process puts `packages/pivot/test
 from __future__ import annotations
 
 import email.mime.text
+import functools
 import importlib.machinery
 import importlib.util
 import json
@@ -24,18 +34,22 @@ import pathlib
 import re
 import subprocess
 import sys
+import threading
+import types
 import uuid
 from typing import TYPE_CHECKING
 
+import cloudpickle
 import pytest
 import yaml
 from tests import helpers
 
 from pivot import discovery, exceptions, executor, fingerprint, loaded_source, project
+from pivot.executor import core as executor_core
+from pivot.storage import store as store_mod
 
 if TYPE_CHECKING:
-    import types
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Sequence
 
     from pytest_mock import MockerFixture
 
@@ -68,12 +82,13 @@ def _held(
 
 
 def _held_namespace(
-    name: str, directory: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    name: str, directories: Sequence[pathlib.Path], monkeypatch: pytest.MonkeyPatch
 ) -> types.ModuleType:
-    """A namespace package `name` whose one portion is `directory`, held in `sys.modules`."""
-    directory.mkdir(parents=True, exist_ok=True)
+    """A namespace package `name` whose portions are `directories`, held in `sys.modules`."""
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
     spec = importlib.machinery.ModuleSpec(name, None, is_package=True)
-    spec.submodule_search_locations = [str(directory)]
+    spec.submodule_search_locations = [str(directory) for directory in directories]
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     return module
@@ -86,21 +101,6 @@ def _resolved(path: pathlib.Path) -> str:
 def _walk(pipeline: PipelineLike) -> dict[str, str]:
     """What the walk records for stage `p/use`, entries a lock leaves out included."""
     return fingerprint.get_stage_fingerprint(pipeline.get_stage("p/use")["func"])
-
-
-def _discover(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str], pipeline: str
-) -> PipelineLike:
-    root = tmp_path / "project"
-    for rel_path, text in {**files, "pipeline.py": pipeline}.items():
-        (root / rel_path).parent.mkdir(parents=True, exist_ok=True)
-        (root / rel_path).write_text(text)
-    (root / ".git").mkdir(exist_ok=True)
-    (root / ".pivot").mkdir(exist_ok=True)
-    monkeypatch.setattr(project, "_project_root_cache", root)
-    loaded = discovery.discover_pipeline(project_root=root)
-    assert loaded is not None
-    return loaded
 
 
 @pytest.fixture
@@ -140,7 +140,7 @@ def test_a_module_the_program_holds_from_another_file_fails_the_stages_fingerpri
     returns it. A worker would import the root's `wi_a` (a namespace directory there is the only
     `wi_a` on its path). The fingerprint fails, naming both."""
     _held("wi_a", tmp_path / held_file, monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {root_file: _PLAIN}, _pipeline("import wi_a", "wi_a.plain()")
     )
 
@@ -185,7 +185,7 @@ def test_a_submodule_the_program_holds_from_another_file_fails_the_stages_finger
     files = {"wi_pkg": "program/wi_pkg/__init__.py", "wi_pkg.sub": "program/wi_pkg/sub.py"}
     for name in held:
         _held(name, tmp_path / files[name], monkeypatch)
-    pipeline = _discover(tmp_path, monkeypatch, _SUB_FILES, _pipeline(imports, call))
+    pipeline = helpers.discover_project(tmp_path, monkeypatch, _SUB_FILES, _pipeline(imports, call))
 
     with pytest.raises(exceptions.PivotError, match=r"module 'wi_pkg\.sub' is .+sub\.py"):
         pipeline.ensure_fingerprint("p/use")
@@ -198,7 +198,7 @@ def test_a_submodule_the_program_holds_under_a_project_package_goes_to_the_worke
     which discovery sends by value with its submodules: the worker runs the program's `sub` that
     the fingerprint describes, and imports nothing by that name."""
     _held("wi_pkg.sub", tmp_path / "program" / "wi_pkg" / "sub.py", monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, _SUB_FILES, _pipeline("from wi_pkg import sub", "sub.plain()")
     )
 
@@ -220,7 +220,9 @@ def test_a_library_the_program_holds_with_a_project_modules_name_fails_the_stage
     project's `wi_lib.py` in its place."""
     held = tmp_path / "lib" / "site-packages" / "wi_lib.py"
     _held("wi_lib", held, monkeypatch)
-    pipeline = _discover(tmp_path, monkeypatch, {"wi_lib.py": _PLAIN}, _pipeline(imports, call))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {"wi_lib.py": _PLAIN}, _pipeline(imports, call)
+    )
 
     with pytest.raises(exceptions.PivotError, match=f"module 'wi_lib' is {_resolved(held)}"):
         pipeline.ensure_fingerprint("p/use")
@@ -239,7 +241,9 @@ def test_a_library_the_program_holds_and_a_stage_imports_in_its_body_fails_the_f
     on its path and gets the project's `wi_lib.py`, not the library the program holds."""
     held = tmp_path / "lib" / "site-packages" / "wi_lib.py"
     _held("wi_lib", held, monkeypatch)
-    pipeline = _discover(tmp_path, monkeypatch, {"wi_lib.py": _PLAIN}, _BODY_IMPORT_PIPELINE)
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {"wi_lib.py": _PLAIN}, _BODY_IMPORT_PIPELINE
+    )
 
     with pytest.raises(exceptions.PivotError, match=f"module 'wi_lib' is {_resolved(held)}"):
         pipeline.ensure_fingerprint("p/use")
@@ -252,7 +256,7 @@ def test_a_partial_over_a_library_callable_the_program_holds_fails_the_fingerpri
     with `plain` by name, so the worker imports `wi_lib`, the project's file in its place."""
     held = tmp_path / "lib" / "site-packages" / "wi_lib.py"
     _held("wi_lib", held, monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_lib.py": _PLAIN},
@@ -275,7 +279,7 @@ def test_a_library_submodule_a_stage_imports_from_a_project_package_is_recorded_
     site = tmp_path / "lib" / "site-packages" / "wi_up"
     site.mkdir(parents=True)
     (site / "sub.py").write_text(_PLAIN)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_up/__init__.py": f"__path__.append({str(site)!r})\n"},
@@ -297,7 +301,9 @@ def test_a_library_module_read_as_a_global_is_recorded_by_name_outside_the_lock(
     site = tmp_path / "lib" / "site-packages"
     _held("wi_lib", site / "wi_lib.py", monkeypatch)
     monkeypatch.syspath_prepend(str(site))
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_lib", "wi_lib.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_lib", "wi_lib.plain()")
+    )
 
     recorded = pipeline.ensure_fingerprint("p/use")
     walked = _walk(pipeline)
@@ -314,9 +320,9 @@ def test_a_namespace_child_the_program_holds_from_a_library_fails_the_stages_fin
     project's `wi_shared` namespace directory has its own `library.py`. The module that defines
     `plain` is compared, not only the top-level namespace."""
     site = tmp_path / "lib" / "site-packages"
-    _held_namespace("wi_shared", site / "wi_shared", monkeypatch)
+    _held_namespace("wi_shared", [site / "wi_shared"], monkeypatch)
     _held("wi_shared.library", site / "wi_shared" / "library.py", monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_shared/library.py": _PLAIN},
@@ -339,7 +345,9 @@ def test_a_pipeline_fingerprinted_after_a_later_discovery_found_nothing_is_still
     (tmp_path / "other").mkdir()
     (tmp_path / "other" / "wi_late.py").write_text(_PLAIN)
     monkeypatch.syspath_prepend(str(tmp_path / "other"))
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_late", "wi_late.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_late", "wi_late.plain()")
+    )
     (tmp_path / "empty").mkdir()
     assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
 
@@ -357,7 +365,9 @@ def test_a_module_the_program_holds_from_the_projects_file_fingerprints(
     """The program imported the project's own `wi_own.py`: a worker gets the same code."""
     confirm = mocker.spy(loaded_source, "_confirm")
     _held("wi_own", tmp_path / "project" / "wi_own.py", monkeypatch)
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_own", "wi_own.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_own", "wi_own.plain()")
+    )
 
     assert "module:wi_own" in pipeline.ensure_fingerprint("p/use")
     assert confirm.call_count == 0
@@ -369,7 +379,7 @@ def test_a_built_in_module_a_root_file_names_needs_no_new_interpreter(
     """`time` is built into the interpreter: a root `time.py` cannot shadow it, in a worker or
     here, so the prediction says so without starting an interpreter."""
     confirm = mocker.spy(loaded_source, "_confirm")
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"time.py": _PLAIN},
@@ -389,7 +399,7 @@ def test_a_library_submodule_a_worker_imports_from_the_same_file_needs_no_new_in
     agrees without starting an interpreter."""
     assert pathlib.Path(email.mime.text.__file__).name == "text.py"
     confirm = mocker.spy(loaded_source, "_confirm")
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {},
@@ -408,7 +418,7 @@ def test_a_frozen_module_needs_no_new_interpreter(
     """`os` is frozen into this interpreter (as in a release build): the frozen importer, which
     comes before any file, finds it in a worker as here."""
     confirm = mocker.spy(loaded_source, "_confirm")
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import os", "os.sep"))
+    pipeline = helpers.discover_project(tmp_path, monkeypatch, {}, _pipeline("import os", "os.sep"))
 
     pipeline.ensure_fingerprint("p/use")
     assert "byname:os" in _walk(pipeline)
@@ -453,7 +463,7 @@ def test_a_module_a_startup_finder_before_path_finder_serves_needs_no_new_interp
     monkeypatch.delitem(sys.modules, "wi_front", raising=False)
     importlib.import_module("wi_front")
     confirm = mocker.spy(loaded_source, "_confirm")
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_front.py": _PLAIN},
@@ -475,7 +485,9 @@ def test_a_module_the_program_reaches_through_a_symlink_is_its_real_file(
     (tmp_path / "link").symlink_to(program, target_is_directory=True)
     _held("wi_link", tmp_path / "link" / "wi_link.py", monkeypatch)
     monkeypatch.syspath_prepend(str(program))
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_link", "wi_link.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_link", "wi_link.plain()")
+    )
 
     assert "module:wi_link" in pipeline.ensure_fingerprint("p/use")
     assert confirm.call_count == 0
@@ -490,7 +502,9 @@ def test_a_held_module_replaced_during_the_session_is_not_the_programs(
     program = tmp_path / "program"
     _held("wi_swap", program / "wi_swap.py", monkeypatch)
     monkeypatch.syspath_prepend(str(program))
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_swap", "wi_swap.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_swap", "wi_swap.plain()")
+    )
     _held("wi_swap", tmp_path / "other" / "wi_swap.py", monkeypatch)
 
     assert "module:wi_swap" in pipeline.ensure_fingerprint("p/use")
@@ -531,7 +545,7 @@ def test_namespace_packages_compare_by_their_directories(
     """Two namespace packages are the same module only with the same directories."""
     (tmp_path / "project" / "wi_ns").mkdir(parents=True)
     monkeypatch.syspath_prepend(str(tmp_path / "project"))
-    _held_namespace("wi_ns", tmp_path / held_portion, monkeypatch)
+    _held_namespace("wi_ns", [tmp_path / held_portion], monkeypatch)
     hold_modules()
 
     if not raises:
@@ -602,7 +616,7 @@ def test_a_loaders_module_named_by_name_is_compared(
     _held("wi_loader", held_file, monkeypatch)
     returns = "Annotated[str, OUTPUT]" if field is None else "Fields"
     value = "raw" if field is None else f"{{{field!r}: raw}}"
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_loader.py": _PLAIN},
@@ -665,7 +679,7 @@ def test_the_module_of_a_loader_another_loader_holds_is_compared(
     by name, so the module the held loader's walk covers is compared like one the stage reads."""
     held = tmp_path / "program" / "wi_inst.py"
     _held("wi_inst", held, monkeypatch, _INNER_LOADER)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {"wi_inst.py": _INNER_LOADER}, _LOADER_HOLDS_AN_INSTANCE
     )
 
@@ -745,7 +759,9 @@ def test_a_path_object_in_sys_path_is_skipped_as_the_import_system_skips_it(
     (tmp_path / "other").mkdir()
     (tmp_path / "other" / "wi_pobj.py").write_text(_PLAIN)
     monkeypatch.setattr(sys, "path", [program, str(tmp_path / "other"), *sys.path])
-    pipeline = _discover(tmp_path, monkeypatch, {}, _pipeline("import wi_pobj", "wi_pobj.plain()"))
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_pobj", "wi_pobj.plain()")
+    )
 
     other = _resolved(tmp_path / "other" / "wi_pobj.py")
     with pytest.raises(exceptions.PivotError, match=f"would import {other}"):
@@ -781,7 +797,7 @@ def test_a_confirmation_that_cannot_run_fails_on_the_prediction(
     confirmation did not run."""
     monkeypatch.setattr(loaded_source, "_CONFIRM_PROGRAM", "raise SystemExit(3)\n")
     _held("wi_fail", tmp_path / "program" / "wi_fail.py", monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_fail.py": _PLAIN},
@@ -803,8 +819,572 @@ def test_a_lock_keeps_every_entry_of_a_dependency_or_output_named_byname() -> No
     }
     manifest = {"self:use": "1", "byname:json": "", **named_byname}
 
-    assert fingerprint.without_by_name(manifest) == {"self:use": "1", **named_byname}
+    assert fingerprint.as_locked(manifest) == {"self:use": "1", **named_byname}
     assert fingerprint.by_name_modules(manifest, {"p/use:byname"}) == {"json"}
+
+
+# Submodules read through a library package --------------------------------------------------
+
+
+def _helper_reads_local(package: str) -> str:
+    """A project module that reads `<package>.local` through its package's name."""
+    return f"import {package}.local\n\n\ndef plain() -> str:\n    return {package}.local.plain()\n"
+
+
+# The stage calls `ra.plain()` and `rz.plain()` (`_helper_reads_local` each), and its output
+# writer's `save` reads `wi_joined.local` through its package's name too.
+_JOINED_PIPELINE = """\
+import dataclasses
+import pathlib
+from typing import Annotated
+
+import ra
+import rz
+import wi_joined.local
+
+from pivot import Pipeline, loaders, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Prefixed(loaders.Text):
+    def save(self, data: str, path: pathlib.Path) -> None:
+        super().save(wi_joined.local.plain() + data, path)
+
+
+@stage
+def use() -> Annotated[str, Prefixed()]:
+    return ra.plain() + rz.plain()
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+# Functions that read `wi_scan.local` through its package's name in their own code, only in a
+# lambda, as a lambda, through a closure cell that holds the package, also beside a cell its
+# factory left empty, through `wi_scan.sub`, or only in the project module `scanned_helper` they
+# call; the stage calls the first.
+_SCANNED_PIPELINE = """\
+import scanned_helper
+import wi_scan.local
+
+from pivot import Pipeline, stage
+
+
+def own_code() -> str:
+    return wi_scan.local.plain()
+
+
+def in_a_lambda() -> str:
+    return (lambda: wi_scan.local.plain())()
+
+
+as_a_lambda = lambda: wi_scan.local.plain()
+
+
+def _with_a_cell():
+    package = wi_scan
+
+    def with_a_cell() -> str:
+        return package.local.plain()
+
+    return with_a_cell
+
+
+with_a_cell = _with_a_cell()
+
+
+def _with_an_empty_cell(bound: bool):
+    if bound:
+        unset = "never"
+    package = wi_scan
+
+    def with_an_empty_cell() -> str:
+        return (unset if bound else "") + package.local.plain()
+
+    return with_an_empty_cell
+
+
+with_an_empty_cell = _with_an_empty_cell(False)
+
+
+def through_a_deeper_package() -> str:
+    return wi_scan.sub.local.plain()
+
+
+def in_a_helper() -> str:
+    return scanned_helper.plain()
+
+
+@stage
+def use() -> str:
+    return own_code()
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+
+
+class _LazyModule(types.ModuleType):
+    """A module subclass as six's `six.moves` is (`six._MovedItems`): its `reduce`, a descriptor
+    of its class, imports a module the first time it is read, here one no interpreter has."""
+
+    @property
+    def reduce(self) -> object:
+        return importlib.import_module("wi_six_missing").reduce
+
+
+def _helper_shared_namespace(
+    name: str, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> types.ModuleType:
+    """The namespace package `name` the program holds (`_held_namespace`), with a directory in
+    the project root that `helpers.discover_project` makes and one in a `site-packages` directory
+    on `sys.path`, which makes it a library's, as an installed library's portion of it does."""
+    site = tmp_path / "lib" / "site-packages"
+    monkeypatch.syspath_prepend(str(site))
+    return _held_namespace(name, [tmp_path / "project" / name, site / name], monkeypatch)
+
+
+def test_a_lazy_module_subclass_on_a_library_module_is_neither_walked_nor_sent(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The program holds the library module `wi_six` from `site-packages`, a package with an
+    empty `__path__` as six is, and on it, held in `sys.modules`, `wi_six.moves`, a module of a
+    subclass (`_LazyModule`) with no file and an empty `__path__`, as six's `six.moves` is, whose
+    `reduce` imports a module the first time it is read, as `six.moves.dbm_gnu` imports `_gdbm`,
+    which an interpreter may lack. A stage that reads `wi_six.moves.reduce` records `wi_six` by
+    name alone, as a stage that reads no submodule of a library package does: the walk reads
+    nothing of `wi_six.moves`, so its import does not run, and records no submodule, so the
+    coordinator sends none with the stage."""
+    site = tmp_path / "lib" / "site-packages"
+    library = _held("wi_six", site / "wi_six.py", monkeypatch, "__path__ = []\n")
+    moves = _LazyModule("wi_six.moves")
+    vars(moves)["__path__"] = []
+    monkeypatch.setitem(sys.modules, "wi_six.moves", moves)
+    monkeypatch.setattr(library, "moves", moves, raising=False)
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_six", "str(wi_six.moves.reduce)")
+    )
+
+    walked = _walk(pipeline)
+
+    assert sorted(walked) == ["byname:wi_six", "self:use"], walked
+    assert fingerprint.bound_submodule(library, "moves") is None, "a module subclass is not read"
+
+
+def test_a_module_with_no_file_and_no_directory_on_a_library_package_is_not_walked(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The program holds the library module `wi_lazy` from `site-packages`, a package with an
+    empty `__path__` as six is, and on it, held in `sys.modules`, the plain module `wi_lazy.moves`
+    made with no file and an empty `__path__`, as a library makes a module of names it imports on
+    demand. A stage that reads `wi_lazy.moves.reduce` records `wi_lazy` by name alone: the module,
+    which `is_user_code` takes as code `exec` made, has no source to walk and is no namespace
+    package of the project's, so no submodule is recorded for the coordinator to send, which a
+    worker would bind under a name no file has."""
+    site = tmp_path / "lib" / "site-packages"
+    library = _held("wi_lazy", site / "wi_lazy.py", monkeypatch, "__path__ = []\n")
+    moves = types.ModuleType("wi_lazy.moves")
+    vars(moves).update(__path__=[], reduce=functools.reduce)
+    monkeypatch.setitem(sys.modules, "wi_lazy.moves", moves)
+    monkeypatch.setattr(library, "moves", moves, raising=False)
+    pipeline = helpers.discover_project(
+        tmp_path, monkeypatch, {}, _pipeline("import wi_lazy", "str(wi_lazy.moves.reduce)")
+    )
+
+    walked = _walk(pipeline)
+
+    assert sorted(walked) == ["byname:wi_lazy", "self:use"], walked
+
+
+def test_a_refusal_reached_through_a_submodule_of_a_library_package_names_the_submodule(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wi_reach` is a namespace package the program holds with a directory in `site-packages`
+    and one in the project root, whose `local.py` holds a list, which no fingerprint records. A
+    stage that reads the list through the package's name (`wi_reach.local.SETTINGS`) is refused,
+    and the refusal says how the stage reaches it in words, the submodule step as the others."""
+    _helper_shared_namespace("wi_reach", tmp_path, monkeypatch)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {"wi_reach/local.py": "SETTINGS = [1]\n"},
+        _pipeline("import wi_reach.local", "str(wi_reach.local.SETTINGS)"),
+    )
+
+    with pytest.raises(exceptions.StageDefinitionError) as raised:
+        _walk(pipeline)
+
+    message = str(raised.value)
+    assert (
+        "Reached through: global 'wi_reach' -> submodule 'local' -> module attribute 'SETTINGS'."
+    ) in message, message
+
+
+def test_a_submodule_read_in_several_parts_of_a_walk_is_one_name(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wi_joined` is a namespace package the program holds with a directory in `site-packages`
+    and one in the project root, whose `local.py` `pipeline.py` imports. The stage calls
+    `ra.plain()` and `rz.plain()`, two project modules that each read `wi_joined.local` through
+    the package's name, and its output writer's `save` reads it so too. The registry keeps its
+    name once beside the stage's fingerprint, whatever part of the walk read it: the name of the
+    module the coordinator sends with the stage."""
+    _helper_shared_namespace("wi_joined", tmp_path, monkeypatch)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {
+            "wi_joined/local.py": _PLAIN,
+            "ra.py": _helper_reads_local("wi_joined"),
+            "rz.py": _helper_reads_local("wi_joined"),
+        },
+        _JOINED_PIPELINE,
+    )
+
+    pipeline.ensure_fingerprint("p/use")
+
+    names = pipeline.get_stage("p/use").get("read_submodules")
+    assert names == ("wi_joined.local",), names
+
+
+def test_a_submodule_a_later_import_session_removed_is_not_walked(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wi_gone` is a namespace package the program holds with a directory in `site-packages`
+    and one in the project root, whose `local.py` `pipeline.py` imports; the stage reads it
+    through the package's name, and the walk records it. A later discovery, of a directory with no
+    pipeline, ends the project's import session, which takes `wi_gone.local` out of
+    `sys.modules` while the package still holds it. The stage's walk then reads nothing of that
+    module, as of a submodule no import bound (`fingerprint.bound_submodule`)."""
+    package = _helper_shared_namespace("wi_gone", tmp_path, monkeypatch)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {"wi_gone/local.py": _PLAIN},
+        _pipeline("import wi_gone.local", "wi_gone.local.plain()"),
+    )
+    local = vars(package)["local"]
+    first = _walk(pipeline)
+    assert fingerprint.read_submodules(first) == ("wi_gone.local",), first
+    assert "func:wi_gone.local.plain" in first, "the session's walk must read it"
+    (tmp_path / "empty").mkdir()
+    assert discovery.discover_pipeline(project_root=tmp_path / "empty") is None
+    assert vars(package)["local"] is local, "the package must still hold the session's module"
+
+    walked = _walk(pipeline)
+
+    assert [key for key in walked if "wi_gone.local" in key] == [], walked
+
+
+def test_a_manifest_cache_hit_walks_a_submodule_bound_on_its_package_since_the_walk(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wi_bound` is a namespace package the program holds with a directory in `site-packages`
+    and one in the project root, which holds `local.py` and `other.py`. `pipeline.py` imports
+    `wi_bound.local`, and the stage reads both through the package's name, so its walk, which the
+    manifest cache keeps in the project's state directory, walks `local` alone: nothing bound
+    `other`. The program then loads `other.py` as `wi_bound.other` bound on the package, which
+    changes no file the cache checks. The next fingerprint of the stage walks it, as a cache hit
+    re-reads which submodules the package holds; a hit that kept the cached manifest would leave
+    an edit to `other.py` unseen and the module not sent with the stage."""
+    package = _helper_shared_namespace("wi_bound", tmp_path, monkeypatch)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {"wi_bound/local.py": _PLAIN, "wi_bound/other.py": _PLAIN},
+        _pipeline("import wi_bound.local", "wi_bound.local.plain() + wi_bound.other.plain()"),
+    )
+    func = pipeline.get_stage("p/use")["func"]
+    first = fingerprint.get_stage_fingerprint_cached("p/use", func)
+    fingerprint.flush_and_close()
+    other = _held("wi_bound.other", tmp_path / "project" / "wi_bound" / "other.py", monkeypatch)
+    monkeypatch.setattr(package, "other", other, raising=False)
+
+    second = fingerprint.get_stage_fingerprint_cached("p/use", func)
+    fingerprint.flush_and_close()
+
+    assert "func:wi_bound.other.plain" not in first, first
+    assert "func:wi_bound.other.plain" in second, second
+    assert fingerprint.read_submodules(second) == ("wi_bound.local", "wi_bound.other"), second
+
+
+# A project module that holds a lock, which cloudpickle cannot pickle, and `plain`, which returns
+# `sent`; the stage reads it through its package's name inside a lambda alone, whose names
+# cloudpickle does not follow, so the module reaches the worker only where the coordinator sends it.
+_SENT_WITH_LOCK = (
+    "import threading\n\n_LOCK = threading.Lock()\n\n\n"
+    + 'def plain() -> str:\n    return "sent"\n'
+)
+
+
+def _helper_sent_submodules(
+    pipeline: PipelineLike, root: pathlib.Path, pickle_trials: executor_core.PickleTrials
+) -> tuple[types.ModuleType | str, ...] | None:
+    """What the coordinator sends with stage `p/use` of the project at `root`
+    (`WorkerStageInfo.sent_submodules`, None for nothing) in the engine run whose trial pickles
+    `pickle_trials` records."""
+    info = executor_core.prepare_worker_info(
+        pipeline.get_stage("p/use"),
+        pipeline,
+        overrides={},
+        run_id="run",
+        force=False,
+        no_commit=False,
+        project_root=root,
+        default_state_dir=root / ".pivot",
+        store_spec=store_mod.StoreSpec(
+            kind="workspace",
+            cache_dir=str(root / ".pivot" / "cache" / "files"),
+            project_root=str(root),
+            pipeline_name=pipeline.name,
+            input_bindings=pipeline.input_bindings,
+            checkout_modes=[],
+        ),
+        pickle_trials=pickle_trials,
+    )
+    return info.get("sent_submodules")
+
+
+def test_a_module_sent_by_value_is_tried_once_in_an_engine_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wi_once` is a namespace package the program holds with a directory in `site-packages`
+    and one in the project root, whose `local.py` the stage reads through the package's name, and
+    which discovery pickles by value. The coordinator sends the module with the stage, as it pickles
+    alone, and records that in the engine run's trial pickles. Once the module holds a lock, which
+    cloudpickle cannot pickle, a later dispatch in the same run sends it again without trying it,
+    while a new run's record tries it and sends nothing (`executor.core.PickleTrials`)."""
+    package = _helper_shared_namespace("wi_once", tmp_path, monkeypatch)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {"wi_once/local.py": _PLAIN},
+        _pipeline("import wi_once.local", "(lambda: wi_once.local.plain())()"),
+    )
+    local = vars(package)["local"]
+    root = tmp_path / "project"
+    pickle_trials: executor_core.PickleTrials = {}
+
+    first = _helper_sent_submodules(pipeline, root, pickle_trials)
+    monkeypatch.setattr(local, "_LOCK", threading.Lock(), raising=False)
+    again = _helper_sent_submodules(pipeline, root, pickle_trials)
+    fresh = _helper_sent_submodules(pipeline, root, {})
+
+    assert (first, again, fresh) == ((local,), (local,), None)
+
+
+def test_a_module_that_did_not_pickle_alone_is_tried_again_in_the_next_run(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wi_trial` is a namespace package the program holds with a directory in `site-packages`
+    and one in the project root, whose `local.py` holds a lock, which cloudpickle cannot pickle;
+    the stage reads it through the package's name inside a lambda, whose names cloudpickle does
+    not follow. The first run of the pipeline in this process does not send the module, which does
+    not pickle alone, and the stage fails in its worker with `AttributeError`. The program then
+    takes the lock out of that module object, and the second run of the same pipeline tries it
+    again, sends it, and the stage writes `sent`: the engine records its trial pickles for one run
+    (`executor.core.PickleTrials`). Were the first run's record kept, the second run would not
+    send the module, and the stage would fail again."""
+    package = _helper_shared_namespace("wi_trial", tmp_path, monkeypatch)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {"wi_trial/local.py": _SENT_WITH_LOCK},
+        _pipeline("import wi_trial.local", "(lambda: wi_trial.local.plain())()"),
+    )
+    local = vars(package)["local"]
+
+    first = executor.run(pipeline=pipeline)
+    monkeypatch.delattr(local, "_LOCK")
+    second = executor.run(pipeline=pipeline)
+
+    failure = first["p/use"]["reason"].splitlines()[-1]
+    assert (first["p/use"]["status"], failure) == (
+        "failed",
+        "AttributeError: module 'wi_trial' has no attribute 'local'",
+    ), first
+    assert second["p/use"]["status"] == "ran", second
+    assert (tmp_path / "project" / "data" / "p" / "use.txt").read_text() == "sent"
+
+
+def _helper_library_namespace(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`wi_rn`, a namespace package the program holds with a directory in `site-packages` and one
+    in the project root (`_helper_shared_namespace`)."""
+    _helper_shared_namespace("wi_rn", tmp_path, monkeypatch)
+
+
+def _helper_library_package(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`wi_re`, a regular package the program holds from `site-packages`, whose `__init__` extends
+    its `__path__` over the project root's `wi_re` directory, as `pkgutil.extend_path` does."""
+    extended = tmp_path / "project" / "wi_re"
+    _held(
+        "wi_re",
+        tmp_path / "lib" / "site-packages" / "wi_re" / "__init__.py",
+        monkeypatch,
+        f"__path__.append({str(extended)!r})\n",
+    )
+
+
+def _helper_no_library(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing: each package of the case is the project's alone."""
+
+
+@pytest.mark.parametrize(
+    ("library", "files", "imports", "registered"),
+    [
+        pytest.param(
+            _helper_library_namespace,
+            {"wi_rn/local.py": _PLAIN, "wi_rn/sub/__init__.py": "", "wi_rn/sub/deep.py": _PLAIN},
+            "import wi_rn.local\nimport wi_rn.sub.deep",
+            {
+                "pipeline": True,
+                "wi_rn": False,
+                "wi_rn.local": True,
+                "wi_rn.sub": True,
+                "wi_rn.sub.deep": True,
+            },
+            id="library-namespace-package",
+        ),
+        pytest.param(
+            _helper_library_package,
+            {"wi_re/local.py": _PLAIN},
+            "import wi_re.local",
+            {"pipeline": True, "wi_re": False, "wi_re.local": True},
+            id="library-regular-package",
+        ),
+        pytest.param(
+            _helper_no_library,
+            {"wi_rp/__init__.py": "", "wi_rp/local.py": _PLAIN},
+            "import wi_rp.local",
+            {"pipeline": True, "wi_rp": True, "wi_rp.local": True},
+            id="project-regular-package",
+        ),
+        pytest.param(
+            _helper_no_library,
+            {"wi_rq/local.py": _PLAIN},
+            "import wi_rq.local",
+            {"pipeline": True, "wi_rq": True, "wi_rq.local": True},
+            id="project-namespace-package",
+        ),
+    ],
+)
+def test_discovery_registers_every_module_under_the_root_by_value(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    library: Callable[[pathlib.Path, pytest.MonkeyPatch], None],
+    files: dict[str, str],
+    imports: str,
+    registered: dict[str, bool],
+) -> None:
+    """Modules under the project root that `pipeline.py` imports, in a package that is a library's
+    (a namespace package the program holds with a directory in `site-packages`, also a project
+    package below it, `wi_rn.sub`, and its module; or a library's regular package from
+    `site-packages` whose `__init__` extends its `__path__` over the project's directory) or the
+    project's (a regular package, or a namespace package with its one directory in the root).
+    Discovery registers with cloudpickle by value `pipeline.py` and every one of those modules, as
+    pivot 0.10.4 does, and not the library's package, which is library code
+    (`fingerprint.is_user_code`): cloudpickle then pickles the project's code by value with the
+    stage that holds it, one copy of each class and of each value the program holds. Were the
+    project's part of a library's package left unregistered, a worker would import it from its
+    file, a copy apart from the classes and values the stage holds."""
+    library(tmp_path, monkeypatch)
+    calls = " + ".join(f"{line.removeprefix('import ')}.plain()" for line in imports.splitlines())
+    helpers.discover_project(tmp_path, monkeypatch, files, _pipeline(imports, calls))
+
+    by_value = cloudpickle.list_registry_pickle_by_value()
+
+    assert {name: name in by_value for name in registered} == registered, by_value
+
+
+@pytest.mark.parametrize(
+    ("library", "directory"),
+    [
+        pytest.param(_helper_no_library, "wi_rs", id="project-directory"),
+        pytest.param(_helper_library_namespace, "wi_rn", id="library-package-name"),
+    ],
+)
+def test_a_pipeline_module_discovery_loads_from_a_directory_goes_by_value(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    library: Callable[[pathlib.Path, pytest.MonkeyPatch], None],
+    directory: str,
+) -> None:
+    """Discovery run from the directory `directory` of the project root loads its `pipeline.py`
+    under the name `<directory>.pipeline`, under a package it makes of the directory, also where
+    the program holds a library's namespace package of that name (`wi_rn`), which it puts aside
+    for the import session. It registers both by value, as it registers `pipeline.py` in the
+    root: the pipeline's package is the project's, so the stages it defines reach a worker by
+    value."""
+    library(tmp_path, monkeypatch)
+    root = tmp_path / "project"
+    (root / directory).mkdir(parents=True, exist_ok=True)
+    (root / directory / "pipeline.py").write_text(_pipeline("import os", "os.sep"))
+    (root / ".git").mkdir()
+    (root / ".pivot").mkdir()
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    monkeypatch.chdir(root / directory)
+
+    assert discovery.discover_pipeline(project_root=root) is not None
+
+    by_value = cloudpickle.list_registry_pickle_by_value()
+    names = (directory, f"{directory}.pipeline")
+    assert {name: name in by_value for name in names} == dict.fromkeys(names, True), by_value
+
+
+# What the scan records of a function that reads `wi_scan.local` through its package.
+_SCANNED_LOCAL = {"submodule:wi_scan.local": ""}
+
+
+@pytest.mark.parametrize(
+    ("function", "expected"),
+    [
+        pytest.param("own_code", _SCANNED_LOCAL, id="own-code"),
+        pytest.param("in_a_lambda", _SCANNED_LOCAL, id="lambda"),
+        pytest.param("as_a_lambda", _SCANNED_LOCAL, id="as-a-lambda"),
+        pytest.param("with_a_cell", _SCANNED_LOCAL, id="closure-cell"),
+        pytest.param("with_an_empty_cell", _SCANNED_LOCAL, id="empty-cell"),
+        pytest.param(
+            "through_a_deeper_package",
+            {"submodule:wi_scan.sub": "", "submodule:wi_scan.sub.local": ""},
+            id="deeper-chain",
+        ),
+        pytest.param("in_a_helper", {}, id="helper-not-read"),
+    ],
+)
+def test_the_scan_of_a_no_fingerprint_stage_finds_what_its_own_code_reads_through_a_package(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, function: str, expected: dict[str, str]
+) -> None:
+    """`wi_scan` and `wi_scan.sub` are namespace packages the program holds, each with a directory
+    in `site-packages` and one in the project root, whose `local.py` and `sub/local.py`
+    `pipeline.py` imports. The scan of a function's code for a `@no_fingerprint` stage, which the
+    walk does not read (`fingerprint.submodule_entries`), finds each submodule the function reads
+    through a package's name, one key for each: in its own code, only in a lambda, as a lambda,
+    through a closure cell of a function defined in another, also beside a cell its factory left
+    empty, which the scan skips, and through `wi_scan.sub` (both, as the walk records them). It
+    does not read the project module `scanned_helper` a function calls, which reads
+    `wi_scan.local` so: a stated limit."""
+    package = _helper_shared_namespace("wi_scan", tmp_path, monkeypatch)
+    site = tmp_path / "lib" / "site-packages"
+    sub = _held_namespace(
+        "wi_scan.sub",
+        [tmp_path / "project" / "wi_scan" / "sub", site / "wi_scan" / "sub"],
+        monkeypatch,
+    )
+    monkeypatch.setattr(package, "sub", sub, raising=False)
+    pipeline = helpers.discover_project(
+        tmp_path,
+        monkeypatch,
+        {
+            "wi_scan/local.py": _PLAIN,
+            "wi_scan/sub/local.py": _PLAIN,
+            "scanned_helper.py": _helper_reads_local("wi_scan"),
+        },
+        "import wi_scan.sub.local\n" + _SCANNED_PIPELINE,
+    )
+    scanned = pipeline.get_stage("p/use")["func"].__globals__[function]
+
+    assert fingerprint.submodule_entries(scanned) == expected
 
 
 # Through a worker -----------------------------------------------------------------------------
@@ -832,7 +1412,7 @@ def test_a_module_every_interpreter_imports_at_startup_is_the_one_its_worker_run
         "PYTHONPATH", os.pathsep.join([str(startup), os.environ.get("PYTHONPATH", "")])
     )
     confirm = mocker.spy(loaded_source, "_confirm")
-    _discover(
+    helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_startup.py": _PLAIN},
@@ -853,7 +1433,7 @@ def test_a_module_from_another_file_fails_the_run_before_a_worker_runs_it(
     """The run fails at fingerprinting: no worker runs the project's file under a fingerprint of
     the program's."""
     _held("wi_run", tmp_path / "program" / "wi_run.py", monkeypatch)
-    _discover(
+    helpers.discover_project(
         tmp_path, monkeypatch, {"wi_run.py": _PLAIN}, _pipeline("import wi_run", "wi_run.plain()")
     )
 
@@ -884,7 +1464,7 @@ def test_the_suspects_of_a_session_are_confirmed_in_one_interpreter(
         f"@stage\ndef use_{name}() -> str:\n    return {name}.plain()\n\n\n" for name in names
     )
     calls = "".join(f"    use_{name}()\n" for name in names)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {f"{name}.py": _PLAIN for name in names},
@@ -908,7 +1488,7 @@ def test_the_check_is_reported_with_the_stages_other_refusals(
     """The stage reads a module-level list and the program's `wi_ag`: one error names both, as
     every fingerprinting refusal of a stage is reported together."""
     _held("wi_ag", tmp_path / "program" / "wi_ag.py", monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_ag.py": _PLAIN},
@@ -934,7 +1514,7 @@ def test_a_relative_startup_path_names_a_directory_under_the_working_directory(
     _held("wi_rel", startup / "wi_rel.py", monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["startup", os.environ.get("PYTHONPATH", "")]))
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {"wi_rel.py": _PLAIN}, _pipeline("import wi_rel", "wi_rel.plain()")
     )
 
@@ -948,7 +1528,7 @@ def test_a_module_a_worker_imports_before_it_gets_its_path_is_the_one_it_uses(
     `sys.path` with the root first, so the root's `uuid.py` is not what the stage uses there.
     The confirming interpreter starts the same way, so nothing fails."""
     assert pathlib.Path(uuid.__file__).name == "uuid.py"
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"uuid.py": _PLAIN},
@@ -994,7 +1574,7 @@ def test_an_expanded_instance_whose_module_is_another_file_fails_as_a_static_sta
     same refusal: an instance is fingerprinted as any stage is."""
     held = tmp_path / "program" / "wi_mp.py"
     _held("wi_mp", held, monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {"wi_mp.py": _PLAIN, **_PLAN}, _mapped_pipeline("wi_mp")
     )
     assert pipeline.expand_template("p/cut", [("a", "a.yaml")]) == ["p/cut@a"]
@@ -1017,7 +1597,7 @@ def test_an_expanded_instance_records_its_by_name_modules_outside_the_lock(
     site = tmp_path / "lib" / "site-packages"
     _held("wi_ml", site / "wi_ml.py", monkeypatch)
     monkeypatch.syspath_prepend(str(site))
-    pipeline = _discover(tmp_path, monkeypatch, _PLAN, _mapped_pipeline("wi_ml"))
+    pipeline = helpers.discover_project(tmp_path, monkeypatch, _PLAN, _mapped_pipeline("wi_ml"))
     pipeline.expand_template("p/cut", [("a", "a.yaml")])
 
     walked = fingerprint.get_stage_fingerprint(pipeline.get_stage("p/cut@a")["func"])
@@ -1073,7 +1653,7 @@ def test_an_expanded_instances_output_loader_module_is_compared(
     check reads them only when the instance's output keys are the ones passed (#546)."""
     held = tmp_path / "program" / "wi_mq.py"
     _held("wi_mq", held, monkeypatch)
-    pipeline = _discover(
+    pipeline = helpers.discover_project(
         tmp_path, monkeypatch, {"wi_mq.py": _PLAIN, **_PLAN}, _MAPPED_OUTPUT_LOADER
     )
     assert pipeline.expand_template("p/cut", [("a", "a.yaml")]) == ["p/cut@a"]
@@ -1098,7 +1678,7 @@ def test_a_stage_after_its_producer_whose_module_is_another_file_fails_the_run(
     static `p/use` or the instance `p/cut@a` the run adds, and fails at its fingerprint the same
     way: no worker runs the root's `wi_mr` under a fingerprint of the program's."""
     _held("wi_mr", tmp_path / "program" / "wi_mr.py", monkeypatch)
-    _discover(
+    helpers.discover_project(
         tmp_path,
         monkeypatch,
         {"wi_mr.py": _PLAIN, **_PLAN},
@@ -1113,6 +1693,429 @@ def test_a_stage_after_its_producer_whose_module_is_another_file_fails_the_run(
 
     assert (data / "plan" / "a.yaml").exists()
     assert not (data / output).exists()
+
+
+# Library code a stage reaches, recorded by name ------------------------------------------------
+
+# Each form names a library module in `site-packages`, which the pipeline imports, and the stage
+# reaches that module's code through the form alone: the walk hashes no library code, so the
+# `byname:` entry is how the module reaches the worker-import check and the `dist:` keys.
+_REACHED_STAGE_LIBRARY = """\
+from pivot import stage
+
+
+@stage
+def use() -> str:
+    return "made"
+"""
+_REACHED_STAGE_PIPELINE = """\
+from wi_rl_stage import use
+
+from pivot import Pipeline
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_BASE_LIBRARY = """\
+class Base:
+    def greet(self):
+        return "base"
+"""
+_REACHED_GENERIC_PIPELINE = """\
+import typing
+
+import wi_rl_generic
+from pivot import Pipeline, stage
+
+T = typing.TypeVar("T")
+
+
+class Greeter(wi_rl_generic.Base, typing.Generic[T]):
+    pass
+
+
+@stage
+def use() -> str:
+    return Greeter().greet()
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_ROW_LIBRARY = """\
+import typing
+
+
+class Row(typing.TypedDict):
+    name: str
+"""
+_REACHED_ROW_PIPELINE = """\
+import {module}
+from pivot import Pipeline, stage
+
+
+class Scored({module}.Row):
+    score: int
+
+
+@stage
+def use() -> str:
+    return str(Scored(name="a", score=1))
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_NO_MODULE_LIBRARY = """\
+class Base:
+    __module__ = None
+
+    def greet(self):
+        return "base"
+"""
+_REACHED_NAMESPACE_LIBRARY = """\
+class Base:
+    def greet(self):
+        return "namespace"
+
+
+# The name of the package that exports it, as a library names its public classes.
+Base.__module__ = "wi_rl_ns"
+"""
+_REACHED_BASE_PIPELINE = """\
+from {module} import Base
+
+from pivot import Pipeline, stage
+
+
+class Greeter(Base):
+    pass
+
+
+@stage
+def use() -> str:
+    return Greeter().greet()
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_SETTING_LIBRARY = """\
+class Setting:
+    def __init__(self, value):
+        self.value = value
+"""
+_REACHED_NO_MODULE_SETTING_LIBRARY = f"{_REACHED_SETTING_LIBRARY}\n\nSetting.__module__ = None\n"
+_REACHED_ANNOTATION_PIPELINE = """\
+{imports}
+from pivot import Pipeline, stage
+
+
+class Config:
+    setting: {annotation}
+
+    def describe(self) -> str:
+        return "config"
+
+
+@stage
+def use() -> str:
+    return Config().describe()
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_BOX_LIBRARY = """\
+import typing
+
+T = typing.TypeVar("T")
+
+
+class Box(typing.Generic[T]):
+    def __init__(self, item):
+        self.item = item
+"""
+_REACHED_HINT_PIPELINE = """\
+import typing
+
+import {module}
+from pivot import Pipeline, stage
+
+
+def describe(box: {module}.Box[int], mode: typing.Literal["short"]) -> str:
+    return mode + str(box.item)
+
+
+@stage
+def use() -> str:
+    return describe(typing.get_type_hints(describe)["box"](1), "short")
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_MARKER_LIBRARY = """\
+class Marker:
+    __module__ = None
+
+    def apply(self, text):
+        return "marked:" + text
+"""
+_REACHED_VALUE_PIPELINE = """\
+import functools
+
+from wi_rl_marker import Marker
+
+from pivot import Pipeline, stage
+
+
+def render(text, marker):
+    return marker.apply(text)
+
+
+RENDER = functools.partial(render, marker=Marker())
+
+
+@stage
+def use() -> str:
+    return RENDER("x")
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+_REACHED_LOADER_LIBRARY = """\
+import dataclasses
+import pathlib
+
+from pivot import loaders
+
+
+@dataclasses.dataclass(frozen=True)
+class Tagged(loaders.Reader[str]):
+    __module__ = None
+
+    def load(self, path: pathlib.Path) -> str:
+        return "tagged:" + str(path)
+"""
+_REACHED_LOADER_PIPELINE = """\
+import functools
+
+from wi_rl_loader import Tagged
+
+from pivot import Pipeline, stage
+
+
+def read(name, loader):
+    return loader.load(name)
+
+
+READ = functools.partial(read, loader=Tagged())
+
+
+@stage
+def use() -> str:
+    return READ("raw.txt")
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+# Each library binds, as `shout`, a callable whose `__module__` is None: a function, a callable
+# instance (as scipy.special binds its ufuncs) and a `functools.cache` wrapper.
+_REACHED_FUNCTION_LIBRARY = """\
+def shout(text):
+    return text.upper()
+
+
+shout.__module__ = None
+"""
+_REACHED_CALLABLE_INSTANCE_LIBRARY = """\
+class _Shout:
+    def __init__(self):
+        self.__name__ = "shout"
+        self.__module__ = None
+
+    def __call__(self, text):
+        return text.upper()
+
+
+shout = _Shout()
+"""
+_REACHED_CACHED_FUNCTION_LIBRARY = """\
+import functools
+
+
+@functools.cache
+def shout(text):
+    return text.upper()
+
+
+shout.__module__ = None
+"""
+_REACHED_CALLABLE_PIPELINE = """\
+import functools
+
+from {module} import shout
+
+from pivot import Pipeline, stage
+
+
+def render(text, transform):
+    return transform(text)
+
+
+RENDER = functools.partial(render, transform=shout)
+
+
+@stage
+def use() -> str:
+    return RENDER("x")
+
+
+with Pipeline("p") as pipeline:
+    use()
+"""
+
+
+@pytest.mark.parametrize(
+    ("library", "pipeline", "recorded"),
+    [
+        pytest.param(
+            {"wi_rl_stage.py": _REACHED_STAGE_LIBRARY},
+            _REACHED_STAGE_PIPELINE,
+            {"byname:wi_rl_stage"},
+            id="library-stage-function",
+        ),
+        pytest.param(
+            {"wi_rl_generic.py": _REACHED_BASE_LIBRARY},
+            _REACHED_GENERIC_PIPELINE,
+            {"byname:wi_rl_generic"},
+            id="library-base-of-a-generic-class",
+        ),
+        pytest.param(
+            {"wi_rl_row.py": _REACHED_ROW_LIBRARY},
+            _REACHED_ROW_PIPELINE.format(module="wi_rl_row"),
+            {"byname:wi_rl_row"},
+            id="library-base-of-a-typed-dict",
+        ),
+        pytest.param(
+            {"wi_rl_nomod.py": _REACHED_NO_MODULE_LIBRARY},
+            _REACHED_BASE_PIPELINE.format(module="wi_rl_nomod"),
+            {"byname:wi_rl_nomod"},
+            id="library-base-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_row.py": f"{_REACHED_ROW_LIBRARY}\n\nRow.__module__ = None\n"},
+            _REACHED_ROW_PIPELINE.format(module="wi_rl_nomod_row"),
+            {"byname:wi_rl_nomod_row"},
+            id="library-base-of-a-typed-dict-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_ns/core.py": _REACHED_NAMESPACE_LIBRARY},
+            _REACHED_BASE_PIPELINE.format(module="wi_rl_ns.core"),
+            {"byname:wi_rl_ns"},
+            id="library-base-of-a-namespace-package",
+        ),
+        pytest.param(
+            {"wi_rl_setting.py": _REACHED_SETTING_LIBRARY},
+            _REACHED_ANNOTATION_PIPELINE.format(
+                imports="from wi_rl_setting import Setting", annotation="Setting"
+            ),
+            {"byname:wi_rl_setting"},
+            id="library-class-in-a-class-body-annotation",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_setting.py": _REACHED_NO_MODULE_SETTING_LIBRARY},
+            _REACHED_ANNOTATION_PIPELINE.format(
+                imports="from wi_rl_nomod_setting import Setting", annotation="Setting"
+            ),
+            {"byname:wi_rl_nomod_setting"},
+            id="library-class-in-a-class-body-annotation-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_dotted.py": _REACHED_NO_MODULE_SETTING_LIBRARY},
+            _REACHED_ANNOTATION_PIPELINE.format(
+                imports="import wi_rl_nomod_dotted", annotation="wi_rl_nomod_dotted.Setting"
+            ),
+            {"byname:wi_rl_nomod_dotted"},
+            id="library-class-in-a-dotted-class-body-annotation-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_box.py": _REACHED_BOX_LIBRARY},
+            _REACHED_HINT_PIPELINE.format(module="wi_rl_box"),
+            {"byname:typing", "byname:wi_rl_box"},
+            id="library-generic-in-a-type-hint",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_box.py": f"{_REACHED_BOX_LIBRARY}\n\nBox.__module__ = None\n"},
+            _REACHED_HINT_PIPELINE.format(module="wi_rl_nomod_box"),
+            {"byname:typing", "byname:wi_rl_nomod_box"},
+            id="library-generic-in-a-type-hint-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_marker.py": _REACHED_MARKER_LIBRARY},
+            _REACHED_VALUE_PIPELINE,
+            {"byname:wi_rl_marker"},
+            id="library-instance-inside-a-value-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_loader.py": _REACHED_LOADER_LIBRARY},
+            _REACHED_LOADER_PIPELINE,
+            {"byname:wi_rl_loader"},
+            id="library-loader-inside-a-value-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_function.py": _REACHED_FUNCTION_LIBRARY},
+            _REACHED_CALLABLE_PIPELINE.format(module="wi_rl_nomod_function"),
+            {"byname:wi_rl_nomod_function"},
+            id="library-function-inside-a-value-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_callable.py": _REACHED_CALLABLE_INSTANCE_LIBRARY},
+            _REACHED_CALLABLE_PIPELINE.format(module="wi_rl_nomod_callable"),
+            {"byname:wi_rl_nomod_callable"},
+            id="library-callable-instance-inside-a-value-whose-module-is-not-a-string",
+        ),
+        pytest.param(
+            {"wi_rl_nomod_cached.py": _REACHED_CACHED_FUNCTION_LIBRARY},
+            _REACHED_CALLABLE_PIPELINE.format(module="wi_rl_nomod_cached"),
+            {"byname:wi_rl_nomod_cached"},
+            id="library-cached-function-inside-a-value-whose-module-is-not-a-string",
+        ),
+    ],
+)
+def test_the_library_module_a_stage_reaches_is_recorded_by_name(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    library: dict[str, str],
+    pipeline: str,
+    recorded: set[str],
+) -> None:
+    """The stage reaches a library module's code through one form, and the walk records exactly
+    the `byname:` entries `recorded`: a stage function that is itself library code names its
+    module; the library base of a user generic class is named once, though its statement names it
+    too (`ob:` skips a base `__bases__` holds); the library base of a user `TypedDict`, which only
+    its statement holds, is named; a library class that a namespace package exports under its own
+    name names that package, which has no file to place it in pivot's packages; a library class in
+    a class-body annotation is named; and a library generic in a helper's type hint is named,
+    beside a `Literal` hint, whose origin is no class, and the module `typing` the stage reads.
+    A library class whose `__module__` is None, set in its class body or after it, names the
+    library module that binds it under its own name, reached as a base, a `TypedDict` base, a
+    class-body annotation by name or by dotted name, a type hint's generic, the class of an
+    instance a partial holds, and a pivot loader a partial holds; so do a library function, a
+    library callable instance and a library `functools.cache` wrapper whose `__module__` is None,
+    when a partial holds one."""
+    site = tmp_path / "lib" / "site-packages"
+    for rel_path, text in library.items():
+        (site / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (site / rel_path).write_text(text)
+    monkeypatch.syspath_prepend(str(site))
+
+    walked = _walk(helpers.discover_project(tmp_path, monkeypatch, {}, pipeline))
+
+    assert {key for key in walked if key.startswith("byname:")} == recorded, walked
 
 
 # The `pivot` command ----------------------------------------------------------------------------

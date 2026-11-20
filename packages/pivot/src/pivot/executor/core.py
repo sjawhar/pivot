@@ -9,16 +9,29 @@ import multiprocessing.resource_tracker
 import os
 import pathlib
 import signal
+import sys
 import threading
+import types as _stdlib_types
 import typing
 from multiprocessing import managers
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 
+import cloudpickle
 import loky
 import loky.backend.resource_tracker
 import loky.reusable_executor
 
-from pivot import config, discovery, exceptions, loaded_source, parameters, project, registry, types
+from pivot import (
+    config,
+    discovery,
+    exceptions,
+    fingerprint,
+    loaded_source,
+    parameters,
+    project,
+    registry,
+    types,
+)
 from pivot import state_dir as state_dir_mod
 from pivot.executor import worker
 from pivot.storage import cache, lock, naming, ownership, track
@@ -28,7 +41,7 @@ from pivot.types import OnError, StageStatus
 
 if TYPE_CHECKING:
     import concurrent.futures
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from pivot.engine import types as engine_types
     from pivot.registry import RegistryStageInfo
@@ -541,6 +554,14 @@ def create_fresh_executor(
     return _get_executor(max_workers, idle_timeout_s=idle_timeout_s, kill_workers=True)
 
 
+# The trial pickle's result for each module cloudpickle pickles by value that a stage reads
+# through its package (`_pickles_alone`), by module object, kept for one engine run: the engine
+# makes one for each run (`Engine._orchestrate_execution`), so a module that many stages read, as a
+# matrix's do, is tried once in a run, and a later run, whose module may hold other values, or be
+# another object after a reload, tries again.
+type PickleTrials = dict[_stdlib_types.ModuleType, bool]
+
+
 def prepare_worker_info(
     stage_info: RegistryStageInfo,
     pipeline: registry.PipelineLike,
@@ -551,20 +572,22 @@ def prepare_worker_info(
     project_root: pathlib.Path,
     default_state_dir: pathlib.Path,
     store_spec: store_mod.StoreSpec,
+    pickle_trials: PickleTrials,
 ) -> worker.WorkerStageInfo:
     """Prepare stage info for pickling to worker process.
 
     Uses stage's state_dir if set, otherwise falls back to default_state_dir. The worker receives
     this process's state resolution, so it reads every state file where the coordinator does.
+    `pickle_trials` is the engine run's record of the modules it tried to pickle (`PickleTrials`).
     """
     state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
     state_dir_mod.make_state_dir(state_dir)
 
-    # The fingerprint is computed first: it sets `unsafe_fingerprint`.
-    fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
+    # The fingerprint is computed first: it sets `unsafe_fingerprint` and `read_submodules`.
+    stage_fingerprint = pipeline.ensure_fingerprint(stage_info["name"])
     info = worker.WorkerStageInfo(
         func=stage_info["func"],
-        fingerprint=fingerprint,
+        fingerprint=stage_fingerprint,
         deps=stage_info["deps"],
         outs=stage_info["outs"],
         store_spec=store_spec,
@@ -588,7 +611,71 @@ def prepare_worker_info(
     # The workers started with other digests: the coordinator loaded user code since then.
     if (digests := loaded_source.digests_for_stage()) is not None:
         info["loaded_sources"] = digests
+    # The submodules the stage reads through their packages (`read_submodules`), sent with the
+    # stage as `_sent_submodules` decides, for the worker to bind on its package before anything
+    # of the stage runs.
+    if (names := stage_info.get("read_submodules")) and (
+        sent := _sent_submodules(names, pickle_trials)
+    ):
+        info["sent_submodules"] = sent
     return info
+
+
+class _Discarded:
+    """A binary file that keeps nothing written to it."""
+
+    def write(self, data: bytes) -> int:
+        return len(data)
+
+
+def _sent_submodules(
+    names: Sequence[str], pickle_trials: PickleTrials
+) -> tuple[_stdlib_types.ModuleType | str, ...]:
+    """The submodules of `names` (`RegistryStageInfo.read_submodules`, a package before its
+    submodules) that the coordinator sends with the stage (`worker.WorkerStageInfo.
+    sent_submodules`), in that order, each a module its package in this process holds bound
+    (`fingerprint.bound_submodule`): `sys.modules` holds it under its name, so cloudpickle never
+    pickles it as a module no process could import, and it is not one an import session took out of
+    `sys.modules` since the walk. One that cloudpickle pickles by reference
+    (`loaded_source.pickled_by_value`: neither it nor a package of it is registered by value) is
+    sent by its name, with no trial pickle, for the worker to import before anything of the stage
+    runs (`worker._sent_submodules_bound`), not as it unpickles the call, where an import that
+    fails would break the pool. One that cloudpickle pickles by value is sent as the module, in
+    the stage's pickle, where it pickles alone (`_pickles_alone`). A module whose pickling raises,
+    as one holding a `threading.Lock` does, is not sent: the worker's call, which would carry it
+    whole, could not be pickled. Why: `docs/architecture/fingerprinting.md`, "Imports a Stage
+    Makes While It Runs"."""
+    by_value = cloudpickle.list_registry_pickle_by_value()
+    sent = list[_stdlib_types.ModuleType | str]()
+    for name in names:
+        package, _, attribute = name.rpartition(".")
+        parent = sys.modules.get(package)
+        if not isinstance(parent, _stdlib_types.ModuleType):
+            continue
+        module = fingerprint.bound_submodule(parent, attribute)
+        if module is None:
+            continue
+        if not loaded_source.pickled_by_value(name, by_value):
+            sent.append(name)
+        elif _pickles_alone(module, pickle_trials):
+            sent.append(module)
+    return tuple(sent)
+
+
+def _pickles_alone(module: _stdlib_types.ModuleType, pickle_trials: PickleTrials) -> bool:
+    """Whether cloudpickle pickles `module`, which it pickles by value, alone: its whole namespace,
+    written nowhere, in the coordinator's event loop, once per module object in an engine run
+    (`pickle_trials`)."""
+    if (known := pickle_trials.get(module)) is not None:
+        return known
+    try:
+        cloudpickle.dump(module, _Discarded())
+    except Exception:  # noqa: BLE001 - a module that does not pickle alone is not sent
+        pickles = False
+    else:
+        pickles = True
+    pickle_trials[module] = pickles
+    return pickles
 
 
 # =========================================================================

@@ -43,7 +43,14 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import xxhash
 
-from pivot import ast_utils, exceptions, loaded_source, metrics
+from pivot import (
+    ast_utils,
+    exceptions,
+    import_origin,
+    installed_distributions,
+    loaded_source,
+    metrics,
+)
 
 if TYPE_CHECKING:
     import pydantic.json_schema
@@ -108,11 +115,21 @@ _PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}"
 # are no `held:` entries, and a cache hit replays the reads of the code inside a value.
 # Version 42 rechecks classes whose DynamicClassAttribute/enum.property members were omitted.
 # Version 43 records a held classmethod's function and its original receiver class.
-_CACHE_SCHEMA_VERSION = 43
+# Version 45 (version 44 was never released) records by name (`byname:` entries) the library
+# module a stage reaches through a library base class, a class in a type hint or a class-body
+# annotation, a library class, instance, enum member or exception inside a value, a library loader
+# class, a library stage function, and a library callable whose `__module__` is not a string; not
+# builtins, the standard library or pivot. It also takes a file linked into site-packages that no
+# editable distribution's RECORD lists, as uv's symlink link mode links each file into its cache,
+# and a link to such a file, as library code (`is_library_file`), where version 43 walked it as
+# user code. And it walks a user submodule a stage reads through a library package
+# (`company.local.f()`, where `company` is a namespace package shared with an installed library),
+# which version 43 recorded by the package's name alone, records each submodule read so
+# (`submodule:<name>` entries, which a lock leaves out), and records which submodules each such
+# package holds (`us`), which a hit re-reads.
+_CACHE_SCHEMA_VERSION = 45
 
 _SCALAR_TYPES = (bool, int, float, str, bytes, type(None))
-
-_SITE_PACKAGE_PATHS = ("site-packages", "dist-packages")
 
 # Type alias for AST hash cache entry tuple.
 # Format: (rel_path, source_digest, qualname, py_version, schema_version, hash_hex)
@@ -126,26 +143,6 @@ class _PydanticModelProtocol(Protocol):
     def model_json_schema(
         cls, *, schema_generator: "type[pydantic.json_schema.GenerateJsonSchema]"
     ) -> dict[str, Any]: ...
-
-
-def _init_stdlib_paths() -> tuple[pathlib.Path, ...]:
-    """Build resolved stdlib paths for symlink-safe comparison.
-
-    Resolves sys.prefix and sys.base_prefix to handle environments where Python
-    is installed via symlinks (e.g., Homebrew). Deduplicates when not in a venv.
-    """
-    paths = list[pathlib.Path]()
-    for prefix in (sys.prefix, sys.base_prefix):
-        try:
-            resolved = pathlib.Path(prefix).resolve()
-        except OSError:
-            resolved = pathlib.Path(prefix)
-        if resolved not in paths:
-            paths.append(resolved)
-    return tuple(paths)
-
-
-_STDLIB_PATHS = _init_stdlib_paths()
 
 
 def _pivot_tui_dirs() -> tuple[pathlib.Path, ...]:
@@ -190,8 +187,18 @@ _PIVOT_PACKAGE_DIRS = (pathlib.Path(__file__).resolve().parent, *_pivot_tui_dirs
 # Cache for hash_function_ast results using weak references.
 # This avoids repeated AST parsing for the same function during fingerprinting
 # while ensuring stale entries are automatically cleaned up when functions are GC'd.
-# Note: WeakKeyDictionary is not thread-safe. Fingerprinting runs single-threaded
-# per process (multiprocessing uses separate memory spaces), so this is safe.
+# Note: this cache, the caches below and the persistent-cache state after them have no lock.
+# Stages are fingerprinted in the process that runs the pipeline, never in a worker (a worker is
+# a process of its own, with its own memory). There a stage is fingerprinted on the thread that
+# asks for it: `pivot status` and `pivot commit` on their main thread, the engine's skip check
+# and watched startup snapshot in anyio worker threads, a stage the skip check did not
+# fingerprint (`--force`, no lock yet) on the engine's event loop as it is sent to a worker
+# (`executor.core.prepare_worker_info`), a watch reload in a daemon thread. Those ask for one
+# stage at a time. An engine that serves RPC (`pivot repro --tui`, `pivot repro --watch
+# --serve`, `pivot run --tui`) does not: it fingerprints for an `explain` request on its event
+# loop and for a `commit` request in a worker thread, waiting only for the startup snapshot and a
+# reload (`Engine.wait_for_fingerprints`), so either can run while a run's skip check, or the
+# other request, fingerprints on another thread, and both use these caches at once.
 _hash_function_ast_cache: weakref.WeakKeyDictionary[Callable[..., Any], str] = (
     weakref.WeakKeyDictionary()
 )
@@ -212,11 +219,12 @@ _get_type_hints_cache: weakref.WeakKeyDictionary[Callable[..., Any], dict[str, A
 )
 
 
-# Module-level state for persistent AST hash caching.
-# Fingerprinting happens during discovery (single-threaded in coordinator process).
-# Workers (via ProcessPoolExecutor) have their own memory space and don't share this
-# state - any pending writes in workers are lost, which is fine since workers use
-# readonly StateDB and fingerprinting should complete during discovery.
+# Module-level state for persistent AST hash caching, in the process that fingerprints stages,
+# with no lock (the comment on `_hash_function_ast_cache` says when two threads fingerprint at
+# once). Workers (via ProcessPoolExecutor) have their own memory space and don't share this
+# state - any pending writes in workers are lost, which is fine since workers use readonly
+# StateDB and a stage's fingerprint is computed before its worker gets the stage
+# (`executor.core.prepare_worker_info`).
 _state_db: "StateDB | None" = None
 _state_db_init_attempted: bool = False
 # The state directory `_state_db` belongs to: the producing directory of its last lookup.
@@ -367,9 +375,10 @@ _identity_active: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextV
 
 
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
-# type-hint classes (`_hint_classes`), user-class members (`_user_methods`), mark decisions
-# (`_mark_decision`), class identities (`_class_identity`) and the parts of classes with no source
-# (`_sourceless_parts`), and by file name for source file digests (`_source_digest`).
+# type-hint classes (`_hint_parts`), user-class members (`_user_methods`), mark decisions
+# (`_mark_decision`), class identities (`_class_identity`), the parts of classes with no source
+# (`_sourceless_parts`) and the library part of a loaded module (`_held_module`), and by file
+# name for source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
 _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
@@ -488,8 +497,8 @@ def _get_state_db() -> "StateDB | None":
     it was opened for. One that fails to open is not tried again until the directory changes
     or the caches flush (graceful degradation).
 
-    Not thread-safe, but fingerprinting runs single-threaded per process
-    (see comment at line 33). Workers use separate memory spaces.
+    Not thread-safe: nothing guards this state, and two threads of one process can fingerprint at
+    once (see the comment on `_hash_function_ast_cache`). Workers use separate memory spaces.
     """
     global _state_db, _state_db_init_attempted, _state_db_dir
     state_dir = _producing_state_dir()
@@ -933,7 +942,9 @@ def _type_of(value: Any) -> type[Any]:
 # accessor the walk and `_form` used, so a cache hit reaches what the walk reached.
 #
 # Code edges: `g:NAME` a global (also recorded when absent), `c:NAME` a closure cell, `d:PARAM` a
-# default, `a:ATTR` a module attribute, `ca:ATTR` a class attribute (`Config.SCALE`, or `self.S`
+# default, `a:ATTR` a module attribute, `sub:ATTR` a submodule read from a library package's
+# namespace and `us` the names of the submodules a library package holds through which user code
+# is reached (`_process_user_submodules`), `ca:ATTR` a class attribute (`Config.SCALE`, or `self.S`
 # in a member), read from the class body that holds it (`_class_attribute`), `mc` a pydantic
 # model's `model_config` a member reads, `n:NAME` and `np:DOTTED` names in a class statement's
 # annotations, `m:NAME` a callable member of a user class's own namespace, `b:INDEX` a class's
@@ -973,6 +984,10 @@ def _read_step(owner: Any, step: str) -> Any:
                 return dict(_function_defaults(owner))[arg]
             case "a" | "cfg":
                 return getattr(owner, arg)
+            case "sub":
+                return _module_namespace(owner)[arg]
+            case "us":
+                return tuple(sorted(_submodules_to_user_code(owner)))
             case "ca":
                 return _class_attribute(owner, arg)
             case "mc":
@@ -998,7 +1013,7 @@ def _read_step(owner: Any, step: str) -> Any:
                 settings = _lru_cache_settings(attributes.get("cache_parameters"))
                 return _UNREAD if settings is None else settings
             case "hc":
-                return _hint_classes(owner)[int(arg)]
+                return _hint_parts(owner).classes[int(arg)]
             case "fc":
                 return _model_field_classes(owner)[int(arg)]
             case "lm":
@@ -1114,7 +1129,9 @@ def _read_token(owner: Any, step: str) -> str:
     the key of each class in it, so a cache hit forms it again and walks no code in it.
     """
     if step == "hints":
-        return "|".join(_value_token(cls) for cls in _hint_classes(owner))
+        parts = _hint_parts(owner)
+        library = (f"byname:{name}" for name in parts.modules)
+        return "|".join([*(_value_token(cls) for cls in parts.classes), *library])
     if step == "schema":
         if not hasattr(owner, "model_json_schema"):
             return "absent"
@@ -1377,8 +1394,9 @@ def _stage_manifest(
     func: Callable[..., Any], *, recording: bool
 ) -> tuple[dict[str, str], list[tuple[tuple[str, ...], str]]]:
     """The manifest of stage function `func`: its `self:` hash and the projection of its node, in
-    a walk of its own (`_loaders_walk` says why); with `recording`, also the reads that projection
-    takes."""
+    a walk of its own (`_loaders_walk` says why), and, for a stage function defined in a library
+    module, that module by name (`_reached_library_module`); with `recording`, also the reads
+    that projection takes."""
     # Public callers need the same identity sharing as an engine's surrounding pass. Otherwise
     # each ancestor's class key restarts its complete base walk, multiplying deep-MRO work.
     with fingerprint_pass():
@@ -1387,6 +1405,12 @@ def _stage_manifest(
         walk.run()
         manifest = {f"self:{getattr(func, '__name__', '<lambda>')}": hash_function_ast(func)}
         reads = _project(root, manifest, recording=recording)
+        # Decided by its module, not `is_user_code(func)`: a user function the walk records by
+        # name for a mark (`_recorded_by_name`) is not library code.
+        module = _get_module(func)
+        if module is not None and not is_user_code(module):
+            # Its body is hashed (`self:`), the rest of its module is not: a worker imports it.
+            _mark_by_name(_reached_library_module(func), manifest)
         return manifest, reads
 
 
@@ -1457,6 +1481,7 @@ _STEP_WORDS = {
     "c": "closure variable '{}'",
     "d": "the default of parameter '{}'",
     "a": "module attribute '{}'",
+    "sub": "submodule '{}'",
     "ca": "class attribute '{}'",
     "n": "'{}' in its class statement",
     "np": "'{}' in its class statement",
@@ -1557,7 +1582,22 @@ def _collected_capture_errors() -> Iterator[None]:
     finally:
         _capture_errors.reset(token)
     if errors:
-        raise exceptions.StageDefinitionError("\n\n".join(_merged_refusals(errors)))
+        raise exceptions.StageDefinitionError(_REFUSAL_SEPARATOR.join(_merged_refusals(errors)))
+
+
+# What `_collected_capture_errors` joins a stage's refusals with, raised together: a blank line.
+_REFUSAL_SEPARATOR = "\n\n"
+
+
+def without_stage_prefix(message: str, stage_name: str) -> str:
+    """`message`, the error of a fingerprint of stage `stage_name`, for a caller that names the
+    stage before it: each refusal in it (one, or several joined by `_REFUSAL_SEPARATOR`) that
+    starts with the stage's name (`_prefix_of`) is given without that start, and all other text
+    as it is."""
+    prefix = _prefix_of(stage_name)
+    return _REFUSAL_SEPARATOR.join(
+        refusal.removeprefix(prefix) for refusal in message.split(_REFUSAL_SEPARATOR)
+    )
 
 
 def refuse(message: str) -> None:
@@ -1700,6 +1740,20 @@ def _collect_nested_code_globals(code: types.CodeType) -> set[str]:
             nested_globals.update(const.co_names)
             nested_globals.update(_collect_nested_code_globals(const))
     return nested_globals
+
+
+def _nested_globals(
+    code: types.CodeType, namespace: Mapping[str, Any], read: Collection[str]
+) -> dict[str, Any]:
+    """The globals the code nested in `code` names (`_collect_nested_code_globals`), but the names
+    `read`, which the caller took from `code`'s own: each in sorted order, with the value the
+    namespace `namespace` holds under it, or `_UNREAD` when it holds none. What the walk
+    (`_expand_function`) and the scan of a `@no_fingerprint` stage (`submodule_entries`) read
+    beyond `code`'s own names."""
+    return {
+        name: namespace[name] if name in namespace else _UNREAD
+        for name in sorted(_collect_nested_code_globals(code).difference(read))
+    }
 
 
 def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
@@ -1916,18 +1970,14 @@ def _expand_function(func: Callable[..., Any]) -> None:
     code_obj = getattr(func, "__code__", None)
     func_globals = getattr(func, "__globals__", None)
     if code_obj is not None and func_globals is not None:
-        already_processed = set(closure_vars.globals.keys())
-        nested_global_names = _collect_nested_code_globals(code_obj)
-        new_names = nested_global_names - already_processed
-        if new_names:
-            nested_globals_dict = dict[str, Any]()
-            for name in sorted(new_names):
-                if name in func_globals:
-                    nested_globals_dict[name] = func_globals[name]
-                elif not name.startswith("__"):
-                    _record_read(func, f"g:{name}")
-            if nested_globals_dict:
-                _process_closure_values(nested_globals_dict, func, prefix="g")
+        nested_globals_dict = dict[str, Any]()
+        for name, value in _nested_globals(code_obj, func_globals, closure_vars.globals).items():
+            if value is not _UNREAD:
+                nested_globals_dict[name] = value
+            elif not name.startswith("__"):
+                _record_read(func, f"g:{name}")
+        if nested_globals_dict:
+            _process_closure_values(nested_globals_dict, func, prefix="g")
 
     _process_default_values(func)
     _process_type_hint_dependencies(func)
@@ -1941,7 +1991,9 @@ def _expand_class(cls: type) -> None:
     that `__bases__` does not hold (`ob:INDEX`, a `TypedDict`'s), every callable member of its own
     namespace (`m:`), each class attribute a member reads through its receiver (`ca:`), its own
     dataclass field defaults (`fd:`), a pydantic model's schema and field defaults (`schema`,
-    `fc:`, `sd:`), and for a class with no source the values its namespace holds (`ns:`).
+    `fc:`, `sd:`), and for a class with no source the values its namespace holds (`ns:`). A
+    library base, whose code is not walked, is read too, and its module recorded by name
+    (`_reached_library_module`).
 
     Every class's bases are its edges, a class statement's or a `type()` class's alike, and its
     members are its own namespace's: a member it inherits is its base's, walked once under the
@@ -1956,19 +2008,17 @@ def _expand_class(cls: type) -> None:
     _process_class_body_dependencies(cls)
     bases = _class_bases(cls)
     for index, base in enumerate(bases):
-        if base is object or not is_user_code(base):
+        if base is object:
             continue
         step = f"b:{index}"
         _record_read(cls, step)
-        with _walking(step):
-            _add_callable(base, in_value=True)
+        _class_edge(base, step, in_value=True)
     for index, base in enumerate(_statement_bases(cls)):
-        if any(base is known for known in bases) or not is_user_code(base):
+        if any(base is known for known in bases):
             continue
         step = f"ob:{index}"
         _record_read(cls, step)
-        with _walking(step):
-            _add_callable(base, in_value=True)
+        _class_edge(base, step, in_value=True)
     _process_user_methods(cls)
     _process_instance_class_attributes(cls)
     _process_dataclass_defaults(cls)
@@ -1987,6 +2037,18 @@ def _statement_bases(cls: type) -> tuple[type, ...]:
     if type(written) is not tuple:
         return ()
     return tuple(base for base in cast("tuple[Any, ...]", written) if issubclass(type(base), type))
+
+
+def _class_edge(target: type, step: str, *, in_value: bool = False) -> None:
+    """The edge `step` of the class node being expanded to class `target` (a base, or a class its
+    statement's annotations name): a library class is not walked, and the library module whose
+    code it runs is recorded by name (`_reached_library_module`); a user class is walked under
+    `step` (`_add_callable`, keyed inside a value when `in_value`)."""
+    if not is_user_code(target):
+        _mark_by_name(_reached_library_module(target), _entries())
+        return
+    with _walking(step):
+        _add_callable(target, in_value=in_value)
 
 
 def _process_user_methods(cls: type) -> None:
@@ -2102,12 +2164,13 @@ def _class_member_parts(name: str, raw: Any) -> list[tuple[str, Any]]:
 
 @functools.lru_cache(maxsize=4096)
 def _is_user_source_file(filename: str) -> bool:
-    """Whether a code object's filename is a real source file outside library directories."""
+    """Whether a code object's filename is a real source file that is not library code
+    (`is_library_file`)."""
     try:
         path = pathlib.Path(filename).resolve()
     except OSError:
         return False
-    return path.is_file() and not is_library_path(path)
+    return path.is_file() and not is_library_file(filename)
 
 
 def _written_in_user_source(function: types.FunctionType) -> bool:
@@ -2332,15 +2395,90 @@ def covered_user_modules(manifest: Mapping[str, str], outputs: Collection[str]) 
     }
 
 
+def read_submodules(manifest: Mapping[str, str]) -> tuple[str, ...]:
+    """The names of the submodules a stage reads through the library packages that hold them
+    (`company.local` in `company.local.f()`, `_process_user_submodules`), sorted, so a package
+    comes before its submodules: its `submodule:<name>` keys (`_add_submodule_read`), the stage's
+    own and its loaders', which join the stage's without a prefix (`merge_loader_fingerprint`).
+    The coordinator sends each with the stage, by name where cloudpickle pickles it by reference
+    and as the module where it pickles it by value and it pickles alone, for its worker to bind on
+    the package (`executor.core.prepare_worker_info`).
+    A lock does not record these keys (`as_locked`), so the registry keeps the names beside the
+    stage's fingerprint (`registry.RegistryStageInfo`)."""
+    return tuple(
+        sorted(key.removeprefix("submodule:") for key in manifest if key.startswith("submodule:"))
+    )
+
+
+def _add_submodule_read(entries: dict[str, str], name: str) -> None:
+    """Record in a walk's `entries` that the stage reads submodule `name` through the library
+    package that holds it: the key `submodule:<name>`, with an empty value."""
+    entries.setdefault(f"submodule:{name}", "")
+
+
 def _mark_by_name(module_name: object, manifest: dict[str, str]) -> None:
     """Record that a stage's worker imports module `module_name` by name to run code the walk
-    does not hash: a library module read as a global or imported in a function body, or the
-    module that defines a callable recorded by name (`ext:`). `loaded_source.check_worker_imports`
-    compares each with the module the worker would import, and the manifest cache re-checks
-    where each resolves (`_try_manifest_cache_hit`). A lock does not record these entries
-    (`without_by_name`)."""
+    does not hash: a library module read as a global or imported in a function body, the module
+    that defines a callable recorded by name (`ext:`), or a library module the stage reaches by a
+    class, a hint, a loader, a value or its own function (`_reached_library_module`).
+    `loaded_source.check_worker_imports` compares each with the module the worker would import,
+    and the manifest cache re-checks where each resolves (`_try_manifest_cache_hit`). A lock does
+    not record these entries (`as_locked`)."""
     if isinstance(module_name, str) and module_name:
         manifest.setdefault(f"byname:{module_name}", "")
+
+
+def _reached_library_module(value: object) -> str | None:
+    """The name of the library module whose code a stage reaches through `value`, for its
+    `byname:` entry (`_mark_by_name`), at each place where a stage reaches library code that no
+    other entry names: a library base class, a library class in a type hint or a class-body
+    annotation, a library class, instance, enum member or exception inside a value, a library
+    loader class, a stage function that is library code, and a library callable whose `__module__`
+    is not a string. The module named is the one `value` declares (`_declared_module`). When that
+    is not a string (a class body that sets `__module__` to None), it is the library module that
+    binds `value` under its own name (`_library_module`); a value that no loaded library module
+    binds so gives None, and records nothing. None also for builtins and every other
+    standard-library module (its top-level name is in `sys.stdlib_module_names`), and for a loaded
+    module whose file lies in one of pivot's own packages (`_PIVOT_PACKAGE_DIRS`): no installed
+    distribution of the user's comes from either, and a stage's `int` hints and `StageParams` base
+    add no entry. A module that is not loaded has no file to decide by, so its name is kept."""
+    module_name = _declared_module(value)
+    if not isinstance(module_name, str):
+        exporter = _library_module(value)
+        module_name = exporter.__name__ if exporter is not None else None
+    if not isinstance(module_name, str) or not module_name:
+        return None
+    if module_name.partition(".")[0] in sys.stdlib_module_names:
+        return None
+    module = sys.modules.get(module_name)
+    if not isinstance(module, types.ModuleType):
+        return module_name
+    # Read through the module's namespace, so no code of a module subclass runs.
+    file = _module_namespace(module).get("__file__")
+    if isinstance(file, str) and _in_pivot_packages(file):
+        return None
+    return module_name
+
+
+def _library_callable_module(value: object, module_name: str | None) -> str | None:
+    """The name of the module a worker imports to run library callable `value`: `module_name`,
+    the `__module__` its caller read and took as a module's name, or, when it took none (None),
+    the library module that `_reached_library_module` gives, the one that binds `value` under its
+    own name (scipy.special's ufuncs name no `__module__`), or None. Each caller reads and checks
+    `__module__` its own way: a reader decides what a `__getattr__` that raises does, and a check
+    (`isinstance` or `type(...) is str`) what a `str` subclass does."""
+    if module_name is not None:
+        return module_name
+    return _reached_library_module(value)
+
+
+@functools.lru_cache(maxsize=4096)
+def _in_pivot_packages(file: str) -> bool:
+    """Whether a module's `file`, resolved, lies in one of pivot's own packages
+    (`_PIVOT_PACKAGE_DIRS`): decided once per file name per process, as `_is_user_source_file`
+    decides, since every stage with a pivot loader reaches that loader's module again, inside a
+    `fingerprint_pass()` or not."""
+    return _under_pivot_package_dirs(pathlib.Path(file).resolve())
 
 
 def _by_name_entry(key: str) -> str | None:
@@ -2353,27 +2491,154 @@ def _by_name_entry(key: str) -> str | None:
     return None
 
 
+def _left_out_of_lock(key: str) -> bool:
+    """Whether a lock leaves out the manifest entry `key` (`as_locked`): a `byname:` entry
+    (`_by_name_entry`) or a `submodule:` entry (`read_submodules`), each only ever a top-level key,
+    as a loader's join the stage's without a prefix (`merge_loader_fingerprint`)."""
+    return _by_name_entry(key) is not None or key.startswith("submodule:")
+
+
 def by_name_modules(manifest: Mapping[str, str], outputs: Collection[str]) -> set[str]:
     """Names of the modules a stage's worker imports by name, as far as its manifest says: the
     user modules it covers (`covered_user_modules`, which the stage's output keys `outputs` place)
     and the `byname:` entries, its loaders' included."""
     names = covered_user_modules(manifest, outputs)
-    names.update(name for key in manifest if (name := _by_name_entry(key)) is not None)
+    names.update(_by_name_names(manifest))
     return names
 
 
-def without_by_name(manifest: Mapping[str, str]) -> dict[str, str]:
-    """`manifest` as a lock records it: without the `byname:` entries, which the worker-import
-    check and the manifest cache read. They name only modules whose code no entry hashes, so a
-    lock written before they existed stays current and an upgrade reruns nothing. Every `dep:`
-    and `out:` entry stays, a dependency or output named `byname` included."""
-    return {key: value for key, value in manifest.items() if _by_name_entry(key) is None}
+def _by_name_names(manifest: Mapping[str, str]) -> list[str]:
+    """The module each `byname:` entry of `manifest` names (`_by_name_entry`), in manifest
+    order."""
+    return [name for key in manifest if (name := _by_name_entry(key)) is not None]
+
+
+def add_distribution_keys(manifest: dict[str, str]) -> None:
+    """Add to a stage's merged `manifest` the `dist:` keys of the distributions its `byname:`
+    modules (the stage's and its loaders') come from, and of those they depend on
+    (`installed_distributions.distribution_keys`), and report each refusal it finds with the
+    stage's others, its message started with the stage's name (`_stage_prefix`), as the other
+    downgradable refusals start theirs: unsafe fingerprinting downgrades it to a warning, which
+    then names the stage it lets run.
+
+    A module's origin is the module this process holds, which is the code the walk saw
+    (`loaded_source.check_worker_imports` refuses a worker that would import another), else where
+    a worker would import it from, predicted without importing it (`loaded_source.worker_spec`,
+    which gives the origin and the file at once). Beside it go the places of the module's file
+    (`_places` of the module's file as its import located it, else of the predicted spec's): the
+    file Pivot judges it by (`judged_file`) and every later file of its chain of links. In a venv
+    uv links into its cache the origin lies in the cache, and only those files name the site
+    directories and the package's directory where the chain of links reaches a library path,
+    where another distribution may put a file. No origin is found when the manifest has no
+    `byname:` entry, or when no distribution on the worker's path can give a key or a refusal
+    (`installed_distributions.needs_origins`).
+
+    Only library code is given (`_library_part`): a module whose file is user code, which the
+    walk hashes or the user names by name (`@pivot.fingerprint_by_name`), is left out, and a
+    namespace package keeps only its directories that are library paths (`is_library_path`, the
+    rule `is_library_file` gives the files in them), and is left out when none is. So no
+    distribution's RECORD, nor its lack of one, decides a file or a directory of user code: a
+    project's `@pivot.fingerprint_by_name` helper whose file is user code, and the project's part
+    of a namespace package shared with a library (in the project root, a `src/` directory, a
+    `PYTHONPATH` entry), give no key and no refusal, as in pivot 0.10.4, whatever metadata lies
+    beside them; a namespace package's directory under the interpreter's prefix (a `--target`
+    install, pip's checkout in `<venv>/src`) is keyed and refused as one in site-packages is."""
+    names = _by_name_names(manifest)
+    if not names:
+        return
+    path = loaded_source.worker_path()
+    pivot_dirs = _pivot_dir_names()
+    if not installed_distributions.needs_origins(path, pivot_dirs):
+        return
+    modules = dict[str, installed_distributions.ReachedModule]()
+    for name in names:
+        module = sys.modules.get(name)
+        if isinstance(module, types.ModuleType):
+            reached = _held_module(module)
+        else:
+            reached = _library_part(*loaded_source.worker_spec(name))
+        if reached is not None:
+            modules[name] = reached
+    found = installed_distributions.distribution_keys(modules, path, pivot_dirs)
+    prefix = _stage_prefix()
+    for message in found.refusals:
+        _report_refusal(prefix + message, downgradable=True)
+    manifest.update(found.keys)
+
+
+def _held_module(module: types.ModuleType) -> installed_distributions.ReachedModule | None:
+    """What `installed_distributions` takes of the library code of a module this process holds
+    (`_library_part`), from its origin (`import_origin.of_module`) and its file as its import
+    located it (`import_origin.file_of_module`), found once per module object within one
+    `fingerprint_pass()`."""
+    return _memoized(
+        "reached-module",
+        module,
+        lambda: _library_part(
+            import_origin.of_module(module), import_origin.file_of_module(module)
+        ),
+    )
+
+
+def _library_part(
+    origin: import_origin.Origin | None, file: str | None
+) -> installed_distributions.ReachedModule | None:
+    """What `installed_distributions` takes of the library code of a module a stage reaches by
+    name, whose origin is `origin` and whose file, as its import located it or would locate it, is
+    `file` (`reached_module_of`). None for a module whose file is user code (`is_library_file`):
+    the walk hashes it, or the user names it by name, so no installed distribution's RECORD
+    decides it. A namespace package keeps only its directories that are library paths
+    (`is_library_path`, of each directory as `import_origin` resolves it: the rule
+    `is_library_file` gives the files in it, so a directory under the interpreter's prefix outside
+    site-packages, as a `--target` install that a `.pth` file puts on `sys.path`, is kept as the
+    same install in site-packages is), and gives None when none is, so the project's part of a
+    namespace package it shares with a library (in the project root, a `src/` directory, a
+    `PYTHONPATH` entry) is neither owned nor walked. Every other origin (a library file,
+    built-in, frozen, no file, unknown, None) is given whole."""
+    match origin:
+        case ("namespace", *directories):
+            library = tuple(
+                directory for directory in directories if is_library_path(pathlib.Path(directory))
+            )
+            return reached_module_of(("namespace", *library), file) if library else None
+        case ("file", _) if file is not None and not is_library_file(file):
+            return None
+        case _:
+            return reached_module_of(origin, file)
+
+
+def reached_module_of(
+    origin: import_origin.Origin | None, file: str | None
+) -> installed_distributions.ReachedModule:
+    """What `installed_distributions` takes of a module a stage reaches by name, whose origin is
+    `origin` and whose file, as its import located it or would locate it, is `file`: that origin
+    and the places of `file` (`_places`: the file Pivot judges it by, `judged_file`, then every
+    later file of its chain of links), none when it has no file. So the keys and the refusals
+    name the site directories and the package directory where the chain of links reaches a
+    library path. For a file whose path with its directory resolved is a library path already
+    (every file of a venv, copied or linked into uv's cache), the first place is
+    `with_real_directory(file)`. The one builder of both a module this process holds and one a
+    worker would import (`loaded_source.worker_spec`), through `_library_part`."""
+    return installed_distributions.ReachedModule(origin, () if file is None else _places(file))
+
+
+def as_locked(manifest: Mapping[str, str]) -> dict[str, str]:
+    """`manifest` as a lock records it: without the `byname:` and `submodule:` entries
+    (`_left_out_of_lock`), which the worker-import check, the manifest cache and the coordinator
+    read. They add nothing a lock would compare: a `byname:` entry names a module whose code no
+    entry hashes, and a `submodule:` entry a submodule whose code and coverage its `func:` and
+    `module:` entries already record. So a lock written before they existed stays current and an
+    upgrade reruns nothing for them. Every `dep:` and `out:` entry stays, a dependency or output
+    named `byname` or `submodule` included."""
+    return {key: value for key, value in manifest.items() if not _left_out_of_lock(key)}
 
 
 def _is_library_spec(spec: importlib.machinery.ModuleSpec) -> bool:
-    """Whether a top-level module's spec locates library code (`is_library_path`), or no file."""
+    """Whether a top-level module's spec locates library code, or no file: its origin by
+    `is_library_file`, and the directories of a namespace package by `is_library_path`, resolved,
+    since uv's symlink link mode keeps a site directory's directories real and links only files."""
     if spec.has_location and spec.origin is not None:
-        return is_library_path(pathlib.Path(spec.origin).resolve())
+        return is_library_file(spec.origin)
     locations = list(spec.submodule_search_locations or ())
     if not locations:
         return True
@@ -2465,14 +2730,41 @@ def _names_submodule(module: types.ModuleType, attribute: str) -> bool:
     """Whether `from module import attribute` binds a submodule: `module` lacks the attribute,
     so the import loads `module.attribute`, or the attribute is that submodule."""
     value = vars(module).get(attribute, _UNREAD)
-    return value is _UNREAD or (
-        isinstance(value, types.ModuleType) and value.__name__ == f"{module.__name__}.{attribute}"
-    )
+    return value is _UNREAD or _is_submodule(module.__name__, attribute, value)
+
+
+def _is_submodule(package_name: object, attribute: str, value: object) -> bool:
+    """Whether `value`, which the namespace of the package named `package_name` holds under
+    `attribute`, is that package's submodule `<package_name>.<attribute>`: a module whose own
+    namespace names it so, read through `ModuleType`'s descriptor (`_module_namespace`), so no
+    code of a module subclass runs."""
+    if type(package_name) is not str or not issubclass(type(value), types.ModuleType):
+        return False
+    name = _module_namespace(cast("types.ModuleType", value)).get("__name__")
+    return type(name) is str and name == f"{package_name}.{attribute}"
+
+
+def bound_submodule(package: types.ModuleType, attribute: str) -> types.ModuleType | None:
+    """The submodule `<package>.<attribute>` bound on package `package` under `attribute`, as its
+    import binds it, or None: a plain module (`types.ModuleType` itself, not a subclass such as
+    six's lazy `six.moves`, whose attributes can run code when read) whose own namespace names it so
+    (`_is_submodule`), and which `sys.modules` holds under that name, so one an import session
+    removed since (`discovery`) is not. Read through `ModuleType`'s descriptor
+    (`_module_namespace`), so no `__getattr__` of the package runs and nothing is imported. The
+    walk follows such a submodule (`_submodules_to_user_code`), and the coordinator sends it with
+    the stage where `executor.core._sent_submodules` decides to (`read_submodules`)."""
+    namespace = _module_namespace(package)
+    value = namespace.get(attribute)
+    name = namespace.get("__name__")
+    if type(value) is not types.ModuleType or not _is_submodule(name, attribute, value):
+        return None
+    return value if sys.modules.get(f"{name}.{attribute}") is value else None
 
 
 def _process_class_body_dependencies(cls: type) -> None:
     """Add an edge to each user class a class statement's annotations name (`n:NAME`, or
-    `np:DOTTED` for `pkg.Type`), read in the namespace of the class's module. Its bases are its
+    `np:DOTTED` for `pkg.Type`), read in the namespace of the class's module, and record by name
+    the module of each library class they name (`_reached_library_module`). Its bases are its
     `b:` edges (`_expand_class`), the classes `__bases__` holds, not the names its statement
     wrote."""
     try:
@@ -2502,18 +2794,17 @@ def _process_class_body_dependencies(cls: type) -> None:
         if name not in ns:
             continue
         value = ns[name]
-        if issubclass(type(value), type) and is_user_code(value):
-            with _walking(f"n:{name}"):
-                _add_callable(value)
+        if not issubclass(type(value), type):
+            continue
+        _class_edge(value, f"n:{name}")
 
     for parts in dotted_refs:
         step = f"np:{'.'.join(parts)}"
         _record_read(cls, step)
         resolved = _resolve_dotted_path(parts, ns)
-        if not issubclass(type(resolved), type) or not is_user_code(resolved):
+        if not issubclass(type(resolved), type):
             continue
-        with _walking(step):
-            _add_callable(resolved)
+        _class_edge(resolved, step)
 
 
 def _collect_annotation_names(
@@ -2635,7 +2926,9 @@ def _expand_loader_class(loader_type: type[Any], key: str) -> None:
     and `empty` (`lm:NAME`) and of the members they reach (`lr:REF`,
     `_reachable_loader_members`), and the hashes of its `load`, `save` and overridden `empty`
     (`loader:<key>:load`, `:save`, `:empty`). A member the class itself defines is keyed under
-    the node's key."""
+    the node's key. The module of each library class on its MRO, a library loader class's own
+    included, is recorded by name (`_reached_library_module`): the code those classes' methods
+    call is not walked."""
     from pivot import loaders as loaders_module
 
     stage_name = _current_stage_name.get() or _class_qualname(loader_type)
@@ -2654,10 +2947,14 @@ def _expand_loader_class(loader_type: type[Any], key: str) -> None:
         with _walking(step):
             _process_captured_value(binding, binding, member, loader_type, stage_name, chain=None)
 
+    entries = _entries()
+    for klass in _class_mro(loader_type):
+        if not is_user_code(klass):
+            _mark_by_name(_reached_library_module(klass), entries)
+
     # Use each method definition rather than a temporary bound method so the
     # weak AST hash cache retains the entry across loader fingerprint calls.
     methods = cast("Any", loader_type)
-    entries = _entries()
     if _on_mro(loader_type, loaders_module.Writer):
         entries[f"loader:{key}:save"] = hash_function_ast(_method_function(methods.save))
 
@@ -2690,22 +2987,22 @@ def merge_loader_fingerprint(
     manifest: dict[str, str], prefix: str, loader: "loaders.Writer[Any] | loaders.Reader[Any]"
 ) -> None:
     """Add `loader`'s manifest (`get_loader_fingerprint`) to a stage's `manifest`: each entry
-    under `prefix` (`dep:<parameter>:`, `out:<output>:`), but the `byname:` entries as they are
-    (`_merge_prefixed`)."""
+    under `prefix` (`dep:<parameter>:`, `out:<output>:`), but the `byname:` and `submodule:`
+    entries as they are (`_merge_prefixed`)."""
     _merge_prefixed(manifest, prefix, get_loader_fingerprint(loader))
 
 
 def _merge_prefixed(manifest: dict[str, str], prefix: str, entries: Mapping[str, str]) -> None:
-    """Add a loader's manifest `entries` to `manifest`, each under `prefix`, but the `byname:`
-    entries as they are. Those name modules the loader's code makes a worker import, not the
-    dependency, output or holder, so a `byname:` entry is only ever a top-level key
-    (`_by_name_entry`), which a lock leaves out, and a dependency or output named `byname` keeps
-    every entry of its own."""
+    """Add a loader's manifest `entries` to `manifest`, each under `prefix`, but the `byname:` and
+    `submodule:` entries as they are. Those name modules the loader's code makes a worker import or
+    find bound on its package, not the dependency, output or holder, so such an entry is only ever
+    a top-level key (`_left_out_of_lock`), which a lock leaves out, and a dependency or output
+    named `byname` or `submodule` keeps every entry of its own."""
     for key, value in entries.items():
-        if _by_name_entry(key) is None:
-            manifest[f"{prefix}{key}"] = value
-        else:
+        if _left_out_of_lock(key):
             manifest.setdefault(key, value)
+        else:
+            manifest[f"{prefix}{key}"] = value
 
 
 def _is_pivot_loader_class(cls: type[Any]) -> bool:
@@ -3170,7 +3467,7 @@ def _check_non_scalar_capture(
     if parameter is not None:
         subject += f" as the default of parameter '{parameter}'"
     message = (
-        f"Stage '{stage_name}': {subject} (type: {type(value).__name__}).\n"
+        f"{_prefix_of(stage_name)}{subject} (type: {type(value).__name__}).\n"
         + "Pivot tracks module-level bool, int, float, str, bytes, and None values, tuples and "
         + "frozensets of them, and compiled regexes. Other values may change without a reliable "
         + "fingerprint, which can cause silent wrong outputs.\n"
@@ -3184,14 +3481,26 @@ def _check_non_scalar_capture(
 _SUPPRESSION = "To suppress: set core.unsafe_fingerprinting=true or PIVOT_UNSAFE_FINGERPRINTING=1"
 
 
+def _stage_prefix() -> str:
+    """`Stage '<name>': `, which starts the message of a refusal unsafe fingerprinting can
+    downgrade, so the warning it becomes names the stage it lets run: the stage that
+    `stage_fingerprint_scope` names (`_current_stage_name`), or `<unknown>` outside one."""
+    return _prefix_of(_current_stage_name.get() or "<unknown>")
+
+
+def _prefix_of(stage_name: str) -> str:
+    """`Stage '<stage_name>': `, the start of a refusal of stage `stage_name` that names it."""
+    return f"Stage '{stage_name}': "
+
+
 def _field_opaque_message(binding: str) -> Callable[[tuple[str, ...], Any], str]:
     """The refusal of a value whose state no form reads (`_admit`) inside the class-level default
     of field `binding` (a dataclass field, a `ClassVar`, a pydantic model's field)."""
 
     def message(_path: tuple[str, ...], value: Any) -> str:
-        stage_name = _current_stage_name.get() or "<unknown>"
         return (
-            f"Stage '{stage_name}': the default of field '{binding}' keeps state pivot cannot "
+            _stage_prefix()
+            + f"the default of field '{binding}' keeps state pivot cannot "
             + f"read (type: {_definition_ref(type(value))}).\n"
             + "Pivot hashes a class-level default by its value, its attributes and its slots; "
             + "this one keeps its state elsewhere (in C), so a change to it would go unseen, which "
@@ -3210,9 +3519,9 @@ def _bound_opaque_message(binding: str) -> Callable[[tuple[str, ...], Any], str]
     partial's arguments, a loader's config field, a `StageParams` default."""
 
     def message(path: tuple[str, ...], value: Any) -> str:
-        stage_name = _current_stage_name.get() or "<unknown>"
         return (
-            f"Stage '{stage_name}': bound value '{_binding_text(binding, path)}' keeps state Pivot "
+            _stage_prefix()
+            + f"bound value '{_binding_text(binding, path)}' keeps state Pivot "
             + f"cannot read (type: {_definition_ref(type(value))}).\n"
             + "Pivot fingerprints a value through its attributes, its slots and the value types "
             + "it knows; this value keeps its state outside them (in C), so a change to it could "
@@ -3230,9 +3539,9 @@ def _sourceless_opaque_message(ref: str, name: str) -> Callable[[tuple[str, ...]
     namespace of class `ref`, which has no source of its own."""
 
     def message(_path: tuple[str, ...], value: Any) -> str:
-        stage_name = _current_stage_name.get() or "<unknown>"
         return (
-            f"Stage '{stage_name}': class '{ref}', which has no source of its own, holds a value "
+            _stage_prefix()
+            + f"class '{ref}', which has no source of its own, holds a value "
             + f"whose state pivot cannot read in '{name}' (type: {_definition_ref(type(value))}).\n"
             + "Pivot hashes such a class by what defines it; this value keeps its state elsewhere "
             + "(in C), so a change to it would go unseen, which can cause silent wrong outputs.\n"
@@ -3339,17 +3648,31 @@ def _is_library_export(value: Any) -> bool:
     return _library_module(value) is not None
 
 
+def _declared_module(value: Any) -> object:
+    """The module `value` says defines it, its `__module__`: a class's read through `type`'s own
+    descriptor (`_class_module`), so no code of its metaclass runs; another value's looked up
+    (`_attribute_or_none`), None without one."""
+    if issubclass(type(value), type):
+        return _class_module(value)
+    return _attribute_or_none(value, "__module__")
+
+
 def _library_module(value: Any) -> types.ModuleType | None:
     """Return the non-user module that binds `value` under its own `__name__`, if any.
 
-    The module named by `__module__` is checked. An object without one (scipy.special's ufuncs,
-    such as `expit`) is looked up in every loaded module; `np.frompyfunc` products stay
-    refused because no module binds their generated names.
+    The module `value` declares (`_declared_module`) is checked. An object without one
+    (scipy.special's ufuncs, such as `expit`, or a class whose class body sets `__module__` to
+    None) is looked up in every loaded module; `np.frompyfunc` products stay refused because no
+    module binds their generated names. A class's `__name__` is read through `type`'s own
+    descriptor (`_class_name`), so no code of its metaclass runs.
     """
-    name = _attribute_or_none(value, "__name__")
+    if issubclass(type(value), type):
+        name = _class_name(value)
+    else:
+        name = _attribute_or_none(value, "__name__")
     if not isinstance(name, str):
         return None
-    module_name = getattr(value, "__module__", None)
+    module_name = _declared_module(value)
     candidates: list[types.ModuleType | None]
     if isinstance(module_name, str):
         candidates = [sys.modules.get(module_name)]
@@ -3455,8 +3778,10 @@ def _process_captured_value(
     module-level rule (a global, a cell, a default, a module or class attribute, a class member).
 
     `chain` is the expression `func` reaches the value by (`Config`, `settings.Config`, a
-    parameter name): the attributes read on a user class or user module are followed from it.
-    None means the value is not reached by a name, and its attributes are not followed.
+    parameter name): the attributes read on a user class or user module, and the submodules read
+    on a library package through which user code is reached (`_process_user_submodules`), are
+    followed from it. None means the value is not reached by a name, and its attributes are not
+    followed.
     `parameter` names the parameter when the value is a default argument.
     """
     entries = _entries()
@@ -3482,6 +3807,8 @@ def _process_captured_value(
             if not is_user_code(value):
                 # Its code is library code, not hashed; a worker imports it by name.
                 _mark_by_name(value.__name__, entries)
+                if chain is not None:
+                    _process_user_submodules(chain, value, func, stage_name)
             elif chain is not None:
                 _process_module_dependency(chain, value, func)
         case _ValueKind.SCALAR:
@@ -3496,7 +3823,9 @@ def _process_captured_value(
             # A library function or class is named by where it is defined; its code is not
             # hashed, but rebinding the name to another one must change the manifest.
             entries[f"ext:{binding_ref}"] = _library_name(value)
-            _mark_by_name(getattr(value, "__module__", None), entries)
+            module_name = getattr(value, "__module__", None)
+            accepted = module_name if isinstance(module_name, str) else None
+            _mark_by_name(_library_callable_module(value, accepted), entries)
         case _ValueKind.LOGGER:
             return
         case _ValueKind.HOOKED:
@@ -3813,47 +4142,69 @@ def _resolved_type_hints(func: Callable[..., Any]) -> dict[str, Any]:
     return hints
 
 
-def _hint_classes(func: Callable[..., Any]) -> list[type]:
-    """Return each user class in `func`'s type hints, including the origin of a generic
-    (`MyContainer[int]`). Within one `fingerprint_pass()` each function's hints are collected
-    once.
-    """
+class _HintParts(typing.NamedTuple):
+    """What a function's type hints name (`_hint_parts`)."""
 
-    def collect() -> list[type]:
-        found = list[type]()
+    # Each user class in them, the origin of a generic (`MyContainer[int]`) included.
+    classes: list[type]
+    # The module of each library class in them that the walk records by name.
+    modules: list[str]
+
+
+def _hint_parts(func: Callable[..., Any]) -> _HintParts:
+    """The user classes in `func`'s type hints and the modules of the library classes in them that
+    the walk records by name (`_collect_hint_classes`). Within one `fingerprint_pass()` each
+    function's hints are collected once."""
+
+    def collect() -> _HintParts:
+        parts = _HintParts(classes=[], modules=[])
         for hint in _resolved_type_hints(func).values():
-            _collect_hint_classes(hint, found)
-        return found
+            _collect_hint_classes(hint, parts)
+        return parts
 
     return _memoized("hints", func, collect)
 
 
-def _collect_hint_classes(hint: Any, found: list[type]) -> None:
-    """Add the user classes in one type hint to `found`, recursing into generics. A class is
-    decided on its real type first, so no metaclass attribute hook runs (`typing.get_origin`
-    would read its `__class__`)."""
+def _collect_hint_classes(hint: Any, parts: _HintParts) -> None:
+    """Add the user classes in one type hint to `parts.classes`, and the module of each library
+    class in it to `parts.modules` unless the walk does not record it (`_reached_library_module`),
+    recursing into generics. A class is decided on its real type first, so no metaclass attribute
+    hook runs (`typing.get_origin` would read its `__class__`)."""
     if hint is type(None):
         return
     if issubclass(type(hint), type):
-        if is_user_code(hint):
-            found.append(cast("type[Any]", hint))
+        _collect_hint_class(hint, parts)
         return
     origin = typing.get_origin(hint)
     if origin is not None:
-        # Track user-defined generic classes (e.g., MyGeneric[int] -> hash MyGeneric)
-        if issubclass(type(origin), type) and is_user_code(origin):
-            found.append(cast("type[Any]", origin))
+        # A generic's origin is a class of the hint too (MyGeneric[int] -> MyGeneric)
+        if issubclass(type(origin), type):
+            _collect_hint_class(origin, parts)
         for arg in typing.get_args(hint):
-            _collect_hint_classes(arg, found)
+            _collect_hint_classes(arg, parts)
+
+
+def _collect_hint_class(cls: type[Any], parts: _HintParts) -> None:
+    """Add class `cls` of a type hint to `parts.classes` when it is user code, else its module to
+    `parts.modules` when the walk records it (`_collect_hint_classes`)."""
+    if is_user_code(cls):
+        parts.classes.append(cls)
+    elif (name := _reached_library_module(cls)) is not None:
+        parts.modules.append(name)
 
 
 def _process_type_hint_dependencies(func: Callable[..., Any]) -> None:
-    """Add an edge to each user class in `func`'s type hints (`hc:INDEX`); a pydantic model's
-    schema and field defaults are its class node's (`_process_model_schema`)."""
+    """Add an edge to each user class in `func`'s type hints (`hc:INDEX`), and record by name the
+    module of each library class in them (`_hint_parts`); a pydantic model's schema and field
+    defaults are its class node's (`_process_model_schema`)."""
     _record_read(func, "hints")
-    for index, hint_class in enumerate(_hint_classes(func)):
+    parts = _hint_parts(func)
+    for index, hint_class in enumerate(parts.classes):
         with _walking(f"hc:{index}"):
             _add_callable(hint_class)
+    entries = _entries()
+    for module_name in parts.modules:
+        _mark_by_name(module_name, entries)
 
 
 def _strip_schema_metadata(schema: dict[str, Any]) -> dict[str, Any]:
@@ -4260,12 +4611,27 @@ class _FormBuilder:
         return None
 
     def external(self, value: Any) -> Any:
-        """A library callable, by where it is defined (`_library_name`); its module is reported,
-        for the worker imports it by name."""
-        module = _attribute_or_none(value, "__module__")
-        if type(module) is str and isinstance(sys.modules.get(module), types.ModuleType):
-            self.report(_ReportKind.EXTERNAL, module)
+        """A library callable, by where it is defined (`_library_name`), its module reported
+        (`callable_module`)."""
+        self.callable_module(value)
         return ["external", _library_name(value)]
+
+    def callable_module(self, value: Any) -> None:
+        """Report the module of library callable `value`, for the worker imports it by name
+        (`_library_callable_module`), unless its `__module__` is a string that names no loaded
+        module."""
+        declared = _attribute_or_none(value, "__module__")
+        accepted = declared if type(declared) is str else None
+        if accepted is not None and not isinstance(sys.modules.get(accepted), types.ModuleType):
+            return
+        if (module := _library_callable_module(value, accepted)) is not None:
+            self.report(_ReportKind.EXTERNAL, module)
+
+    def reached_module(self, value: Any, *steps: str) -> None:
+        """Report, at `steps`, the library module whose code `value` runs, when the walk records
+        it by name (`_reached_library_module`): a worker imports it by name."""
+        if (name := _reached_library_module(value)) is not None:
+            self.report(_ReportKind.EXTERNAL, name, *steps)
 
     def opaque(self, value: Any) -> Any:
         self.report(_ReportKind.OPAQUE, value)
@@ -4334,12 +4700,14 @@ class _FormBuilder:
     def class_label(self, cls: type[Any]) -> Any:
         """A class: a user class by its key (`label`), reported for its class node, or, when its
         metaclass answers attribute reads with user code, `hooked`; a library class by
-        `type.__repr__`, which runs no metaclass code (main's text)."""
+        `type.__repr__`, which runs no metaclass code (main's text), its module reported
+        (`reached_module`)."""
         if is_user_code(cls):
             if _attribute_hook(cls) is not None:
                 return self.hooked(cls)
             self.report(_ReportKind.CLASS, cls)
             return ["class", self.label(cls)]
+        self.reached_module(cls)
         return [_class_name(type(cls)), type.__repr__(cls)]
 
     def module(self, module: Any) -> Any:
@@ -4366,13 +4734,11 @@ class _FormBuilder:
 
     def function(self, func: Any) -> Any:
         """A Python function: main's `["function", function_identity]`, reported for its function
-        node (a user function) or its module (a library one)."""
+        node (a user function) or its module (a library one, `callable_module`)."""
         if is_user_code(func):
             self.report(_ReportKind.FUNCTION, func)
         else:
-            module = getattr(func, "__module__", None)
-            if type(module) is str and isinstance(sys.modules.get(module), types.ModuleType):
-                self.report(_ReportKind.EXTERNAL, module)
+            self.callable_module(func)
         return ["function", self.identity(func)]
 
     def identity(self, func: Any) -> FunctionIdentity:
@@ -4624,13 +4990,17 @@ class _FormBuilder:
         return self.part_rows(["cached_property"], ("cp", value.func))
 
     def cache_wrapper(self, value: Any) -> Any:
-        """A user cache's identity and statically readable settings, or a library name.
+        """A user cache's identity and statically readable settings, or a library name, its module
+        reported (`_library_callable_module`).
 
         Only the shared follower traverses user wrapper metadata. Replaced `cache_parameters`
         keeps unreadable settings in C and makes a user cache opaque.
         """
         if not is_user_code(value):
-            self.report(_ReportKind.EXTERNAL, getattr(value, "__module__", None))
+            declared = getattr(value, "__module__", None)
+            accepted = declared if type(declared) is str else None
+            if (module := _library_callable_module(value, accepted)) is not None:
+                self.report(_ReportKind.EXTERNAL, module)
             return ["external", _library_name(value)]
         self.report(_ReportKind.FUNCTION, value)
         attributes = _instance_dict(_type_of(value), value) or {}
@@ -4748,8 +5118,8 @@ class _FormBuilder:
 
     def state(self, tag: str, value: Any, value_type: type[Any], *, user: bool) -> Any:
         """An instance by its state (`field_rows`): a user class by its key, reported for its class
-        node at `cls`; a library class by its definition name. Opaque when its layout holds state
-        no descriptor shows (`_layout`)."""
+        node at `cls`; a library class by its definition name, its module reported at `cls`
+        (`reached_module`). Opaque when its layout holds state no descriptor shows (`_layout`)."""
         layout = self.layout(value_type)
         if not layout.readable:
             return self.opaque(value)
@@ -4762,6 +5132,7 @@ class _FormBuilder:
         if fields is None:
             return self.opaque(value)
         if not user:
+            self.reached_module(value_type, "cls")
             return [tag, _definition_ref(value_type), fields]
         self.report(_ReportKind.CLASS, value_type, "cls")
         return [tag, self.label(value_type), fields]
@@ -4836,6 +5207,8 @@ class _FormBuilder:
         user = is_user_code(value_type)
         if user:
             self.report(_ReportKind.CLASS, value_type, "cls")
+        else:
+            self.reached_module(value_type, "cls")
         state = dict[str, Any]()
         state["args"] = yield ("ea", _exception_args(value))
         found = _exception_fields(value_type, value)
@@ -4853,14 +5226,16 @@ class _FormBuilder:
 
     def enum_member(self, value: Any, value_type: type[Any]) -> Any:
         """An Enum member: its class (a user Enum's by its key, reported for its class node; a
-        library Enum's by its definition name), its name and its value's form (`ev`). A value is
-        not in a class statement's syntax tree (`PICK = settings.VALUE`), so it is formed."""
+        library Enum's by its definition name, its module reported: `reached_module`), its name and
+        its value's form (`ev`). A value is not in a class statement's syntax tree (`PICK =
+        settings.VALUE`), so it is formed."""
         attributes = _instance_dict(value_type, value) or {}
         name = attributes.get("_name_")
         if is_user_code(value_type):
             self.report(_ReportKind.CLASS, value_type, "cls")
             label = self.label(value_type)
         else:
+            self.reached_module(value_type, "cls")
             label = _definition_ref(value_type)
         head = ["enum", label, name if type(name) is str else None]
         return self.part_rows(head, ("ev", attributes.get("_value_")))
@@ -5149,11 +5524,11 @@ def _read_attribute_hook(meta: type[Any]) -> type[Any] | None:
 def _hooked_class_message(cls: type[Any]) -> str:
     """The refusal of class `cls`, whose metaclass answers attribute reads with user code
     (`_attribute_hook`)."""
-    stage_name = _current_stage_name.get() or "<unknown>"
     hook = _attribute_hook(cls)
     meta = _definition_ref(hook) if hook is not None else "?"
     return (
-        f"Stage '{stage_name}': class '{_definition_ref(cls)}' has the metaclass '{meta}', whose "
+        _stage_prefix()
+        + f"class '{_definition_ref(cls)}' has the metaclass '{meta}', whose "
         + "`__getattribute__` or `__getattr__` is user code, so reading the class runs it.\n"
         + "Pivot reads a class through `type`'s own descriptors and runs none of its code; this "
         + "class answers attribute reads with code, so what it holds could change unseen, which "
@@ -5166,9 +5541,9 @@ def _hooked_class_message(cls: type[Any]) -> str:
 
 def _proxy_message(binding: str, value: Any) -> str:
     """The refusal of library instance `value`, a proxy (`_forwards_attributes`), at `binding`."""
-    stage_name = _current_stage_name.get() or "<unknown>"
     return (
-        f"Stage '{stage_name}': value '{binding}' is a proxy (type: "
+        _stage_prefix()
+        + f"value '{binding}' is a proxy (type: "
         + f"{_definition_ref(type(value))}) whose class computes its attributes (`__getattr__` "
         + "or `__getattribute__`).\n"
         + "Pivot reads a value through its state and runs none of its code, so what the proxy "
@@ -5784,7 +6159,8 @@ def _process_module_dependency(
     the global rule, and a class or submodule has its own reads followed from the longer chain
     (`settings.Config.SCALE`). A cache hit re-reads each attribute (`a:NAME`). A library
     module's attributes are not read: they are library code, and `repr()` of objects like `np.c_`
-    holds an address; the module is recorded by name (`_process_captured_value`).
+    holds an address; the module is recorded by name (`_process_captured_value`), and only a
+    submodule of it through which user code is reached is followed (`_process_user_submodules`).
     """
     _mark_module_covered(module.__name__, _entries())
     stage_name = _current_stage_name.get() or getattr(func, "__name__", "<unknown>")
@@ -5805,6 +6181,126 @@ def _process_module_dependency(
                 stage_name,
                 chain=f"{chain}.{attribute}",
             )
+
+
+def _process_user_submodules(
+    chain: str, package: types.ModuleType, func: Callable[..., Any], stage_name: str
+) -> None:
+    """Walk each submodule `func` reads on library package `package`, reached as `chain`, through
+    which user code is reached (`_user_submodules_read`), as the value of a global is walked
+    (`_process_captured_value`), with the binding `<package>.<NAME>`, and record it, outside the
+    lock (`_add_submodule_read`): a user module is walked as one read as a global is, and a
+    library package on the way is recorded by name and followed in turn. The package's other
+    attributes are library code and are not read. What this reaches and why:
+    `docs/architecture/fingerprinting.md`, "Library modules" in What Gets Tracked. A cache hit
+    re-reads which submodules the package holds (`us`), so one bound on it since (an `import
+    company.other` added) is walked, and each submodule from the package's namespace (`sub:NAME`),
+    so no `__getattr__` of the package runs."""
+    _record_read(package, "us")
+    entries = _entries()
+    for attribute, submodule in _user_submodules_read(func, chain, package):
+        step = f"sub:{attribute}"
+        _record_read(package, step)
+        binding_ref = f"{package.__name__}.{attribute}"
+        _add_submodule_read(entries, binding_ref)
+        with _walking(step):
+            _process_captured_value(
+                binding_ref,
+                binding_ref,
+                submodule,
+                func,
+                stage_name,
+                chain=f"{chain}.{attribute}",
+            )
+
+
+def _user_submodules_read(
+    func: Callable[..., Any], chain: str, package: types.ModuleType
+) -> list[tuple[str, types.ModuleType]]:
+    """Each submodule `func` reads on library package `package`, reached as `chain`, through which
+    user code is reached (`_submodules_to_user_code`), with the attribute that holds it, in source
+    order (`_attributes_read`): what the walk follows (`_process_user_submodules`) and the scan of
+    a `@no_fingerprint` stage records (`submodule_entries`)."""
+    submodules = _submodules_to_user_code(package)
+    if not submodules:
+        return []
+    return [
+        (attribute, submodules[attribute])
+        for attribute in _attributes_read(func, chain)
+        if attribute in submodules
+    ]
+
+
+def _submodules_to_user_code(package: types.ModuleType) -> dict[str, types.ModuleType]:
+    """The submodules bound on library package `package` (`bound_submodule`) through which user
+    code is reached, by the attribute that holds each: a user module loaded from a source file
+    (`is_user_source_module`), or a package that holds such a submodule itself, a library's or the
+    project's namespace package. A module with no file that holds none, as six's `six.moves`, is
+    not one, though `is_user_code` takes a module with no file and no directory as code `exec`
+    made. Read through the namespaces, so no `__getattr__` of a package runs and no import
+    starts; a module with no `__path__` is no package and holds none. Found once per package
+    within one `fingerprint_pass()`, so each library module a stage reads (`np`) is scanned
+    once, and a function that reads one that holds none has no source read for it."""
+    namespace = _module_namespace(package)
+    if "__path__" not in namespace:
+        return {}
+
+    def find() -> dict[str, types.ModuleType]:
+        found = dict[str, types.ModuleType]()
+        for attribute in tuple(namespace):
+            submodule = bound_submodule(package, attribute)
+            if submodule is not None and (
+                is_user_source_module(submodule) or _submodules_to_user_code(submodule)
+            ):
+                found[attribute] = submodule
+        return found
+
+    return _memoized("user-submodules", package, find)
+
+
+def submodule_entries(func: Callable[..., Any]) -> dict[str, str]:
+    """The `submodule:` entries of a `@no_fingerprint` stage's function `func`, which the walk does
+    not read, found without walking or hashing any code: each submodule that `func`'s own code and
+    its nested code (a lambda, a nested function) read through a library package a global or a
+    closure cell of `func` holds, through which user code is reached, and each library package on
+    the way, found as the walk finds them (`_user_submodules_read`, `_add_submodule_read`). `func`
+    is read at the end of its `__wrapped__` chain (`unwrap`), the function whose file the stage's
+    fingerprint hashes. Its globals are the names its own code holds that its module binds
+    (`co_names`, which hold the attributes it reads too, through which `_attributes_read` finds no
+    read) and those of its nested code (`_nested_globals`). Its cells are read as the walk reads
+    them (`c:NAME`), so an empty one (a variable its factory binds on one branch only) is skipped,
+    where `inspect.getclosurevars` raises. A helper `func` calls is not read: a submodule only a
+    helper reads so does not reach the worker with the stage (a stated limit)."""
+    target = unwrap(func)
+    code = target.__code__
+    namespace = cast("dict[str, Any]", target.__globals__)
+    values = {name: namespace[name] for name in code.co_names if name in namespace}
+    for name, value in _nested_globals(code, namespace, values).items():
+        if value is not _UNREAD:
+            values[name] = value
+    for name in code.co_freevars:
+        value = _read_step(target, f"c:{name}")
+        if value is not _UNREAD:
+            values[name] = value
+    entries = dict[str, str]()
+    for name in sorted(values):
+        value = values[name]
+        if issubclass(type(value), types.ModuleType) and not is_user_code(value):
+            _scan_user_submodules(name, value, target, entries)
+    return entries
+
+
+def _scan_user_submodules(
+    chain: str, package: types.ModuleType, func: Callable[..., Any], entries: dict[str, str]
+) -> None:
+    """Record in `entries` each submodule `func` reads on library package `package`, reached as
+    `chain`, through which user code is reached (`_user_submodules_read`, `_add_submodule_read`),
+    and follow each library package among them in turn, as the walk follows them
+    (`_process_user_submodules`), without walking any code."""
+    for attribute, submodule in _user_submodules_read(func, chain, package):
+        _add_submodule_read(entries, f"{package.__name__}.{attribute}")
+        if not is_user_code(submodule):
+            _scan_user_submodules(f"{chain}.{attribute}", submodule, func, entries)
 
 
 def _get_qualname_for_cache(func: Callable[..., Any]) -> str:
@@ -6652,7 +7148,7 @@ def _class_above_mark_message(value: Any) -> str:
     decorator = _definition_ref(type(instance))
     helper = _library_name(marked) if marked is not None else _definition_ref(instance)
     stage = _current_stage_name.get()
-    prefix = f"Stage '{stage}': " if stage else ""
+    prefix = _prefix_of(stage) if stage else ""
     return (
         f"{prefix}the class-based decorator '{decorator}' is above '{helper}', which is marked "
         + "@fingerprint_by_name.\n"
@@ -6728,7 +7224,8 @@ def _by_name_hash(func: Any) -> str:
 
 def is_user_code(obj: Any) -> bool:
     """Check if object is user code (not stdlib/site-packages/builtins, nor pivot's own
-    packages: ``is_library_path``)."""
+    packages: ``is_library_file`` for a module's file, and for a namespace package its
+    directories' site-packages, dist-packages or pivot-package parts)."""
     _t = metrics.start()
     try:
         if obj is None:
@@ -6752,6 +7249,20 @@ def is_user_code(obj: Any) -> bool:
         return result
     finally:
         metrics.end("fingerprint.is_user_code", _t)
+
+
+def is_user_source_module(module: object) -> bool:
+    """Whether `module` is a module of user code loaded from a source file: a module whose own
+    namespace, read through `ModuleType`'s descriptor, names its file (`__file__`), and which is
+    user code (`is_user_code`). A module made without a file (CPython's `pyexpat.errors`, Cython's
+    `_cython_3_3_0`) has no source to fingerprint: the worker's stage-import check ignores one
+    (`worker._record_stage_import`), and the walk follows one bound on a library package only
+    when it holds a submodule that has one (`_submodules_to_user_code`)."""
+    return (
+        issubclass(type(module), types.ModuleType)
+        and isinstance(_module_namespace(cast("types.ModuleType", module)).get("__file__"), str)
+        and is_user_code(module)
+    )
 
 
 def _hashes_by_identity(cls: type[Any]) -> bool:
@@ -6793,31 +7304,128 @@ def _is_user_code_impl(obj: Any) -> bool:
         return False
 
     # A namespace package (PEP 420) has a __path__ but no __file__. It is a library's when one of
-    # its directories is in site-packages or dist-packages or in pivot's own packages. A directory
-    # under the interpreter's prefix alone, as pip's checkout of a `pip install -e git+...`
-    # package in `<venv>/src`, leaves a namespace the user shares with it user code.
+    # its directories, resolved, lies in a site-packages directory
+    # (`installed_distributions.in_site_packages`) or in one of pivot's own packages
+    # (`_under_pivot_package_dirs`), as in pivot 0.10.4: a directory under the interpreter's prefix
+    # alone, as pip's checkout of a `pip install -e git+...` package in `<venv>/src`, leaves a
+    # namespace the user shares with it user code, which the walk walks. The `dist:` keys judge
+    # each of its directories by `is_library_path` instead (`_library_part`), the rule
+    # `is_library_file` gives the files in it, which adds the interpreter's prefix. A directory is
+    # judged resolved, not by `is_library_file`'s rule for a linked file: uv's symlink link mode
+    # links each installed file and keeps the directories real.
     if not hasattr(module, "__file__") or module.__file__ is None:
         if not hasattr(module, "__path__"):
             return True  # No __file__ and no __path__: user code (exec/notebook/interactive)
-        for entry in module.__path__:
-            resolved = pathlib.Path(entry).resolve()
-            if any(part in _SITE_PACKAGE_PATHS for part in resolved.parts) or any(
-                resolved.is_relative_to(prefix) for prefix in _PIVOT_PACKAGE_DIRS
-            ):
-                return False
-        return True
+        resolved = (pathlib.Path(entry).resolve() for entry in module.__path__)
+        return not any(
+            installed_distributions.in_site_packages(path) or _under_pivot_package_dirs(path)
+            for path in resolved
+        )
 
-    return not is_library_path(pathlib.Path(module.__file__).resolve())
+    return not is_library_file(module.__file__)
 
 
 def is_library_path(path: pathlib.Path) -> bool:
-    """Whether resolved file or directory ``path`` belongs to a library, not to user code: it
-    lies under the interpreter's prefix (the stdlib, or a virtualenv), in a site-packages or
-    dist-packages directory, or in one of pivot's own packages (``_PIVOT_PACKAGE_DIRS``), which
-    an editable install puts outside site-packages."""
-    if any(part in _SITE_PACKAGE_PATHS for part in path.parts):
+    """Whether resolved file or directory ``path`` belongs to a library, not to user code: it lies
+    in a library location (``installed_distributions.in_library_location``: a site-packages or
+    dist-packages directory, or under the interpreter's prefix, the stdlib or a virtualenv), or
+    in one of pivot's own packages, which an editable install puts outside site-packages
+    (``_under_pivot_package_dirs``)."""
+    return installed_distributions.in_library_location(path) or _under_pivot_package_dirs(path)
+
+
+def _under_pivot_package_dirs(resolved: pathlib.Path) -> bool:
+    """Whether the resolved path ``resolved`` lies in one of pivot's own packages
+    (``_PIVOT_PACKAGE_DIRS``)."""
+    return any(resolved.is_relative_to(directory) for directory in _PIVOT_PACKAGE_DIRS)
+
+
+@functools.lru_cache(maxsize=4096)
+def is_library_file(filename: str) -> bool:
+    """Whether the file ``filename`` (a module's ``__file__``, a spec's origin, a code object's
+    file) holds library code, not user code, decided in this order:
+
+    1. Its resolved path is a library path (``is_library_path``): library code. A file of a
+       copied venv is decided here.
+    2. Else the file Pivot judges it by (``judged_file``: its path with its directory resolved
+       and its last name kept, or the first file of its chain of symbolic links that is a
+       library path) is a library path: library code, recorded by name, keyed and refused as the
+       same file copied there would be, unless the RECORD of an editable distribution in that
+       file's site directory lists it (``installed_distributions.listed_by_editable``, on the
+       worker's ``sys.path``). Then the resolved path decides, as in pivot 0.10.4: user code.
+    3. Else user code: the chain meets a file that is no library path and no link before one that
+       is a library path, or reaches no library path within the links
+       ``installed_distributions.link_chain`` follows.
+
+    So a file that uv's ``UV_LINK_MODE=symlink`` links into its cache from a real directory of
+    ``site-packages``, a library package linked into the project root, a ``sys.path`` entry that
+    is a link to ``site-packages``, and a module file linked by hand into the project root to a
+    file of ``site-packages`` are each judged in ``site-packages``, as where the files there are
+    copies. A link there that no editable distribution's RECORD lists is library code, as a
+    copied file there is: one that no RECORD lists, one of an editable install whose RECORD is
+    lost or that Pivot cannot read, and one that only a distribution Pivot cannot classify, or
+    one that is not editable, lists. flit's ``install --symlink`` links a checkout's module file
+    into ``site-packages``, with a RECORD of an editable install that lists it: user code by
+    rule 2, also through a project file linked to it; it links a package's directory too, whose
+    files are judged in the checkout, where that directory resolves: user code by rule 3.
+
+    Decided once per file name per process, as ``_is_user_source_file`` is. Raises ``OSError``
+    when the path cannot be resolved."""
+    if is_library_path(pathlib.Path(filename).resolve()):
         return True
-    return any(path.is_relative_to(prefix) for prefix in (*_STDLIB_PATHS, *_PIVOT_PACKAGE_DIRS))
+    judged = judged_file(filename)
+    if not is_library_path(pathlib.Path(judged)):
+        return False
+    return not installed_distributions.listed_by_editable(
+        judged, loaded_source.worker_path(), _pivot_dir_names()
+    )
+
+
+def judged_file(filename: str) -> str:
+    """The file Pivot judges the file ``filename`` by (``is_library_file``): the first of its
+    places (``_places``), which is the first file of its chain of symbolic links that is a
+    library path, whatever the resolved path is, so a project file linked by hand to a file of
+    ``site-packages`` is judged there both where that file is a copy and where it is a link into
+    uv's cache. The file as the import found it (``with_real_directory``) when no file of the chain
+    is a library path: the chain meets a file that is no library path and no link Pivot can read,
+    or reaches no library path within the links ``installed_distributions.link_chain`` follows (a
+    loop of links among them). For a file whose own path with its directory resolved is a library
+    path already (every file of a venv, copied or linked into uv's cache), that is the file as
+    the import found it."""
+    return _places(filename)[0]
+
+
+@functools.lru_cache(maxsize=4096)
+def _places(filename: str) -> tuple[str, ...]:
+    """The places the file ``filename`` lies in, which ``reached_module_of`` gives
+    ``installed_distributions`` (``ReachedModule.places``): the chain of symbolic links from the
+    file as the import found it (``installed_distributions.link_chain`` of
+    ``with_real_directory``), from its first file that is a library path (``judged_file``) to its
+    end, every later file included, library path or not, so the check of a file that no RECORD
+    lists sees the path entry of each of them: ``A/site-packages/m.py``, a link made by hand to
+    ``B/site-packages/m.py`` or to ``P/libs/m.py`` (a ``--target`` directory), lies in both,
+    whether that file is a copy or a link into uv's cache. The file as the import found it alone
+    when no file of the chain is a library path. Decided once per file name per process."""
+    chain = installed_distributions.link_chain(with_real_directory(filename))
+    for index, hop in enumerate(chain):
+        if is_library_path(pathlib.Path(hop)):
+            return chain[index:]
+    return chain[:1]
+
+
+def with_real_directory(filename: str) -> str:
+    """The file ``filename`` made absolute, its directory resolved and its last name kept: the
+    file as the import found it, whatever links its directory was reached through, and, where
+    the file is itself a link, not where that link points. ``_places`` starts the chain of links
+    it follows from it."""
+    absolute = os.path.abspath(filename)
+    return os.path.join(os.path.realpath(os.path.dirname(absolute)), os.path.basename(absolute))
+
+
+def _pivot_dir_names() -> list[str]:
+    """Pivot's own package directories (``_PIVOT_PACKAGE_DIRS``), as ``installed_distributions``
+    takes them."""
+    return [str(directory) for directory in _PIVOT_PACKAGE_DIRS]
 
 
 def _get_module(obj: Any) -> types.ModuleType | None:

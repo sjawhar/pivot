@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import anyio
 import pytest
 
-from pivot import compose, exceptions, project, stage_def
+from pivot import compose, discovery, exceptions, project, stage_def
 from pivot import names as stage_names
 from pivot.storage import mounts as mounts_module
 from pivot.storage import state, store
@@ -458,6 +458,27 @@ def create_pipeline_py(
 
     pipeline_path.write_text("\n".join(lines))
     return pipeline_path
+
+
+def discover_project(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    files: Mapping[str, str],
+    pipeline: str,
+) -> PipelineLike:
+    """Write a project at `tmp_path/project`: `files` (each path relative to its root, with its
+    text), `pipeline` as its `pipeline.py`, and `.git` and `.pivot` directories. Make it the
+    project root and return the pipeline discovery finds there."""
+    root = tmp_path / "project"
+    for rel_path, text in {**files, "pipeline.py": pipeline}.items():
+        (root / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel_path).write_text(text)
+    (root / ".git").mkdir(exist_ok=True)
+    (root / ".pivot").mkdir(exist_ok=True)
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    loaded = discovery.discover_pipeline(project_root=root)
+    assert loaded is not None, "the project must define a pipeline"
+    return loaded
 
 
 def mount_table(

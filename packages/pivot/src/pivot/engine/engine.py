@@ -1853,6 +1853,8 @@ class Engine:
         results: dict[str, executor_core.ExecutionSummary] = {}
         stage_start_times: dict[str, float] = {}
         stage_durations: dict[str, float] = {}
+        # This run's trial pickles of the modules sent with its stages (`PickleTrials`)
+        pickle_trials: executor_core.PickleTrials = {}
 
         # Per-stage StateDB cache: routes deferred writes to correct database
         state_dbs = dict[pathlib.Path, state_mod.StateDB]()
@@ -1904,6 +1906,7 @@ class Engine:
                 project_root=project_root,
                 state_dir=default_state_dir,
                 results=results,
+                pickle_trials=pickle_trials,
             )
 
             # Only start drain thread and main loop if workers were dispatched in this run.
@@ -2045,6 +2048,7 @@ class Engine:
                                     project_root=project_root,
                                     state_dir=default_state_dir,
                                     results=results,
+                                    pickle_trials=pickle_trials,
                                 )
 
                         # Diagnostic: log stages not in results after main loop
@@ -2362,6 +2366,7 @@ class Engine:
         project_root: pathlib.Path,
         state_dir: pathlib.Path,
         results: dict[str, executor_core.ExecutionSummary],
+        pickle_trials: executor_core.PickleTrials,
     ) -> None:
         """Start all eligible stages up to max_workers."""
         if self._scheduler.stop_starting_new:
@@ -2462,6 +2467,7 @@ class Engine:
                     project_root,
                     default_state_dir=state_dir,
                     store_spec=store_spec,
+                    pickle_trials=pickle_trials,
                 )
 
                 active_after_parent = len(self._futures)

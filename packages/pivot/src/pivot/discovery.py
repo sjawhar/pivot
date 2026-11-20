@@ -83,9 +83,11 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
     (``--check-hash-based-pycs never``). Its bytecode is replaced in that last case too: pivot's
     workers do not inherit the flag, and they read it.
 
-    A file whose resolved path is a library's (``fingerprint.is_library_path``: pivot's own
-    packages included), as a library package symlinked into the project root, loads as CPython
-    loads it, and its bytecode is left alone.
+    A library's file (``fingerprint.is_library_file``: its resolved path is a library's, pivot's
+    own packages included, as a library package symlinked into the project root; or a file linked
+    into ``site-packages`` that no editable distribution's RECORD lists, as uv's symlink link mode
+    links each file into its cache, or a file whose chain of links reaches such a file) loads as
+    CPython loads it, and its bytecode is left alone.
 
     Every other file's code comes from source bytes this loader read, and it records those bytes
     (``loaded_source.record``): a stage's fingerprint describes that code, which a worker receives
@@ -110,7 +112,7 @@ class _ProjectSourceLoader(importlib.machinery.SourceFileLoader):
     @override
     def get_code(self, fullname: str) -> _stdlib_types.CodeType | None:
         source = self.get_filename(fullname)
-        if fingerprint.is_library_path(pathlib.Path(source).resolve()):
+        if fingerprint.is_library_file(source):
             return super().get_code(fullname)
         self._source_read = None
         code = self._user_code(fullname, source)
@@ -270,9 +272,10 @@ _wrapped_spec_from_file_location: object | None = None
 
 
 def _should_record_origin(origin: str) -> bool:
-    """Whether the recording finder should wrap this origin's loader."""
+    """Whether the recording finder should wrap this origin's loader: unless the origin is a
+    library's file (``fingerprint.is_library_file``)."""
     try:
-        return not fingerprint.is_library_path(pathlib.Path(origin).resolve())
+        return not fingerprint.is_library_file(origin)
     except OSError:
         return True
 
@@ -346,7 +349,9 @@ def _holds_user_code(path: str, root: pathlib.Path) -> bool:
     That is every directory but a library's (``fingerprint.is_library_path``, which counts the
     stdlib even when the interpreter lives under the root), minus, under the project root, the
     library and tooling directories discovery skips. A stage's module outside the root, as a
-    package installed from a source checkout, is user code.
+    package installed from a source checkout, is user code. A directory is judged resolved, not
+    by ``fingerprint.is_library_file``'s rule for a linked file: uv's symlink link mode links each
+    installed file and keeps ``site-packages`` and the directories in it real.
     """
     try:
         resolved = pathlib.Path(path or ".").resolve()

@@ -20,7 +20,7 @@ import cloudpickle
 import pytest
 
 import pivot_tui
-from pivot import discovery, fingerprint, loaded_source, project
+from pivot import discovery, fingerprint, installed_distributions, loaded_source, project
 from pivot.storage import state
 from tests import conftest
 
@@ -761,7 +761,11 @@ def test_user_code_rule_skips_libraries_the_stdlib_and_pivot(
     tooling directories discovery skips."""
     root = tmp_path / "project"
     env = root / "env"
-    monkeypatch.setattr(fingerprint, "_STDLIB_PATHS", (*fingerprint._STDLIB_PATHS, env))
+    monkeypatch.setattr(
+        installed_distributions,
+        "INTERPRETER_PREFIXES",
+        (*installed_distributions.INTERPRETER_PREFIXES, env),
+    )
     pivot_dir = pathlib.Path(discovery.__file__).resolve().parent
     tui_dir = pathlib.Path(pivot_tui.__file__).resolve().parent
 

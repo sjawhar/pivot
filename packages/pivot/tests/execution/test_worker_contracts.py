@@ -35,6 +35,8 @@ import textwrap
 import threading
 import time
 import weakref
+import zipfile
+import zipimport
 from typing import TYPE_CHECKING, Any, cast, override
 
 import joblib.parallel
@@ -279,6 +281,210 @@ def test_worker_waits_for_artifact_lock_the_coordinator_holds(
 
     assert results[0]["status"] == StageStatus.RAN, results[0]["reason"]
     assert "running" in states[states.index("waiting_on_lock") :]
+
+
+# The latin-1 source, as its coding cookie says, of a module whose import runs `raises`. In a zip,
+# `zipimporter.get_source` decodes a module's source as UTF-8, which raises `UnicodeDecodeError`
+# here, so a lookup of any line of the module raises it too.
+_LATIN_1_MODULE = "# -*- coding: latin-1 -*-\n# caf\xe9\n{raises}\n"
+
+# The source of a module whose import raises `Raised.Error("boom")`, whose class's `__notes__`
+# property, which describing the error reads, raises `{notes_raise}`.
+_NOTES_RAISE = (
+    "from pivot.executor import worker\n\n"
+    + "class Raised:\n"
+    + "    class Error(Exception):\n"
+    + "        @property\n"
+    + "        def __notes__(self):\n"
+    + "            raise {notes_raise}\n\n"
+    + 'raise Raised.Error("boom")'
+)
+
+# The source of a module whose import raises `Raised.Error("boom")`, whose class's metaclass
+# `__getattribute__` raises `SystemExit` where `__qualname__` is read through it, as describing
+# the error reads it.
+_QUALNAME_RAISES = (
+    "class Meta(type):\n"
+    + "    def __getattribute__(cls, name):\n"
+    + "        if name == '__qualname__':\n"
+    + "            raise SystemExit(1)\n"
+    + "        return super().__getattribute__(name)\n\n"
+    + "class Raised:\n"
+    + "    class Error(Exception, metaclass=Meta):\n"
+    + "        pass\n\n"
+    + 'raise Raised.Error("boom")'
+)
+
+# The source of a module whose import raises `Raised.Error("boom")`, whose class body stores as
+# its `__qualname__` a `str` subclass whose `__str__` raises `SystemExit`, and whose `__notes__`
+# property raises `SystemExit`, so describing the error raises and its qualified name is the text.
+_QUALNAME_STR_SUBCLASS = (
+    "class Name(str):\n"
+    + "    def __str__(self):\n"
+    + "        raise SystemExit(1)\n\n"
+    + "class Raised:\n"
+    + "    class Error(Exception):\n"
+    + "        __qualname__ = Name('Raised.Error')\n\n"
+    + "        @property\n"
+    + "        def __notes__(self):\n"
+    + "            raise SystemExit(1)\n\n"
+    + 'raise Raised.Error("boom")'
+)
+
+
+def _zipped_package(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, raises: str
+) -> ModuleType:
+    """`sent_zipped`, a package in a zip on `sys.path`, held in `sys.modules` as the worker holds a
+    package it imported. Its submodule `sent_zipped.latin`, `_LATIN_1_MODULE` running `raises`, is
+    not in `sys.modules`: were an earlier case's import of it to succeed, the module it left there
+    is removed, so each case imports it afresh."""
+    archive = tmp_path / "lib.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("sent_zipped/__init__.py", "")
+        zf.writestr("sent_zipped/latin.py", _LATIN_1_MODULE.format(raises=raises).encode("latin-1"))
+    # zipimport keeps each archive's directory by its path; the test's archive leaves none there.
+    monkeypatch.setattr(zipimport, "_zip_directory_cache", {})
+    monkeypatch.syspath_prepend(str(archive))
+    spec = importlib.util.find_spec("sent_zipped")
+    assert spec is not None and spec.loader is not None
+    package = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "sent_zipped", package)
+    spec.loader.exec_module(package)
+    monkeypatch.delitem(sys.modules, "sent_zipped.latin", raising=False)
+    return package
+
+
+@pytest.mark.parametrize(
+    ("raises", "raised"),
+    [
+        pytest.param('raise RuntimeError("boom")', "RuntimeError: boom", id="raises"),
+        pytest.param(
+            'raise RuntimeError("boom\\n")', "RuntimeError: boom", id="raises-ending-in-a-newline"
+        ),
+        pytest.param(
+            'raise RuntimeError("boom\\n  again")',
+            "RuntimeError: boom again",
+            id="raises-with-an-indented-line",
+        ),
+        pytest.param(
+            'try:\n    raise KeyError("first")\nexcept KeyError:\n    raise RuntimeError("boom")',
+            "RuntimeError: boom",
+            id="raises-while-handling-an-error",
+        ),
+        pytest.param(
+            _NOTES_RAISE.format(notes_raise="SystemExit(1)"),
+            "Raised.Error",
+            id="raises-an-error-whose-notes-raise-system-exit",
+        ),
+        pytest.param(
+            _QUALNAME_RAISES,
+            "Raised.Error",
+            id="raises-an-error-whose-metaclass-raises-system-exit-on-its-qualified-name",
+        ),
+        pytest.param(
+            _QUALNAME_STR_SUBCLASS,
+            "Raised.Error",
+            id="raises-an-error-whose-qualname-is-a-str-subclass-whose-str-raises-system-exit",
+        ),
+    ],
+)
+def test_a_submodule_sent_by_name_whose_import_fails_warns_its_error_on_one_line(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raises: str,
+    raised: str,
+) -> None:
+    """The worker holds `sent_zipped`, a package in a zip on `sys.path`. Its submodule
+    `sent_zipped.latin`, sent by name, is latin-1 source with a coding cookie, and its import
+    raises `RuntimeError`: with the message `boom` (`raises`), `boom` and a newline
+    (`raises-ending-in-a-newline`) or `boom`, a newline and `  again`
+    (`raises-with-an-indented-line`), or with `boom` while it handles a `KeyError` it raised
+    (`raises-while-handling-an-error`); or it raises `Raised.Error`, whose class's `__notes__`
+    property raises `SystemExit` (`raises-an-error-whose-notes-raise-system-exit`), or whose
+    class's metaclass `__getattribute__` raises `SystemExit` where `__qualname__` is read through
+    it (`raises-an-error-whose-metaclass-raises-system-exit-on-its-qualified-name`), or whose
+    class body stores as its `__qualname__` a `str` subclass whose `__str__` raises `SystemExit`
+    and whose `__notes__` property raises `SystemExit`
+    (`raises-an-error-whose-qualname-is-a-str-subclass-whose-str-raises-system-exit`).
+    Entering `_sent_submodules_bound` logs one warning, which gives the error's type and message
+    on one line (`RuntimeError: boom`, or `RuntimeError: boom again`), each line of the message
+    stripped and no empty line joined, or the class's qualified name alone, without its module
+    (`Raised.Error`), where describing the error raises, binds nothing and does not raise. Were
+    the warning's text built with a line of the module looked up, for the error's traceback or for
+    the error it chains, the lookup would raise `UnicodeDecodeError` out of
+    `_sent_submodules_bound`; so would the `SystemExit` that describing `Raised.Error` raises, were
+    it not caught, and the one its metaclass raises, were the fallback name read through it. Were
+    the fallback name the `str` subclass itself, formatting the warning (its `%s`, as the
+    caplog handler and `record.getMessage()` format it) would raise its `SystemExit`."""
+    package = _zipped_package(tmp_path, monkeypatch, raises)
+
+    escaped = None
+    with caplog.at_level(logging.WARNING, logger=worker.logger.name):
+        # An error that leaves the context manager is recorded, not raised: pytest's report of it
+        # would look up the module's line, through the error it chains, and raise again.
+        try:
+            with worker._sent_submodules_bound(["sent_zipped.latin"]):
+                pass
+        except (Exception, SystemExit) as exc:
+            escaped = f"{type(exc).__name__}: {exc}"
+
+    assert (
+        escaped,
+        [(record.levelno, record.getMessage()) for record in caplog.records],
+        "latin" in vars(package),
+        "sent_zipped.latin" in sys.modules,
+    ) == (
+        None,
+        [
+            (
+                logging.WARNING,
+                "Could not import module 'sent_zipped.latin', which the stage reads through its "
+                + f"package: {raised}. The module is not bound on its package, so code that "
+                + "reads it through the package fails.",
+            )
+        ],
+        False,
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "raises",
+    [
+        pytest.param(
+            "from pivot.executor import worker\n\nraise worker.WorkerTerminated", id="import"
+        ),
+        pytest.param(_NOTES_RAISE.format(notes_raise="worker.WorkerTerminated"), id="description"),
+    ],
+)
+def test_an_interrupt_while_a_submodule_sent_by_name_is_imported_or_its_error_described_stays_one(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raises: str,
+) -> None:
+    """`WorkerTerminated`, the interrupt of the stage's run, raised by the import of
+    `sent_zipped.latin`, sent by name (`import`), or by the `__notes__` property of the error that
+    import raises, as the warning's text describes the error (`description`), leaves
+    `_sent_submodules_bound`: no warning is logged and nothing is bound."""
+    package = _zipped_package(tmp_path, monkeypatch, raises)
+
+    escaped = None
+    with caplog.at_level(logging.WARNING, logger=worker.logger.name):
+        try:
+            with worker._sent_submodules_bound(["sent_zipped.latin"]):
+                pass
+        except worker.WorkerTerminated as exc:
+            escaped = type(exc)
+
+    assert (
+        escaped,
+        [(record.levelno, record.getMessage()) for record in caplog.records],
+        "latin" in vars(package),
+        "sent_zipped.latin" in sys.modules,
+    ) == (worker.WorkerTerminated, [], False, False)
 
 
 # =============================================================================
