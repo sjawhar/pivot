@@ -13,10 +13,11 @@ from typing import TYPE_CHECKING, Annotated, NoReturn, TypedDict
 import pytest
 import yaml
 
-from pivot import compose, config, executor, expansion, loaders, stage_def, status
+from pivot import compose, config, executor, expansion, loaders, project, stage_def, status
+from pivot.config import io as config_io
 from pivot.remote import config as remote_config
 from pivot.storage import cache
-from pivot.types import Recovery
+from pivot.types import Recovery, StageStatus
 
 if TYPE_CHECKING:
     import pathlib
@@ -43,6 +44,10 @@ def _stage_build(cut: dict[str, int]) -> dict[str, int]:
     return {"built": cut["cut"] + 1000}
 
 
+def _stage_final(build: dict[str, int]) -> dict[str, int]:
+    return {"final": build["built"] * 2}
+
+
 def _stage_twin(entry: dict[str, int]) -> dict[str, int]:
     return {"twin": entry["value"]}
 
@@ -64,12 +69,29 @@ def _write_plan(root: pathlib.Path, plan: dict[str, int]) -> None:
     (root / "data" / "raw" / "plan.yaml").write_text(yaml.safe_dump(plan))
 
 
+def _chain(pipeline: compose.Pipeline) -> dict[str, int]:
+    """Add to ``pipeline`` _stage_plan over input plan.yaml, _stage_cut mapped over its files and
+    _stage_build over _stage_cut's instances; return _stage_build's output."""
+    plan = compose.stage(_stage_plan)(pipeline.input("plan.yaml", t=dict[str, int]))
+    cut = compose.stage(_stage_cut)(pipeline.map(plan), params=_CutParams())
+    return compose.stage(_stage_build)(cut)
+
+
 def _pipeline(root: pathlib.Path) -> compose.Pipeline:
     with compose.Pipeline("p", root=root) as pipeline:
-        plan = compose.stage(_stage_plan)(pipeline.input("plan.yaml", t=dict[str, int]))
-        cut = compose.stage(_stage_cut)(pipeline.map(plan), params=_CutParams())
-        compose.stage(_stage_build)(cut)
+        _chain(pipeline)
     return pipeline
+
+
+def _composed(root: pathlib.Path) -> compose.Pipeline:
+    """Pipeline report, whose _stage_final is mapped over the instances of pipeline p's
+    _stage_build (``_chain``): walking report's handles reaches p/_stage_build before
+    p/_stage_cut, which it is mapped over, and that before p/_stage_plan."""
+    with compose.Pipeline("p", root=root) as prep:
+        build = _chain(prep)
+    with compose.Pipeline("report", root=root) as report:
+        compose.stage(_stage_final)(build)
+    return report
 
 
 @pytest.fixture
@@ -86,6 +108,7 @@ def ran(
 
 _CUTS = ["p/_stage_cut@a", "p/_stage_cut@b"]
 _BUILDS = ["p/_stage_build@a", "p/_stage_build@b"]
+_FINALS = ["report/_stage_final@a", "report/_stage_final@b"]
 
 
 def _empty_cache(root: pathlib.Path) -> None:
@@ -111,6 +134,113 @@ def test_a_current_producer_expands_every_template(
     )
     assert sorted(pipeline.list_stages()) == sorted(["p/_stage_plan", *_CUTS, *_BUILDS])
     assert list(known) == ["p/_stage_plan"], "the explanations it read, for the caller to reuse"
+
+
+def test_a_template_reached_through_another_pipeline_expands_after_the_one_it_is_mapped_over(
+    set_project_root: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_composed``: report's walk reaches p/_stage_build before p/_stage_cut, which it is
+    mapped over. Each template is registered after the one it is mapped over, so with
+    p/_stage_plan current every one expands; pivot 0.10.4 registered p/_stage_build first and
+    left it and report/_stage_final not expanded."""
+    root = set_project_root
+    monkeypatch.chdir(root)
+    _write_plan(root, {"a": 1, "b": 2})
+    executor.run(pipeline=_composed(root))
+    pipeline = _composed(root)
+
+    result, _ = status.expand_current(pipeline)
+
+    assert result["not_expanded"] == {}
+    assert result["expanded"] == {
+        "p/_stage_cut": _CUTS,
+        "p/_stage_build": _BUILDS,
+        "report/_stage_final": _FINALS,
+    }
+    assert sorted(pipeline.list_stages()) == sorted(["p/_stage_plan", *_CUTS, *_BUILDS, *_FINALS])
+    assert pipeline.list_templates() == ["p/_stage_cut", "p/_stage_build", "report/_stage_final"]
+
+
+def _stack_closure(
+    pipeline: compose.Pipeline,
+) -> list[tuple[compose.Pipeline, compose._StageNode]]:
+    """``Pipeline._upstream_closure`` as pivot 0.10.4 had it: from a stack of the stages of other
+    pipelines that ``pipeline``'s stages read, the last pushed first, each stage added before the
+    stages it reads."""
+    visited = set[int]()
+    result = list[tuple[compose.Pipeline, compose._StageNode]]()
+    stack = list[tuple[compose.Pipeline, compose._StageNode]]()
+
+    def push_reads(node: compose._StageNode) -> None:
+        for handle in compose._iter_stage_handles(node):
+            if handle._pipeline is not pipeline:
+                assert isinstance(handle._source, compose._StageNode)
+                stack.append((handle._pipeline, handle._source))
+
+    for node in pipeline._stages:
+        push_reads(node)
+    while stack:
+        foreign, node = stack.pop()
+        if id(node) not in visited:
+            visited.add(id(node))
+            result.append((foreign, node))
+            push_reads(node)
+    return result
+
+
+def _run_composed(
+    root: pathlib.Path, monkeypatch: pytest.MonkeyPatch, *, stack_order: bool
+) -> tuple[compose.Pipeline, dict[str, StageStatus]]:
+    """``_composed`` in a new project at ``root``, its stages of p registered in pivot 0.10.4's
+    order (``_stack_closure``) when ``stack_order``, and the status of each stage of its run."""
+    for marker in (".pivot", ".git"):
+        (root / marker).mkdir(parents=True)
+    monkeypatch.setattr(project, "_project_root_cache", root)
+    config_io.clear_config_cache()
+    monkeypatch.chdir(root)
+    _write_plan(root, {"a": 1, "b": 2})
+    with monkeypatch.context() as patch:
+        if stack_order:
+            patch.setattr(compose.Pipeline, "_upstream_closure", _stack_closure)
+        pipeline = _composed(root)
+    results = executor.run(pipeline=pipeline)
+    return pipeline, {name: StageStatus(result["status"]) for name, result in results.items()}
+
+
+def _stages_dir_files(root: pathlib.Path) -> dict[str, bytes]:
+    """Each file in the stages directory of the project at ``root`` (locks, listings), by its
+    path there."""
+    stages_dir = root / ".pivot" / "stages"
+    return {
+        path.relative_to(stages_dir).as_posix(): path.read_bytes()
+        for path in sorted(stages_dir.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_the_registration_order_moves_no_stage_name_fingerprint_or_lock_byte(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_composed``, its stages of p registered in pivot 0.10.4's order and in this one's, each
+    run in a project of its own: both runs run every stage and instance, of the same names,
+    with the same fingerprints, and leave the same locks and listings, byte for byte. So
+    registering a stage after the stages it reads re-keys no lock of a composed pipeline."""
+    stacked, stacked_ran = _run_composed(tmp_path / "stacked", monkeypatch, stack_order=True)
+    walked, walked_ran = _run_composed(tmp_path / "walked", monkeypatch, stack_order=False)
+
+    assert stacked.list_templates() == ["p/_stage_build", "p/_stage_cut", "report/_stage_final"]
+    assert walked.list_templates() == ["p/_stage_cut", "p/_stage_build", "report/_stage_final"]
+    every = ["p/_stage_plan", *_CUTS, *_BUILDS, *_FINALS]
+    assert stacked_ran == walked_ran == dict.fromkeys(every, StageStatus.RAN)
+    assert sorted(stacked.list_stages()) == sorted(walked.list_stages()) == sorted(every)
+    assert {name: stacked.ensure_fingerprint(name) for name in every} == {
+        name: walked.ensure_fingerprint(name) for name in every
+    }
+    stacked_files = _stages_dir_files(tmp_path / "stacked")
+    assert sorted(path for path in stacked_files if path.endswith(".lock")) == sorted(
+        f"{name}.lock" for name in every
+    )
+    assert stacked_files == _stages_dir_files(tmp_path / "walked")
 
 
 def test_expanding_again_replaces_the_last_expansion(

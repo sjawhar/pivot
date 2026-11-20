@@ -1373,33 +1373,43 @@ class Pipeline:
                 msg += f"  {err}\n"
             raise exceptions.StageDefinitionError(msg)
 
+    def _foreign_reads(self, node: _StageNode) -> list[tuple[Pipeline, _StageNode]]:
+        """The stages of other pipelines that ``node`` reads, in the order it takes them."""
+        reads = list[tuple[Pipeline, _StageNode]]()
+        for handle in _iter_stage_handles(node):
+            if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
+                reads.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+        return reads
+
     def _upstream_closure(self) -> list[tuple[Pipeline, _StageNode]]:
-        """Collect foreign stages reachable from this pipeline's handles via DFS."""
+        """The stages of other pipelines that this pipeline's stages read, directly or through
+        each other, each after every stage it reads.
+
+        They are registered in this order, which the registry keeps, and
+        ``expansion.expand_current`` expands a template mapped over another template's
+        instances only when that one has already expanded, so a template listed before it would
+        stay unexpanded outside a run. A depth-first walk from each of this pipeline's stages,
+        through the stages each reads in the order it takes them, adds a stage once every stage
+        it reads is added: the same order on every load. A stage of this pipeline that one of
+        them reads is not walked; it is registered with this pipeline's own stages, after them.
+        """
         visited = set[int]()
         result = list[tuple[Pipeline, _StageNode]]()
-        stack = list[tuple[Pipeline, _StageNode]]()
-
-        for node in self._stages:
-            for handle in _iter_stage_handles(node):
-                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
-                    stack.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-
+        roots = [read for node in self._stages for read in self._foreign_reads(node)]
+        # (stage, False): a stage to walk; (stage, True): one whose reads are all added
+        stack = [(read, False) for read in reversed(roots)]
         while stack:
-            foreign_pipeline, stage_node = stack.pop()
-            node_id = id(stage_node)
-            if node_id in visited:
+            (foreign_pipeline, stage_node), walked = stack.pop()
+            if walked:
+                result.append((foreign_pipeline, stage_node))
                 continue
-            visited.add(node_id)
-            result.append((foreign_pipeline, stage_node))
-
-            for handle in _iter_stage_handles(stage_node):
-                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
-                    stack.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-
+            if id(stage_node) in visited:
+                continue
+            visited.add(id(stage_node))
+            stack.append(((foreign_pipeline, stage_node), True))
+            stack.extend((read, False) for read in reversed(self._foreign_reads(stage_node)))
         return result
 
     def _merge_foreign_input_bindings(

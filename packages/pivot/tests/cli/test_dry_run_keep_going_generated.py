@@ -5,12 +5,14 @@ generated at random, the dry run (`--dry-run --jsonl`) on one copy of a tree and
 
 A seed gives one case (``_generate``): a project of one or two pipelines of plain stages,
 directory producers and mapped stages over them (``Pipeline.map``, and chains of them), reading
-raw files and directories, some tracked with `pivot track`; the changes made after a first full
-run (``_Change``); and the run's options and targets. A failure names the seed and prints the
-case and its pipelines, and the seed alone builds the same case again. Not generated: a cache
-whose object store is a mount of its own, which takes a mount the test cannot make for a
-command it starts (`test_tracked_keep_going_and_dry_run_keep_going_refuse_a_cache_whose_store_
-is_its_own_mount` in tests/integration/test_all_pipelines.py fakes the mount table in process).
+raw files and directories, some tracked with `pivot track`, and of two pipelines the first may
+read the second's stages through their handles (``_compose_across``); the changes made after a
+first full run (``_Change``); and the run's options and targets. A failure names the seed and
+prints the case and its pipelines, and the seed alone builds the same case again. Not
+generated: a cache whose object store is a mount of its own, which takes a mount the test
+cannot make for a command it starts (`test_tracked_keep_going_and_dry_run_keep_going_refuse_a_
+cache_whose_store_is_its_own_mount` in tests/integration/test_all_pipelines.py fakes the mount
+table in process).
 
 The fixed seeds run in the normal test job. ``PIVOT_DIFFERENTIAL_SEEDS=N`` runs seeds 0 to N-1
 instead, and ``PIVOT_DIFFERENTIAL_SEEDS=A:B`` seeds A to B-1, for a long run.
@@ -56,6 +58,9 @@ _FIXED_SEEDS = (
     # committed listing (2747), and one whose cached listing's prefix directory this user cannot
     # search (1083)
     *(8697, 2747, 1083),
+    # A chained stage mapped over another pipeline's chained stage, which pivot 0.10.4 registered
+    # before the mapped stage it is mapped over and left not expanded
+    817,
 )
 
 # The keys every producer writes, and the key a dropping producer wrote in the first run alone
@@ -93,11 +98,14 @@ class _Stage(NamedTuple):
     function: str
     kind: _StageKind
     """"plain" (one text output), "producer" (a directory output of one file per key),
-    "mapped" (over a producer's files) or "chained" (over a mapped stage's instances)."""
+    "mapped" (over a producer's files) or "chained" (over the instances of a mapped or chained
+    stage)."""
     reads: tuple[str, ...]
-    """Input paths, and names of plain stages of its pipeline, that it reads."""
+    """Input paths, and names of plain stages of its pipeline or, for a stage of p0 composed
+    across pipelines (``_compose_across``), of p1, that it reads."""
     over: str
-    """The stage it is mapped over; "" for a plain stage or a producer."""
+    """The stage it is mapped over, of its pipeline or, composed across pipelines, of p1; "" for
+    a plain stage or a producer."""
     params: bool
     """Whether it takes a StageParams, whose field ``k`` params.yaml can set."""
 
@@ -199,6 +207,7 @@ def _generate(seed: int, *, locked_out: bool) -> _Case:
             name = f"{pipeline}/{function}"
             stages.append(_Stage(name, pipeline, function, kind, reads, over, False))
             over = name
+    stages = _compose_across(random.Random(f"{seed}:across"), stages)
     producers = [item.name for item in stages if item.kind == "producer"]
     project = _Project(
         inputs=tuple(inputs),
@@ -220,6 +229,30 @@ def _generate(seed: int, *, locked_out: bool) -> _Case:
         ]
         targets = rng.sample(named, rng.randint(1, min(2, len(named))))
     return _Case(seed, project, changes, options, tuple(targets))
+
+
+def _compose_across(rng: random.Random, stages: list[_Stage]) -> list[_Stage]:
+    """``stages``, or, for half the cases of two pipelines, ``stages`` with pipeline p0 composed
+    from p1's handles, which its pipeline.py imports: each plain stage of p0 may also read a
+    plain stage of p1, and p0's chained stage is mapped over the instances of a mapped or
+    chained stage of p1 instead of p0's mapped stage. ``rng`` is this alone's, and a stage keeps
+    its kind, so a case composed of no cross-pipeline read is the one its seed gave before these
+    were generated. With p0's chained stage over p1's chained stage, pivot 0.10.4 registered
+    p1's chained stage before the mapped stage it is mapped over, and so never expanded it
+    outside a run."""
+    if len({item.pipeline for item in stages}) == 1 or rng.random() < 0.5:
+        return stages
+    plain = [item.name for item in stages if item.pipeline == "p1" and item.kind == "plain"]
+    mapped = [item.name for item in stages if item.pipeline == "p1" and item.over]
+    composed = list[_Stage]()
+    for item in stages:
+        if item.pipeline == "p0" and item.kind == "plain" and plain and rng.random() < 0.5:
+            composed.append(item._replace(reads=(*item.reads, rng.choice(plain))))
+        elif item.pipeline == "p0" and item.kind == "chained" and mapped:
+            composed.append(item._replace(over=rng.choice(mapped)))
+        else:
+            composed.append(item)
+    return composed
 
 
 # How likely each subject is to be changed, by its kind: a producer and a mapped stage have the
@@ -357,16 +390,21 @@ def _pipeline_code(
 ) -> str:
     """Pipeline ``pipeline``'s pipeline.py: each stage's text names its stage, its version (1 for
     a stage in ``changed``, else 0) and what it read. In the ``first_run`` a dropping producer
-    writes key z too."""
+    writes key z too. A stage of another pipeline that it reads or is mapped over is read
+    through the handle that pipeline's pipeline.py names it by, imported."""
     directories = {item.path for item in project.inputs if item.directory}
     own = [item for item in project.stages if item.pipeline == pipeline]
-    lines = [
-        "import pathlib",
-        "from typing import Annotated",
-        "",
-        "from pivot import Pipeline, StageParams, directory, stage",
-        "",
-    ]
+    # The import of the handle of each stage of another pipeline read, by the stage's name
+    imports = dict[str, str]()
+
+    def _handle(name: str) -> str:
+        other, function = _stage_parts(name)
+        if other == pipeline:
+            return f"h_{function}"
+        imports[name] = f"from {other}.pipeline import h_{function} as {other}_{function}"
+        return f"{other}_{function}"
+
+    lines = list[str]()
     calls = list[str]()
     inputs = dict[str, str]()
     for item in own:
@@ -376,7 +414,7 @@ def _pipeline_code(
                 variable = inputs.setdefault(read, f"i{len(inputs)}")
                 handles.append(variable)
             else:
-                handles.append(f"h_{read.rsplit('/', 1)[1]}")
+                handles.append(_handle(read))
         arguments = [
             f"a{index}: {'pathlib.Path' if read in directories else 'str'}"
             for index, read in enumerate(item.reads)
@@ -419,7 +457,7 @@ def _pipeline_code(
                 f"def {item.function}({', '.join(['entry: str', *arguments])}) -> str:",
                 f"    return entry + '|' + {read_text}",
             ]
-            over = f"h_{item.over.rsplit('/', 1)[1]}"
+            over = _handle(item.over)
             handles.insert(0, f"pipeline.map({over})" if item.kind == "mapped" else over)
         calls.append(f"    h_{item.function} = {item.function}({', '.join(handles)})")
     lines += ["", "", f'with Pipeline("{pipeline}") as pipeline:']
@@ -429,7 +467,15 @@ def _pipeline_code(
         for path, variable in inputs.items()
     ]
     lines += calls
-    return "\n".join(lines) + "\n"
+    header = [
+        "import pathlib",
+        "from typing import Annotated",
+        "",
+        "from pivot import Pipeline, StageParams, directory, stage",
+        *imports.values(),
+        "",
+    ]
+    return "\n".join([*header, *lines]) + "\n"
 
 
 def _write_pipelines(
@@ -847,9 +893,22 @@ def _restored_read(case: _Case, change: _Change) -> str | None:
     return read if restorable else None
 
 
+def _across(case: _Case) -> set[str]:
+    """What ``case`` composes across pipelines (``_compose_across``), as ``_COVERED`` names it."""
+    kinds = {item.name: item.kind for item in case.project.stages}
+    found = set[str]()
+    for item in case.project.stages:
+        if any(read in kinds and _stage_parts(read)[0] != item.pipeline for read in item.reads):
+            found.add(f"a {item.kind} stage reading another pipeline's")
+        if item.over and _stage_parts(item.over)[0] != item.pipeline:
+            found.add(f"a {item.kind} stage over another pipeline's {kinds[item.over]} stage")
+    return found
+
+
 def test_dry_run_keep_going_fixed_seeds_cover_every_kind() -> None:
     """Between them, the fixed seeds generate every kind of change, each run option, a target
-    naming each kind of stage and an instance, two pipelines, each kind of tracked input, a
+    naming each kind of stage and an instance, two pipelines, one reading the other's stages
+    and mapped over its mapped and chained stages (``_across``), each kind of tracked input, a
     configured remote and a producer whose key left its listing (for a user who is not root,
     as CI's; root gets the same cases but for the modes). What a deleted tracked path's restore
     meets counts only in a case that restores it (``_restores``), so each detail of it is
@@ -884,6 +943,7 @@ def test_dry_run_keep_going_fixed_seeds_cover_every_kind() -> None:
             for case in cases
             if len({item.pipeline for item in case.project.stages}) == 2
         ),
+        *(composed for case in cases for composed in _across(case)),
         *("remote" for case in cases if case.project.remote),
         *("dropping" for case in cases if case.project.dropping),
     }
@@ -908,6 +968,9 @@ _COVERED = {
     "input directory whole",
     "input directory member",
     "two pipelines",
+    "a plain stage reading another pipeline's",
+    "a chained stage over another pipeline's mapped stage",
+    "a chained stage over another pipeline's chained stage",
     "remote",
     "dropping",
 }

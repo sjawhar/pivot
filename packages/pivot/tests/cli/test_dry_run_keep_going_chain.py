@@ -3,7 +3,8 @@
 over p/build's (``_CHAIN_PIPELINE``). The dry run lists the stages the run on the same tree runs,
 skips, fails or blocks (spec R5): a mapped stage whose expansion the run refuses, those it blocks
 behind it, a producer current only because a pull would bring it up to date, targets naming a
-mapped stage or one of its instances, and the limit of a producer that must run first.
+mapped stage or one of its instances, the limit of a producer that must run first, and a chain
+another pipeline reaches through its handles.
 
 Each test drives the installed ``pivot`` binary in a real git project (``helpers.git_project``)
 and parses the dry run's stdout as one JSON document. The run's stages are its `stage_complete`
@@ -115,6 +116,49 @@ def cut(entry: str, shared: str) -> str:
 
 with Pipeline("p") as pipeline:
     cut(pipeline.map(plan()), shared())
+"""
+
+# _CHAIN_PIPELINE's p/plan, p/cut and p/build as pipeline prep, in prep/pipeline.py
+_PREP_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+@stage
+def build(cut: str) -> str:
+    return cut + "!"
+
+
+with Pipeline("prep") as pipeline:
+    built = build(cut(pipeline.map(plan())))
+"""
+
+# The root pipeline, report, maps report/final over the instances of prep/build, whose handle it
+# imports (``_PREP_PIPELINE``). `--all` loads it first, from the project root, so the combined
+# pipeline registers prep's stages in the order report's load does
+_REPORT_PIPELINE = """\
+from pivot import Pipeline, stage
+from prep.pipeline import built
+
+
+@stage
+def final(build: str) -> str:
+    return build + "?"
+
+
+with Pipeline("report") as pipeline:
+    final(built)
 """
 
 # _CHAIN_PIPELINE's mapped stages, each standing for its instances while not expanded
@@ -472,6 +516,40 @@ def test_dry_run_keep_going_lists_the_instances_a_failing_mapped_target_is_mappe
             "p/cut@a": helpers.UNCHANGED_ROW,
             "p/cut@b": helpers.UNCHANGED_ROW,
             "p/build": {"would_run": False, "reason": reason},
+        }
+    }, stderr
+    assert statuses.keys() == document["stages"].keys()
+
+
+def test_dry_run_keep_going_lists_the_instances_of_a_chain_another_pipeline_reaches(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pipeline report maps report/final over the instances of prep/build, mapped over
+    prep/cut's, mapped over prep/plan's files (``_REPORT_PIPELINE``); only prep/plan ran. Walking
+    report's handles reaches prep/build before prep/cut, and pivot 0.10.4 registered them in that
+    order, so outside a run prep/build and report/final stayed not expanded. Each is registered
+    after the stage it is mapped over now: the dry run lists every instance, each would run, and
+    the run runs them."""
+    root, home = helpers.git_project(tmp_path)
+    helpers.write_pipeline(root, "prep", _PREP_PIPELINE)
+    (root / "pipeline.py").write_text(_REPORT_PIPELINE)
+    helpers.ok(helpers.run_pivot(root, home, "repro", "--all", "prep/plan"))
+
+    document, stderr = helpers.dry_run_keep_going(root, home)
+    ran, _ = helpers.run_keep_going(root, home)
+
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    instances = [
+        f"{template}@{key}"
+        for template in ("prep/cut", "prep/build", "report/final")
+        for key in "ab"
+    ]
+    statuses = helpers.stage_statuses(ran.stdout)
+    assert statuses == {"prep/plan": "cached", **dict.fromkeys(instances, "ran")}, ran.stdout
+    assert document == {
+        "stages": {
+            "prep/plan": helpers.UNCHANGED_ROW,
+            **dict.fromkeys(instances, {"would_run": True, "reason": "No previous run"}),
         }
     }, stderr
     assert statuses.keys() == document["stages"].keys()

@@ -191,6 +191,34 @@ def test_a_template_reached_through_an_imported_handle_comes_with_its_producer(
     assert report.list_templates() == ["prep/_helper_cut", "report/_helper_build"]
 
 
+@compose.stage
+def _helper_final(build: dict[str, int]) -> dict[str, int]:
+    return build
+
+
+def test_stages_reached_through_another_pipeline_are_registered_after_what_they_read(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pipeline report maps `report/_helper_final` over the instances of prep's
+    `prep/_helper_build`, mapped over `prep/_helper_cut_with`'s, mapped over the files of
+    `prep/_helper_plan` and reading `prep/_helper_value`. Walking report's handles reaches each
+    stage before the stages it reads; each is registered after them, so a mapped stage expands
+    after the one it is mapped over (pivot 0.10.4 registered them in the order reached)."""
+    with compose.Pipeline("prep", root=tmp_path) as prep:
+        value = _helper_value()
+        plan = _helper_plan(_plan_input(prep))
+        build = _helper_build(_helper_cut_with(prep.map(plan), value))
+    with compose.Pipeline("report", root=tmp_path) as report:
+        _helper_final(build)
+
+    assert report.list_stages() == ["prep/_helper_plan", "prep/_helper_value"]
+    assert report.list_templates() == [
+        "prep/_helper_cut_with",
+        "prep/_helper_build",
+        "report/_helper_final",
+    ]
+
+
 # =============================================================================
 # Refusals
 # =============================================================================
