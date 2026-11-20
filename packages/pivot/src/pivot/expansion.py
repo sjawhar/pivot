@@ -98,16 +98,10 @@ class InstanceChecks(NamedTuple):
     wanted: dict[str, dict[str, set[str]]]
     """The keys each template expands when the run's targets name instances, each with the
     targets that need it (``mapped_targets``); a template it does not hold expands every key."""
-    missing_tracked: list[str]
-    """The tracked files the run start left missing for the stages that read them, absolute and
-    normalized (``executor.core.verify_tracked_files``' ``tolerate_missing``); empty in any
-    other run, which stops on a missing tracked file."""
-    restore_failed: Collection[str]
-    """Each path of ``missing_tracked`` whose ``--checkout-missing`` restore failed
-    (``executor.core.verify_tracked_files``' ``restore_failed``), which a refusal names as such."""
-    checkout_missing: bool
-    """Whether the run start restored the missing tracked files it could
-    (``--checkout-missing``)."""
+    missing_tracked: ownership.MissingTracked
+    """The tracked files the run start left missing for the stages that read them, with those
+    whose ``--checkout-missing`` restore failed (``executor.core.verify_tracked_files``'
+    ``tolerate_missing``); none in any other run, which stops on a missing tracked file."""
     allow_uncached_incremental: bool
     force: bool
 
@@ -181,10 +175,8 @@ def plan_instances(
                 checks.missing_tracked,
                 ownership.stage_output_paths(project_root, planned),
                 project_root,
-                checkout_attempted=checks.checkout_missing,
-                restore_failed=checks.restore_failed,
             )
-            if checks.missing_tracked
+            if checks.missing_tracked.paths
             else None
         )
         if refusal is None:

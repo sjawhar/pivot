@@ -188,10 +188,11 @@ When multiple `pivot` processes share the same StateDB:
   listing that has the wrong hash or cannot be read falls back to the cache object with one
   warning, and is refused only when that object is absent too, or at once with
   `OnStale.REFUSE` (`pivot verify`). A reader of a stage the command does not run passes
-  `OnStale.QUIET`, which falls back without a word. A listing refused because the cache lacks
-  that object too, or whose cache object or prefix directory cannot be read, raises
-  `ListingUnavailableError`, a `CorruptListingError` that a leave-out restore tolerates
-  (`executor/restore.py`); every other refusal is a plain `CorruptListingError`.
+  `OnStale.QUIET`, which falls back without a word. Where the cache could not give a listing it
+  was read for, the refusal is `ListingUnavailableError` (its docstring says where), a
+  `CorruptListingError` that a leave-out restore tolerates (`executor/tracked_restore.py`);
+  every other refusal is a plain `CorruptListingError`, and the cache object's lookup raises its
+  `OSError` as it is.
 
 ## Lock and Listing Files
 

@@ -443,8 +443,9 @@ def nearest_entry_problem(path: pathlib.Path) -> tuple[pathlib.Path, str] | None
     the first new entry, is made, with what keeps it from taking one: it "must be a directory",
     or it "is not a writable, searchable directory" (this process cannot create entries in it
     and search it, ``W_OK | X_OK``). None when it is such a directory, or when nothing on the
-    way exists. A state directory (``state_dir_target_problem``) and a restore of a missing
-    tracked path (``executor.restore``) are both checked here."""
+    way exists. A state directory is checked here (``state_dir_target_problem``), and the dry
+    run predicts here whether a restore of a missing tracked path can write it
+    (``executor.tracked_restore.check_tracked``); the restore itself learns by trying."""
     for candidate in (path, *path.parents):
         if not os.path.lexists(candidate):
             continue

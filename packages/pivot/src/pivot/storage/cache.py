@@ -1242,7 +1242,16 @@ def refuse_unregistered_link(target: pathlib.Path | str, link: pathlib.Path) -> 
         for root, cache_root in _UNREGISTERED_ROOTS.items()
         if real == root or real.startswith(root + os.sep)
     )
-    raise exceptions.CacheError(
+    raise unregistered_link_error(target, link, cache_root)
+
+
+def unregistered_link_error(
+    target: pathlib.Path | str, link: pathlib.Path, cache_root: pathlib.Path | str
+) -> exceptions.CacheError:
+    """The refusal to make ``link`` a link to ``target`` in the cache ``cache_root``, which this
+    process could not register its project in (``refuse_unregistered_link``), or will not, as a
+    dry run predicts (``executor.tracked_restore.check_tracked``)."""
+    return exceptions.CacheError(
         f"Refusing to link {link} to {target}: this command could not register the "
         + f"project in the cache {cache_root}, whose filesystem is read-only here, so a "
         + "`pivot gc` of that cache, run where it is writable, cannot see that this "

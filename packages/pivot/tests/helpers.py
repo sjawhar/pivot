@@ -1,6 +1,6 @@
 """Test helpers shared by test modules: pipelines built with the compositional API or written as
-pipeline.py text, tracked files with no data, the output of `pivot repro --jsonl`, sockets, and
-venvs that CI-only tests install with uv."""
+pipeline.py text, tracked files with no data or removed once tracked, the output of `pivot repro
+--jsonl` and its restore warnings, sockets, and venvs that CI-only tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
@@ -22,14 +22,16 @@ from typing import TYPE_CHECKING, Any
 import anyio
 import pytest
 
-from pivot import compose, exceptions, project, stage_def
+from pivot import cli, compose, exceptions, project, stage_def
 from pivot import names as stage_names
+from pivot.storage import cache, state, store, track
 from pivot.storage import mounts as mounts_module
-from pivot.storage import state, store, track
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
     from multiprocessing.synchronize import Event
+
+    import click.testing
 
     from pivot.registry import PipelineLike
 
@@ -90,6 +92,20 @@ def track_without_data(data_path: pathlib.Path) -> pathlib.Path:
     return pvt_path
 
 
+def track_then_remove(runner: click.testing.CliRunner, root: pathlib.Path, name: str) -> None:
+    """Track ``root / name`` with the real ``pivot track`` (its objects go to the cache), then
+    remove it from the workspace."""
+    assert runner.invoke(cli.cli, ["track", name]).exit_code == 0
+    cache.remove_output(root / name)
+
+
+# The line `TrackedFileMissingError` ends with when a file it lists overlaps a stage output
+OVERLAP_STOPS = (
+    "Pivot does not run a stage whose output overlaps a file above. "
+    + "That stage replaces its output when it runs."
+)
+
+
 # `pivot repro --all --keep-going --dry-run --jsonl`: its one JSON document on stdout
 DRY_RUN_KEEP_GOING = ["repro", "--all", "--keep-going", "--dry-run", "--jsonl"]
 
@@ -119,6 +135,11 @@ def write_pipeline(root: pathlib.Path, name: str, code: str) -> None:
 def skipping_lines(output: str) -> list[str]:
     """Each `Skipping:` line of ``output``: a stage a run leaves out, with why."""
     return [line for line in output.splitlines() if "Skipping:" in line]
+
+
+def restore_warnings(stderr: str) -> list[str]:
+    """Each `Cannot restore` warning line of ``stderr``: a tracked path a restore left missing."""
+    return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
 
 
 def completed_stages(stdout: str) -> dict[str, dict[str, object]]:

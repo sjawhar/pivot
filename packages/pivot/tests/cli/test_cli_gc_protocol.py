@@ -2388,14 +2388,14 @@ import pathlib
 import sys
 
 from pivot import config, project
-from pivot.executor import core, restore
+from pivot.executor import core, tracked_restore
 from pivot.storage import naming
 
 
 def _watch_first_restore(configured_cache: pathlib.Path, report: pathlib.Path) -> None:
     # At the first tracked-file restore, record whether the project is already in the register
     # of the cache that restore links from: the order, not only the end state.
-    restore_tracked = restore.restore_tracked
+    restore_tracked = tracked_restore.restore_tracked
 
     def watched(*args, **kwargs):
         if not report.exists():
@@ -2405,7 +2405,7 @@ def _watch_first_restore(configured_cache: pathlib.Path, report: pathlib.Path) -
             report.write_text("registered" if entry is not None and entry.exists() else "absent")
         return restore_tracked(*args, **kwargs)
 
-    restore.restore_tracked = watched
+    tracked_restore.restore_tracked = watched
 
 
 if __name__ == "__main__":  # pivot starts processes with spawn, which re-imports this module

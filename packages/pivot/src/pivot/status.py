@@ -251,10 +251,10 @@ def _explanations_for(
     """Each stage of ``execution_order``'s own explanation, before its upstream is counted
     (``_compute_explanations_with_upstream``): ``known``'s where it holds one, computed with the
     same ``force``, ``allow_missing`` and ``restorable``, else read now. ``restorable`` holds the
-    missing tracked files the cache can restore, with their ``.pvt`` data, which the
-    explanations count as present (a dry run with ``--checkout-missing``,
-    ``executor.core.find_missing_tracked_files``). ``assume_restored``: as
-    ``_get_explanations_in_parallel`` takes it."""
+    missing tracked files that the restore brings back
+    (``executor.core.MissingTrackedFiles.restorable``), with their ``.pvt`` data, which the
+    explanations count as present (a dry run with ``--checkout-missing``). ``assume_restored``:
+    as ``_get_explanations_in_parallel`` takes it."""
     tracked_files, tracked_trie = _discover_tracked_files(allow_missing, all_stages)
     if tracked_files is None and restorable:
         tracked_files = dict(restorable)
@@ -367,13 +367,13 @@ def expand_current(
     restores what it lacks. Every other template stays unexpanded, naming what it waits for. A
     run never pulls, so a template whose producer is current only so and whose listing cannot
     be read is not ``refused`` (``expansion.expand_current``'s ``pulled``).
-    ``restorable`` holds the missing tracked files the cache can restore, which the explanations
-    count as present (``_explanations_for``). ``no_commit`` reads the keys a listing gives as a
-    ``--no-commit`` run reads them, from the workspace where neither the committed file nor the
-    cache holds a usable listing (``expansion.expand_current``'s ``workspace``). ``not_current``,
-    when given, receives each stage of the producers' execution order that is not current: a
-    template whose producer it holds waits for that producer, or is mapped over the instances of
-    one that does.
+    ``restorable`` holds the missing tracked files that the restore brings back, which the
+    explanations count as present (``_explanations_for``). ``no_commit`` reads the keys a
+    listing gives as a ``--no-commit`` run reads them, from the workspace where neither the
+    committed file nor the cache holds a usable listing (``expansion.expand_current``'s
+    ``workspace``). ``not_current``, when given, receives each stage of the producers' execution
+    order that is not current: a template whose producer it holds waits for that producer, or is
+    mapped over the instances of one that does.
 
     Returns the expansion and the explanations it computed, before their upstream is counted,
     for the caller to pass on as ``known`` (computed with ``force``, ``allow_missing`` and

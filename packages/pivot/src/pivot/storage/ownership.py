@@ -40,7 +40,7 @@ from pivot.storage import cache, listing, lock, naming, state, track
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     from pivot.registry import RegistryStageInfo
     from pivot.storage.store import WorkspaceStore
@@ -1019,39 +1019,49 @@ def stage_output_paths(
     }
 
 
+class MissingTracked(NamedTuple):
+    """The tracked files a run start leaves missing, which only leave-out mode does (any other
+    run stops on one), with what its restore did: what a refusal of a stage whose output
+    overlaps one of them names (``tracked_output_refusal``). The run start
+    (``executor.core.verify_tracked_files``) gives it, the dry run predicts it
+    (``executor.core.find_missing_tracked_files``), and the checks of a mapped stage's instances
+    take it (``expansion.InstanceChecks``)."""
+
+    paths: list[str]
+    """Each missing tracked path, absolute and normalized as ``track.discover_pvt_files``
+    gives it, sorted."""
+    failed: frozenset[str]
+    """Each path of ``paths`` whose ``--checkout-missing`` restore failed
+    (``executor.tracked_restore.Outcome.FAILED``), which a refusal names as such rather than as
+    one the local cache lacks."""
+    checkout_attempted: bool
+    """Whether a ``--checkout-missing`` restore tried ``paths`` first."""
+
+
 def tracked_output_refusal(
-    missing: Collection[str],
-    outputs: Mapping[pathlib.Path, str],
-    project_root: pathlib.Path,
-    *,
-    checkout_attempted: bool,
-    restore_failed: Collection[str],
+    missing: MissingTracked, outputs: Mapping[pathlib.Path, str], project_root: pathlib.Path
 ) -> exceptions.TrackedFileMissingError | None:
-    """The refusal of the stages whose outputs ``outputs`` holds, or None: a missing tracked
-    path of ``missing`` (absolute normalized paths, as ``track.discover_pvt_files`` gives them)
-    is, lies inside or contains one of those outputs, so that stage's write would delete the
-    path's sidecar. ``outputs`` maps the ``normalized`` path of each output to the stage that
-    writes it (``stage_output_paths``). The error names each such path and how it overlaps
-    (``_tracked_output_overlaps``); ``checkout_attempted`` says whether a restore
-    (``--checkout-missing``) tried those paths first, and ``restore_failed`` holds each path of
-    ``missing`` whose restore failed (``executor.restore.Outcome.FAILED``), which the error names
-    as such rather than as one the local cache lacks. Every check of missing tracked files
-    against stage outputs builds its refusal here: the run start's check of the loaded stages
+    """The refusal of the stages whose outputs ``outputs`` holds, or None: a path of
+    ``missing`` is, lies inside or contains one of those outputs, so that stage's write would
+    delete the path's sidecar. ``outputs`` maps the ``normalized`` path of each output to the
+    stage that writes it (``stage_output_paths``). The error names each such path and how it
+    overlaps (``_tracked_output_overlaps``), whether a restore tried it first, and whether that
+    restore failed. Every check of missing tracked files against stage outputs builds its
+    refusal here: the run start's check of the loaded stages
     (``executor.core.verify_tracked_files``), the run's check of a mapped stage's planned
     instances (``Engine._expand_template``) and the dry run's check of both
     (``pivot repro --dry-run``), so all of them agree. With no missing path it reads nothing.
     """
-    if not missing:
+    if not missing.paths:
         return None
-    overlaps = _tracked_output_overlaps(missing, outputs, project_root)
+    overlaps = _tracked_output_overlaps(missing.paths, outputs, project_root)
     if not overlaps:
         return None
-    failed = set(restore_failed)
     return exceptions.TrackedFileMissingError(
         list(overlaps),
-        checkout_attempted=checkout_attempted,
+        checkout_attempted=missing.checkout_attempted,
         overlaps=overlaps,
-        restore_failed=[path for path in overlaps if path in failed],
+        restore_failed=missing.failed,
     )
 
 

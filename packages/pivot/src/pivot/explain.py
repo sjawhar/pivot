@@ -238,8 +238,8 @@ def get_stage_explanation(
     ``tracked_files`` (with ``tracked_trie``, keyed by their paths' parts) gives a missing
     dependency the hash of the ``.pvt`` that tracks it. With ``allow_missing`` they hold every
     tracked file, and a missing dependency none of them tracks takes the lock's hash. Without it
-    they hold the missing tracked files the cache can restore (a dry run with
-    ``--checkout-missing``), whose ``.pvt`` hash the restore brings back, and a dependency none
+    they hold the missing tracked files that the restore brings back (a dry run with
+    ``--checkout-missing``), whose ``.pvt`` hash the restore gives back, and a dependency none
     of them tracks stays missing: the lock's own hash would compare with itself and call an
     input the restore changes unchanged.
 

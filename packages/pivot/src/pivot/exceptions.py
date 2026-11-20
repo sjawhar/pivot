@@ -1,5 +1,6 @@
 import os
 import pathlib
+from collections.abc import Collection
 from difflib import get_close_matches
 from typing import ClassVar, override
 
@@ -387,13 +388,15 @@ class CorruptListingError(CacheError):
 
 
 class ListingUnavailableError(CorruptListingError):
-    """A directory's listing cannot be had from the files that hold it, though none of them was
-    found corrupt: the committed listing file is refused (stale, empty or unreadable) and the
-    cache holds no copy of it to fall back on (it is lost, as in a fresh clone), or the cache's
-    listing object, or its prefix directory, cannot be read (``__cause__`` is the ``OSError``).
-    ``storage.listing`` raises it at those sites alone, with the message a ``CorruptListingError``
-    there gives. A restore in leave-out mode leaves such a directory missing
-    (``executor.restore``); every other reader takes it as any ``CorruptListingError``."""
+    """A directory's listing is unavailable, though a cache was read for it: the committed
+    listing file is refused (stale, empty or unreadable) and the cache holds no copy of it to
+    fall back on (the listing is lost, as in a fresh clone), or the cache's listing object
+    cannot be read (``__cause__`` is the ``OSError``). ``storage.listing`` raises it at those two
+    sites alone, with the message a ``CorruptListingError`` gave there in 0.10.4. A read with no
+    cache raises the committed file's own refusal, and a prefix directory of the cache that
+    cannot be searched raises its ``OSError``, as in 0.10.4. A restore in leave-out mode leaves
+    such a directory missing (``executor.tracked_restore``); every other reader takes it as any
+    ``CorruptListingError``."""
 
 
 class ListingMissingError(CacheError):
@@ -425,28 +428,32 @@ class TrackedFileMissingError(CacheError):
     ``overlaps`` maps a missing file to how it overlaps a stage output
     (``ownership.tracked_output_refusal``). Such a file stops a run even when the run tolerates
     missing files (``executor.core.verify_tracked_files``'s ``tolerate_missing``).
-    ``restore_failed`` holds each missing file whose ``--checkout-missing`` restore failed, with
-    a ``Cannot restore`` warning naming why (``executor.restore``): the error says so for it,
-    not that the local cache lacks it."""
+    ``restore_failed`` holds missing files whose ``--checkout-missing`` restore failed, with a
+    ``Cannot restore`` warning naming why (``executor.tracked_restore``); the error keeps those
+    it lists and says so for each, not that the local cache lacks it."""
 
     _missing: list[str]
     _checkout_attempted: bool
     _overlaps: dict[str, str]
     _restore_failed: list[str]
+    _every_restore_failed: bool
 
     def __init__(
         self,
         missing_files: list[str],
         checkout_attempted: bool = False,
         overlaps: dict[str, str] | None = None,
-        restore_failed: list[str] | None = None,
+        restore_failed: Collection[str] | None = None,
     ) -> None:
         self._missing = missing_files
         self._checkout_attempted = checkout_attempted
         # None: no listed file overlaps a stage output
         self._overlaps = {} if overlaps is None else overlaps
-        # None: no listed file's restore failed
-        self._restore_failed = [] if restore_failed is None else restore_failed
+        # None: no file's restore failed
+        failed = frozenset[str]() if restore_failed is None else frozenset(restore_failed)
+        self._restore_failed = [path for path in missing_files if path in failed]
+        # Each listed file's restore failed: none is one the local cache lacks
+        self._every_restore_failed = 0 < len(self._restore_failed) == len(missing_files)
         super().__init__(self._format_message())
 
     def _format_message(self) -> str:
@@ -461,7 +468,7 @@ class TrackedFileMissingError(CacheError):
             reason = "These files are tracked by Pivot but don't exist on disk."
         elif not failed:
             reason = "These files are not in local cache."
-        elif failed.issuperset(self._missing):
+        elif self._every_restore_failed:
             reason = "Their restore failed: a 'Cannot restore' warning above names each cause."
         else:
             reason = (
@@ -480,7 +487,7 @@ class TrackedFileMissingError(CacheError):
     @override
     def get_suggestion(self) -> str:
         if self._checkout_attempted:
-            if set(self._restore_failed).issuperset(self._missing):
+            if self._every_restore_failed:
                 return "Fix what each 'Cannot restore' warning above names, then run again"
             return "Run 'pivot pull' to fetch from remote storage"
         if len(self._missing) == 1:

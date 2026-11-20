@@ -275,11 +275,6 @@ def _skipping_lines(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if "Skipping:" in line]
 
 
-def _restore_warnings(stderr: str) -> list[str]:
-    """Each `Cannot restore` warning line of ``stderr``: a tracked path a restore left missing."""
-    return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
-
-
 @pytest.mark.parametrize("mode", ["plain", "uncached-incremental", "stale-producer"])
 def test_dry_run_keep_going_leaves_out_a_mapped_stage_and_its_orphan(
     tmp_path: pathlib.Path, mode: str
@@ -481,10 +476,10 @@ def test_dry_run_keep_going_names_a_failed_restore_under_a_mapped_stage_as_the_r
         "stages": {"p/plan": _UNCHANGED, "p/cut": {"would_run": False, "reason": reason}}
     }, dry_run.stdout
     # The run's error names the path its checkout opened, which its link modes stage first
-    assert _restore_warnings(dry_run.stderr) == [
+    assert helpers.restore_warnings(dry_run.stderr) == [
         f"Cannot restore {tracked}: [Errno 13] Permission denied: '{cache_object}'"
     ], dry_run.stderr
-    run_warnings = _restore_warnings(ran.stderr)
+    run_warnings = helpers.restore_warnings(ran.stderr)
     assert len(run_warnings) == 1, ran.stderr
     assert run_warnings[0].startswith(f"Cannot restore {tracked}: [Errno 13] Permission denied: ")
     assert not tracked.exists()

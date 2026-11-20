@@ -132,9 +132,14 @@ class _LeaveOut(NamedTuple):
     mode; ``_no_leave_out`` in any other mode, which leaves out nothing)."""
 
     found: MissingTrackedFiles
-    """The missing tracked files, split by whether the cache can restore them
-    (``--checkout-missing``; ``executor.core.find_missing_tracked_files``): the restorable ones
-    count as present, and nothing restores them."""
+    """The missing tracked files, split by whether the restore brings them back
+    (``--checkout-missing``; ``executor.core.find_missing_tracked_files``). A tracked path that
+    the restore brings back counts as present, and nothing restores it: the local cache holds
+    every object its restore needs and this user can read them, unless the restore could not
+    write it (the nearest existing directory above it must be one this user can write in and
+    search) or read its cache objects, or it lies in a tracked directory whose committed
+    listing is stale, empty or unreadable with no cached copy. Such a path stays missing, as in
+    the run, where its failed restore warns and leaves its readers out."""
     present: list[tuple[str, ArtifactRef]]
     """Each dependency of the kept stages and templates that no stage produces, with its stage:
     each exists, or the restore creates it (``engine.graph.get_runnable_stages``' ``present``)."""
@@ -155,9 +160,16 @@ def _no_leave_out(stages_list: list[str] | None) -> _LeaveOut:
     """The decisions of a run that is not in leave-out mode: it keeps every stage and target and
     finds no missing tracked file (its pre-flight stops on one)."""
     from pivot.executor import core as executor_core
+    from pivot.storage import ownership
 
     return _LeaveOut(
-        found=executor_core.MissingTrackedFiles(missing=[], restorable={}, restored={}, failed=[]),
+        found=executor_core.MissingTrackedFiles(
+            missing=ownership.MissingTracked(
+                paths=[], failed=frozenset(), checkout_attempted=False
+            ),
+            restorable={},
+            restored={},
+        ),
         present=[],
         stages=None,
         left_out={},
@@ -172,16 +184,17 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
     made in its order (``Engine._orchestrate_execution`` in leave-out mode), reading only.
 
     It finds the missing tracked files with the run's skip, built from the loaded stages
-    (``executor.core.find_missing_tracked_files``; with ``checkout_missing`` those the cache can
-    restore count as present, and nothing is restored); stops on one that is, lies inside or
-    contains an output of a loaded stage (``ownership.tracked_output_refusal``), as the run
-    start does; leaves out each stage with a missing input and every stage downstream of it,
-    with one ``Skipping:`` warning per missing input (``engine.graph.get_runnable_stages``); and
-    leaves out each target whose stage it leaves out (``expansion.left_out_targets``).
+    (``executor.core.find_missing_tracked_files``; with ``checkout_missing`` each tracked path
+    that the restore brings back counts as present, as ``_LeaveOut.found`` says, and nothing is
+    restored); stops on one that is, lies inside or contains an output of a loaded stage
+    (``ownership.tracked_output_refusal``), as the run start does; leaves out each stage with a
+    missing input and every stage downstream of it, with one ``Skipping:`` warning per missing
+    input (``engine.graph.get_runnable_stages``); and leaves out each target whose stage it
+    leaves out (``expansion.left_out_targets``).
 
     Raises:
-        TrackedFileMissingError: A missing tracked file the cache cannot restore overlaps an
-            output of a loaded stage.
+        TrackedFileMissingError: A missing tracked file that the restore does not bring back
+            overlaps an output of a loaded stage.
         MultipleDependencyError: Every stage is left out.
     """
     from pivot.executor import core as executor_core
@@ -200,13 +213,9 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
         ),
         checkout_missing=checkout_missing,
     )
-    if found.missing:
+    if found.missing.paths:
         refusal = ownership.tracked_output_refusal(
-            found.missing,
-            ownership.stage_output_paths(project_root, loaded),
-            project_root,
-            checkout_attempted=checkout_missing,
-            restore_failed=found.failed,
+            found.missing, ownership.stage_output_paths(project_root, loaded), project_root
         )
         if refusal is not None:
             raise refusal
@@ -216,7 +225,7 @@ def _leave_out_plan(stages_list: list[str] | None, *, checkout_missing: bool) ->
         cli_helpers.require_workspace_store(),
         all_pipelines=True,
         on_error=OnError.KEEP_GOING,
-        missing_tracked=found.missing,
+        missing_tracked=found.missing.paths,
         restored_tracked=found.restored,
         present=present,
     )
@@ -339,10 +348,10 @@ def _get_explanations(
     In leave-out mode (``repro --all --keep-going``) it shows what that run would do. The run's
     decisions before it expands (``_leave_out_plan``) leave out stages and targets; when targets
     were left out and none is left, nothing is explained, as the run runs nothing. The mapped
-    stages expand as the run would expand them: the missing tracked files the cache can restore
-    count as present, each template adds the instances ``expansion.plan_instances`` plans over
-    the run's checks, or the template fails with its reason, and with ``no_commit`` the keys are
-    read as that run reads them. A template the run fails (``expansion.Expansion``'s
+    stages expand as the run would expand them: the missing tracked files that the restore
+    brings back count as present, each template adds the instances ``expansion.plan_instances``
+    plans over the run's checks, or the template fails with its reason, and with ``no_commit``
+    the keys are read as that run reads them. A template the run fails (``expansion.Expansion``'s
     ``refused``: any refusal but an unread listing of a producer current only by a pull, which
     the run runs again) is in ``refused``, not ``not_expanded``, and each template mapped over
     its instances, directly or through other mapped stages, is in ``blocked``, as the run blocks
@@ -384,8 +393,6 @@ def _get_explanations(
         checks=expansion.InstanceChecks(
             wanted=plan.wanted,
             missing_tracked=plan.found.missing,
-            restore_failed=plan.found.failed,
-            checkout_missing=checkout_missing,
             allow_uncached_incremental=allow_uncached_incremental,
             force=force,
         )
@@ -1307,8 +1314,11 @@ def _run_oneshot_mode(
     "--checkout-missing",
     is_flag=True,
     help="Restore tracked files that don't exist on disk from cache before running. With "
-    + "--all --keep-going, and neither --watch nor --fail-fast, --dry-run and --explain count "
-    + "such a file the cache holds as present and restore nothing.",
+    + "--all --keep-going, and neither --watch nor --fail-fast, --dry-run and --explain restore "
+    + "nothing and count such a file as present when the cache holds every object its restore "
+    + "needs, unless the restore could not write it or read its cache objects, or it lies in a "
+    + "tracked directory whose committed listing is stale, empty or unreadable with no cached "
+    + "copy; the run warns for each such file and leaves out the stages that read it.",
 )
 @click.option(
     "--allow-missing",

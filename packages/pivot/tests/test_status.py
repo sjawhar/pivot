@@ -917,7 +917,7 @@ def test_dry_run_keep_going_restore_reads_name_each_stage_whose_explanation_miss
     (raw / "link").symlink_to("dir")
     (raw / "alias").symlink_to("inputs")
     found = executor_core.find_missing_tracked_files(mock_discovery.root, checkout_missing=True)
-    assert found.missing == []
+    assert found.missing.paths == []
     assert list(found.restorable) == [
         str(raw / "dir" / "f.txt"),
         str(raw / "images"),
@@ -945,7 +945,7 @@ def test_dry_run_keep_going_restore_reads_name_each_stage_whose_explanation_miss
         status._make_workspace_store(mock_discovery),
         all_pipelines=True,
         on_error=OnError.KEEP_GOING,
-        missing_tracked=found.missing,
+        missing_tracked=found.missing.paths,
         restored_tracked=found.restored,
         present=present,
     )

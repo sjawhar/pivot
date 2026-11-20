@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import pathlib
@@ -16,7 +17,7 @@ import xxhash
 
 import pivot_tui.run
 from pivot import cli
-from pivot.storage import cache, lock, track
+from pivot.storage import cache, lock, naming, track
 from tests import helpers
 from tests.conftest import isolated_pivot_dir
 
@@ -381,11 +382,6 @@ def test_repro_all_tracked_keep_going_leaves_out_a_mapped_stage_whose_shared_inp
         assert (cwd / "data" / "m" / "plan" / "a.txt").read_text() == "a"
 
 
-def _helper_restore_warnings(stderr: str) -> list[str]:
-    """Each `Cannot restore` warning line of ``stderr``: a tracked path a restore left missing."""
-    return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
-
-
 def _helper_checkout_missing_dry_run_and_run(runner: CliRunner) -> tuple[Result, Result]:
     """`pivot repro --all --keep-going --checkout-missing` in the current project, as a dry run
     (``--dry-run --jsonl``) and then as a run (``--jsonl``), after checking that the dry run
@@ -469,12 +465,12 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_los
 
         _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
         images = cwd / "data" / "raw" / "images"
-        warnings = _helper_restore_warnings(dry_run.stderr)
+        warnings = helpers.restore_warnings(dry_run.stderr)
         assert len(warnings) == 1, dry_run.output
         assert warnings[0].startswith(
             f"Cannot restore {images}: {committed_listing}: its bytes hash to "
         ), dry_run.output
-        assert _helper_restore_warnings(ran.stderr) == warnings, ran.output
+        assert helpers.restore_warnings(ran.stderr) == warnings, ran.output
         assert not images.exists()
 
 
@@ -506,12 +502,15 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_an_un
 
         _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
         images = cwd / "data" / "raw" / "images"
-        warning = (
-            f"Cannot restore {images}: {listing_object}: cannot be read ([Errno 13] Permission "
-            + f"denied: '{listing_object}')"
+        denied = f"[Errno 13] Permission denied: '{listing_object}'"
+        # Reading the object fails as 0.10.4 failed, with a CorruptListingError naming it; the
+        # lookup through an unsearchable prefix directory fails with its raw PermissionError
+        reason = (
+            f"{listing_object}: cannot be read ({denied})" if unreadable == "object" else denied
         )
-        assert _helper_restore_warnings(dry_run.stderr) == [warning], dry_run.output
-        assert _helper_restore_warnings(ran.stderr) == [warning], ran.output
+        warning = f"Cannot restore {images}: {reason}"
+        assert helpers.restore_warnings(dry_run.stderr) == [warning], dry_run.output
+        assert helpers.restore_warnings(ran.stderr) == [warning], ran.output
         assert not images.exists()
 
 
@@ -544,7 +543,7 @@ def test_tracked_keep_going_and_dry_run_keep_going_stop_on_a_cached_listing_that
         assert dry_run.stdout == "", dry_run.output
         assert ran.exit_code == 1, ran.output
         assert problem in ran.stderr, ran.output
-        assert _helper_restore_warnings(dry_run.stderr + ran.stderr) == []
+        assert helpers.restore_warnings(dry_run.stderr + ran.stderr) == []
         assert not (cwd / "data" / "alpha" / "stage_a.txt").exists(), "the run runs no stage"
 
 
@@ -585,7 +584,7 @@ def test_tracked_keep_going_and_dry_run_keep_going_name_a_failed_restore_over_an
             assert tip in result.stderr, result.output
             assert "not in local cache" not in result.output, result.output
             assert "pivot pull" not in result.output, result.output
-            assert len(_helper_restore_warnings(result.stderr)) == 1, result.output
+            assert len(helpers.restore_warnings(result.stderr)) == 1, result.output
         assert dry_run.stdout == "", dry_run.output
         assert not tracked.exists()
 
@@ -629,10 +628,10 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_a_rea
                 + "(path data/raw/locked/cached.txt), which does not exist"
             ],
         )
-        assert _helper_restore_warnings(dry_run.stderr) == [
+        assert helpers.restore_warnings(dry_run.stderr) == [
             f"Cannot restore {cached}: this user cannot write in {locked}"
         ], dry_run.output
-        warnings = _helper_restore_warnings(ran.stderr)
+        warnings = helpers.restore_warnings(ran.stderr)
         assert len(warnings) == 1, ran.output
         assert warnings[0].startswith(
             f"Cannot restore {cached}: [Errno 13] Permission denied: '{locked}/"
@@ -683,15 +682,40 @@ def test_tracked_keep_going_and_dry_run_keep_going_leave_out_the_reader_of_an_un
                 + "(path data/raw/cached.txt), which does not exist"
             ],
         )
-        assert _helper_restore_warnings(dry_run.stderr) == [
+        assert helpers.restore_warnings(dry_run.stderr) == [
             f"Cannot restore {cached}: [Errno 13] Permission denied: '{cache_object}'"
         ], dry_run.output
-        warnings = _helper_restore_warnings(ran.stderr)
+        warnings = helpers.restore_warnings(ran.stderr)
         assert len(warnings) == 1, ran.output
         assert warnings[0].startswith(f"Cannot restore {cached}: [Errno 13] Permission denied: "), (
             ran.output
         )
         assert not cached.exists()
+
+
+def _helper_images_tree_project(
+    runner: CliRunner, root: pathlib.Path, modes: str
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """`_helper_tracked_images_project` with the checkout modes ``modes`` (the list
+    `cache.checkout_mode` gives, SYMLINK first) and the whole directory tree of data/raw/images
+    in the cache, complete and marked, as a SYMLINK commit of a stage output with the same files
+    leaves it. Returns data/raw/images, the tree and the object of its member a.png."""
+    (root / ".pivot" / "config.yaml").write_text(f"cache:\n  checkout_mode: [{modes}]\n")
+    _helper_tracked_images_project(runner, root)
+    files = root / ".pivot" / "cache" / "files"
+    images = root / "data" / "raw" / "images"
+    record = track.read_pvt_file(track.get_pvt_path(images))
+    assert record is not None
+    # A directory with the same files, saved as a SYMLINK commit saves an output
+    twin = root / "twin"
+    twin.mkdir()
+    (twin / "a.png").write_text("a")
+    cache.save_to_cache(
+        twin, files, checkout_modes=[cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
+    )
+    twin.unlink()
+    member_hash = track.tracked_members(images, record, files)["files"][0]["hash"]
+    return images, cache.tree_path(files, record["hash"]), cache.get_cache_path(files, member_hash)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root searches a directory whatever its mode")
@@ -706,26 +730,10 @@ def test_tracked_keep_going_and_dry_run_keep_going_read_a_symlink_tree_as_the_re
     tree's files and restores file by file, which fails on the member object: the run leaves
     dirs/scan out, and so does the dry run, with the same warning."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
-        (cwd / ".pivot" / "config.yaml").write_text(
-            "cache:\n  checkout_mode: [symlink, hardlink, copy]\n"
+        images, tree, member_object = _helper_images_tree_project(
+            runner, cwd, "symlink, hardlink, copy"
         )
-        _helper_tracked_images_project(runner, cwd)
-        files = cwd / ".pivot" / "cache" / "files"
-        images = cwd / "data" / "raw" / "images"
-        record = track.read_pvt_file(track.get_pvt_path(images))
-        assert record is not None
-        # A directory with the same files, saved as a SYMLINK commit saves an output
-        twin = cwd / "twin"
-        twin.mkdir()
-        (twin / "a.png").write_text("a")
-        cache.save_to_cache(
-            twin, files, checkout_modes=[cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
-        )
-        twin.unlink()
-        tree = cache.tree_path(files, record["hash"])
         tree_mode = stat.S_IMODE(tree.stat().st_mode)
-        member_hash = track.tracked_members(images, record, files)["files"][0]["hash"]
-        member_object = cache.get_cache_path(files, member_hash)
 
         member_object.chmod(0)
         try:
@@ -752,7 +760,7 @@ def test_tracked_keep_going_and_dry_run_keep_going_read_a_symlink_tree_as_the_re
         } == {"alpha/stage_a": "ran", "dirs/scan": "ran"}, linked_run.output
         assert linked, "the restore links the directory to the tree"
         assert (cwd / "data" / "dirs" / "scan.txt").read_text() == "a.png"
-        assert _helper_restore_warnings(linked_dry_run.stderr + linked_run.stderr) == []
+        assert helpers.restore_warnings(linked_dry_run.stderr + linked_run.stderr) == []
         assert dry_run.exit_code == 0, dry_run.output
         assert json.loads(dry_run.stdout) == {
             "stages": {"alpha/stage_a": {"would_run": False, "reason": "unchanged"}}
@@ -764,9 +772,150 @@ def test_tracked_keep_going_and_dry_run_keep_going_read_a_symlink_tree_as_the_re
         } == {"alpha/stage_a": "cached"}, ran.output
         assert helpers.skipping_lines(ran.stderr) == _IMAGES_SKIPPED, ran.output
         warning = f"Cannot restore {images}: [Errno 13] Permission denied: '{member_object}'"
-        assert _helper_restore_warnings(dry_run.stderr) == [warning], dry_run.output
-        assert _helper_restore_warnings(ran.stderr) == [warning], ran.output
+        assert helpers.restore_warnings(dry_run.stderr) == [warning], dry_run.output
+        assert helpers.restore_warnings(ran.stderr) == [warning], ran.output
         assert not images.exists()
+
+
+def _helper_register_on_a_read_only_mount(
+    monkeypatch: pytest.MonkeyPatch, cache_root: pathlib.Path
+) -> None:
+    """Make the register of the cache at ``cache_root`` behave, in this process, as on a
+    filesystem mounted read-only, which this user cannot make: opening a naming lock file there
+    fails with EROFS, as it does on such a mount (``naming.naming_unit`` then refuses this
+    process's links into the cache), and ``os.statvfs`` of the register reports ``ST_RDONLY``
+    beside its real figures. The links a registration refuses go to a table of this test's
+    own."""
+    register = os.path.realpath(naming.register_root(cache_root))
+    real_open_cache_lock = cache.open_cache_lock
+    real_statvfs = os.statvfs
+
+    def open_cache_lock(path: pathlib.Path, *, dir_fd: int | None = None) -> int:
+        if dir_fd is None and os.path.realpath(path.parent) == register:
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(path))
+        return real_open_cache_lock(path, dir_fd=dir_fd)
+
+    def statvfs(path: str | os.PathLike[str]) -> os.statvfs_result:
+        found = real_statvfs(path)
+        if os.path.realpath(path) != register:
+            return found
+        return os.statvfs_result((*found[:8], found.f_flag | os.ST_RDONLY, *found[9:]))
+
+    monkeypatch.setattr(cache, "_UNREGISTERED_ROOTS", dict[str, str]())
+    monkeypatch.setattr(cache, "open_cache_lock", open_cache_lock)
+    monkeypatch.setattr(os, "statvfs", statvfs)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a cache object whatever its mode")
+@pytest.mark.parametrize("copies", [True, False], ids=["copy_among_modes", "no_copy"])
+def test_tracked_keep_going_and_dry_run_keep_going_restore_from_a_read_only_cache_as_the_run_does(
+    runner: CliRunner,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copies: bool,
+) -> None:
+    """R1, R5 (SYMLINK first): data/raw/images is a missing tracked directory whose whole tree
+    the cache holds, searchable, and whose member object is unreadable (0o000), as in
+    `test_tracked_keep_going_and_dry_run_keep_going_read_a_symlink_tree_as_the_restore_does`,
+    but the cache's register is on a read-only mount. The run cannot register there, so it
+    refuses links into the cache (`naming.naming_unit`). With COPY among the checkout modes its
+    restore copies file by file, which fails on the member object: the run leaves dirs/scan out
+    with a warning, and so does the dry run, which reads the mount's flag and opens each object
+    as the copy does. With no COPY, the restore refuses to link and the run stops before any
+    stage runs; so does the dry run, with no document."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        images, tree, member_object = _helper_images_tree_project(
+            runner, cwd, "symlink, hardlink, copy" if copies else "symlink, hardlink"
+        )
+        _helper_register_on_a_read_only_mount(monkeypatch, cwd / ".pivot" / "cache")
+
+        member_object.chmod(0)
+        try:
+            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+        finally:
+            member_object.chmod(0o444)
+
+        assert cache.links_refused(tree), "the run's registration met the read-only register"
+        if copies:
+            _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
+            warning = f"Cannot restore {images}: [Errno 13] Permission denied: '{member_object}'"
+            assert helpers.restore_warnings(dry_run.stderr) == [warning], dry_run.output
+            assert helpers.restore_warnings(ran.stderr) == [warning], ran.output
+        else:
+            for result in (dry_run, ran):
+                assert result.exit_code == 1, result.output
+                assert f"Error: Refusing to link {images} to " in result.stderr, result.output
+                assert helpers.skipping_lines(result.stderr) == [], result.output
+                assert helpers.restore_warnings(result.stderr) == [], result.output
+            assert dry_run.stdout == "", dry_run.output
+            assert helpers.completed_stages(ran.stdout) == {}, ran.output
+        assert not images.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes in a read-only directory")
+def test_tracked_keep_going_and_dry_run_keep_going_limit_a_cache_register_this_user_cannot_write(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R5's limit, pinned: data/raw/images is a missing tracked directory whose objects the cache
+    holds, but the cache's register (`projects/`) holds no entry for this project and is a
+    read-only directory on a writable filesystem. The run's registration must write an entry
+    there, cannot, and stops the run before any stage runs, restoring nothing. The dry run
+    writes nothing, so it cannot tell: whether a registration writes in the register, and
+    fails, only the write tells (a current entry, on a kernel that lets the removal of an absent
+    file pass in such a directory, needs no write). It lists dirs/scan as one the restore lets
+    run."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_tracked_images_project(runner, cwd)
+        register = cwd / ".pivot" / "cache" / naming.REGISTER_DIR
+        entries = [path for path in register.iterdir() if path.suffix in (".json", ".nonce")]
+        assert entries, "pivot track registered the project"
+        for entry in entries:
+            entry.unlink()
+
+        register.chmod(0o555)
+        try:
+            dry_run, ran = _helper_checkout_missing_dry_run_and_run(runner)
+        finally:
+            register.chmod(0o755)
+
+        assert dry_run.exit_code == 0, dry_run.output
+        assert json.loads(dry_run.stdout)["stages"].keys() == {
+            "alpha/stage_a",
+            "dirs/scan",
+        }, dry_run.output
+        assert ran.exit_code == 1, ran.output
+        assert "Error: Cannot record this project in the cache register at " in ran.stderr, (
+            ran.output
+        )
+        assert helpers.completed_stages(ran.stdout) == {}, ran.output
+        assert not (cwd / "data" / "raw" / "images").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a directory whatever its mode")
+def test_tracked_keep_going_off_an_unreadable_listing_prefix_directory_stops_as_in_0_10_4(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R6, D1: outside leave-out mode (`repro --all --checkout-missing`, no --keep-going), the
+    restore of data/raw/images, a missing tracked directory whose listing object's prefix
+    directory in the cache this user cannot search (0o000), stops the run before any stage runs
+    with the raw PermissionError of the listing object's lookup, as 0.10.4 stops it, not a
+    listing error."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        listing_object = _helper_tracked_images_project(runner, cwd)
+        prefix = listing_object.parent
+        mode = stat.S_IMODE(prefix.stat().st_mode)
+
+        prefix.chmod(0)
+        try:
+            ran = runner.invoke(cli.cli, ["repro", "--all", "--checkout-missing", "--jsonl"])
+        finally:
+            prefix.chmod(mode)
+
+        assert ran.exit_code == 1, ran.output
+        assert f"Error: Permission denied: {listing_object}\n" in ran.stderr, ran.output
+        assert "listing" not in ran.stderr, ran.output
+        assert helpers.completed_stages(ran.stdout) == {}, ran.output
+        assert not (cwd / "data" / "raw" / "images").exists()
 
 
 class _FakeTuiApp:

@@ -287,6 +287,27 @@ def test_read_without_a_cache_says_the_listing_file_does_not_exist(
         listing.read(tmp_path / "absent.listing", record, None)
 
 
+def test_a_listing_read_with_no_cache_refuses_bytes_that_do_not_hash_as_they_are(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A read with no cache, as `pivot gc` reads a cache object's own bytes, refuses bytes that
+    do not hash to the record with that refusal itself, a plain ``CorruptListingError``. With a
+    cache that holds no copy, the same bytes are an unavailable listing
+    (``ListingUnavailableError``): only a cache could have given it."""
+    data = f"{_A} 1 - a.txt\n".encode()
+    record = _helper_record(data, size=1, nfiles=1)
+    stale = data.replace(b" 1 - ", b" 2 - ")
+
+    with pytest.raises(exceptions.CorruptListingError) as without_cache:
+        listing.read_found(stale, "some.listing", record, None)
+    with pytest.raises(exceptions.ListingUnavailableError) as with_cache:
+        listing.read_found(stale, "some.listing", record, tmp_path / "files")
+
+    assert type(without_cache.value) is exceptions.CorruptListingError
+    assert str(without_cache.value) == str(with_cache.value)
+    assert str(without_cache.value).startswith("some.listing: its bytes hash to ")
+
+
 def test_write_replaces_a_listing_atomically_and_leaves_identical_bytes_alone(
     tmp_path: pathlib.Path,
 ) -> None:

@@ -30,7 +30,7 @@ import logging
 import operator
 import os
 import re
-from typing import TYPE_CHECKING, NewType, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, NewType, TypedDict, cast
 
 import xxhash
 
@@ -422,23 +422,35 @@ def _warn_stale(problem: str) -> None:
     )
 
 
+class _CachedListing(NamedTuple):
+    """The cache's listing object at a record's hash (``_read_cached``)."""
+
+    data: CheckedBytes
+    """Its bytes, checked against the record."""
+    path: pathlib.Path
+
+
 def _read_cached(
-    cache_dir: pathlib.Path, record: DirHash, *, notice: bool
-) -> tuple[bytes, pathlib.Path] | None:
-    """The bytes of the cache's listing object at ``record``'s hash, with its path
-    (``cache.resolve_cache_object_path``), or None when the cache holds none. The object, or a
-    directory on the way to it, that cannot be read raises ``ListingUnavailableError`` from the
-    ``OSError``, naming the object."""
-    cached: pathlib.Path | None = None
+    cache_dir: pathlib.Path | None, record: DirHash, *, notice: bool
+) -> _CachedListing | None:
+    """The cache's listing object at ``record``'s hash (``cache.resolve_cache_object_path``),
+    its bytes checked against ``record`` (``check``), or None with no cache or no such object.
+    The lookup's ``OSError`` (a prefix directory this user cannot search) is raised as it is,
+    as 0.10.4 raised it. An object that cannot be read raises ``ListingUnavailableError`` from
+    the ``OSError``, with the message 0.10.4's ``CorruptListingError`` gave."""
+    if cache_dir is None:
+        return None
+    cached = cache.resolve_cache_object_path(cache_dir, record["hash"], notice=notice)
+    if cached is None:
+        return None
     try:
-        cached = cache.resolve_cache_object_path(cache_dir, record["hash"], notice=notice)
-        return None if cached is None else (cached.read_bytes(), cached)
+        data = cached.read_bytes()
     except FileNotFoundError:
         # Removed since it was found
         return None
     except OSError as e:
-        named = cache.get_cache_path(cache_dir, record["hash"]) if cached is None else cached
-        raise exceptions.ListingUnavailableError(f"{named}: cannot be read ({e})") from e
+        raise exceptions.ListingUnavailableError(f"{cached}: cannot be read ({e})") from e
+    return _CachedListing(check(data, record, cached), cached)
 
 
 def _resolve(
@@ -463,11 +475,12 @@ def _resolve(
     listing, a merge, or a run interrupted between writing the listing and the lock. Only when
     the cache lacks that object too is the committed file refused.
 
-    The listing is unavailable (``ListingUnavailableError``) at exactly two kinds of site: the
-    committed file is refused and the cache holds no copy (it is lost), or the cache object, or
-    a directory on the way to it, cannot be read. Every other refusal, a collision, a cache
-    object whose bytes do not hash to ``record``, or a committed file refused at once, is a
-    ``CorruptListingError`` of its own kind.
+    With a cache (``cache_dir``), a refusal where the cache could not give the listing is a
+    ``ListingUnavailableError`` (whose docstring says where); without one, the committed file's
+    own refusal is raised. The cache object's lookup raises its ``OSError`` as it is
+    (``_read_cached``). Every other refusal, a collision, a cache object whose bytes do not hash
+    to ``record``, or a committed file refused at once, is a ``CorruptListingError`` of its own
+    kind.
     """
     notice = on_stale is not OnStale.QUIET
     if found is not None:
@@ -477,28 +490,28 @@ def _resolve(
         except exceptions.CorruptListingError as e:
             problem = e
         else:
-            cached = None if cache_dir is None else _read_cached(cache_dir, record, notice=notice)
+            cached = _read_cached(cache_dir, record, notice=notice)
             if cached is None:
                 return checked, source
-            canonical = check(cached[0], record, cached[1])
-            if canonical != checked:
+            if cached.data != checked:
                 raise exceptions.CorruptListingError(
-                    f"{source}: its bytes differ from the canonical cache listing {cached[1]}, "
+                    f"{source}: its bytes differ from the canonical cache listing {cached.path}, "
                     + f"though both hash to directory {record['hash']}; refuse an XXH64 collision"
                 )
             return checked, source
     if problem is not None and on_stale is OnStale.REFUSE:
         raise problem
-    cached = None if cache_dir is None else _read_cached(cache_dir, record, notice=notice)
+    cached = _read_cached(cache_dir, record, notice=notice)
     if cached is not None:
-        data = check(cached[0], record, cached[1])
         if problem is not None:
             if notice:
                 _warn_stale(str(problem))
             else:
                 logger.debug("%s; using the cache's copy of that listing", problem)
-        return data, f"cache object {record['hash']}"
+        return cached.data, f"cache object {record['hash']}"
     if problem is not None:
+        if cache_dir is None:
+            raise problem
         raise exceptions.ListingUnavailableError(str(problem)) from problem
     # Each place the listing could have come from, all of them missing
     where = list[str]() if source is None else [str(source)]
