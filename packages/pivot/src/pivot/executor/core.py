@@ -611,8 +611,8 @@ def prepare_worker_info(
     # The workers started with other digests: the coordinator loaded user code since then.
     if (digests := loaded_source.digests_for_stage()) is not None:
         info["loaded_sources"] = digests
-    # The submodules the stage reads through their packages (`read_submodules`), each sent by name
-    # or, where it pickles alone, by value, for the worker to bind on its package before anything
+    # The submodules the stage reads through their packages (`read_submodules`), sent with the
+    # stage as `_sent_submodules` decides, for the worker to bind on its package before anything
     # of the stage runs.
     if (names := stage_info.get("read_submodules")) and (
         sent := _sent_submodules(names, pickle_trials)

@@ -2752,7 +2752,7 @@ def bound_submodule(package: types.ModuleType, attribute: str) -> types.ModuleTy
     removed since (`discovery`) is not. Read through `ModuleType`'s descriptor
     (`_module_namespace`), so no `__getattr__` of the package runs and nothing is imported. The
     walk follows such a submodule (`_submodules_to_user_code`), and the coordinator sends it with
-    the stage, by name or, where it pickles alone, by value (`read_submodules`)."""
+    the stage where `executor.core._sent_submodules` decides to (`read_submodules`)."""
     namespace = _module_namespace(package)
     value = namespace.get(attribute)
     name = namespace.get("__name__")
