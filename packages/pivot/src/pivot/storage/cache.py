@@ -1912,7 +1912,8 @@ def missing_cache_objects(
     ``members`` is a directory's listing (None for a file). With SYMLINK first, an existing
     whole-directory tree for a directory output is checked but never repaired here: a supplied
     listing must match its canonical mark byte-for-byte before the tree is trusted
-    (``linked_tree``).
+    (``linked_tree``). Without a tree it trusts, each object is looked up as a restore that
+    links no whole tree looks it up (``missing_linked_objects``).
 
     With ``readable``, each object found is also opened for reading, as every checkout of it
     opens it (a copy reads it, and a link's staged entry is opened through it,
@@ -1929,6 +1930,24 @@ def missing_cache_objects(
             is not None
         ):
             return []
+    return missing_linked_objects(output_hash, members, cache_dir, readable=readable)
+
+
+def missing_linked_objects(
+    output_hash: HashInfo,
+    members: listing.DirListing | None,
+    cache_dir: pathlib.Path,
+    *,
+    readable: bool = False,
+) -> list[str]:
+    """Return the hashes of the objects absent from the cache that a restore of an output
+    checks out one by one, as it does where it links no whole-directory tree: a file's object,
+    or, for a directory, the object of each file of its listing ``members``. Each is looked up
+    as that restore looks it up (``resolve_cache_object_path``); with ``readable``, each one
+    found is also opened for reading, as ``missing_cache_objects`` says. An ``OSError`` of the
+    lookup or the open is raised."""
+    if is_dir_hash(output_hash):
+        assert members is not None, "a directory is restored from its listing"
         hashes = [entry["hash"] for entry in members["files"]]
     else:
         hashes = [output_hash["hash"]]

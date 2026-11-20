@@ -1337,8 +1337,8 @@ def require_shared_store(cache_dir: pathlib.Path) -> StoreLayout:
     mount of its own (``StoreLayout.unshared``), whose register cannot show every project of the
     store: the check every naming unit makes first (``naming_unit``), so a run refuses at its
     start (``register_use``), and which a command that only plans a run makes without writing
-    (``pivot repro --all --keep-going --dry-run``). A cache root that does not exist has a plain
-    layout.
+    (``--dry-run`` and ``--explain`` of ``pivot repro --all --keep-going``, without ``--watch``
+    or ``--fail-fast``). A cache root that does not exist has a plain layout.
 
     Raises:
         exceptions.CacheError: The object store is the root of a mount of its own.

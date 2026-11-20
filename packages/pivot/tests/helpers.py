@@ -1,6 +1,8 @@
 """Test helpers shared by test modules: pipelines built with the compositional API or written as
-pipeline.py text, tracked files with no data or removed once tracked, the output of `pivot repro
---jsonl` and its restore warnings, sockets, and venvs that CI-only tests install with uv."""
+pipeline.py text, tracked files with no data or removed once tracked, git projects that the
+installed `pivot` runs in, the output of `pivot repro --jsonl` and its restore warnings, the dry
+run and the run of `pivot repro --all --keep-going`, sockets, and venvs that CI-only tests
+install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
@@ -108,6 +110,89 @@ OVERLAP_STOPS = (
 
 # `pivot repro --all --keep-going --dry-run --jsonl`: its one JSON document on stdout
 DRY_RUN_KEEP_GOING = ["repro", "--all", "--keep-going", "--dry-run", "--jsonl"]
+
+# A row of a DRY_RUN_KEEP_GOING document: a stage the run would skip as unchanged
+UNCHANGED_ROW = {"would_run": False, "reason": "unchanged"}
+
+
+def ok(proc: subprocess.CompletedProcess[str]) -> str:
+    """The output of ``proc``, a command that must exit 0: its stdout, then its stderr."""
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    return out
+
+
+def git_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """An initialized pivot project in a git repository under ``tmp_path``, and the home its
+    commands run with (``run_pivot``)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "project"
+    root.mkdir()
+    for args in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.email", "t@example.com"),
+        ("git", "config", "user.name", "t"),
+    ):
+        ok(run_cli(root, home, *args))
+    ok(run_pivot(root, home, "init"))
+    return root, home
+
+
+def dry_run_keep_going(
+    root: pathlib.Path, home: pathlib.Path, *args: str
+) -> tuple[dict[str, Any], str]:
+    """``DRY_RUN_KEEP_GOING`` with ``args`` in project ``root``, which must exit 0: its
+    document, parsed from its stdout alone, and its stderr."""
+    proc = run_pivot(root, home, *DRY_RUN_KEEP_GOING, *args)
+    ok(proc)
+    return json.loads(proc.stdout), proc.stderr
+
+
+def run_keep_going(
+    root: pathlib.Path, home: pathlib.Path, *args: str
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, Any]]]:
+    """The run ``dry_run_keep_going`` with ``args`` predicts, `pivot repro --all --keep-going
+    --jsonl` in project ``root``, and its JSONL events."""
+    proc = run_pivot(root, home, "repro", "--all", "--keep-going", "--jsonl", *args)
+    return proc, [json.loads(line) for line in proc.stdout.splitlines()]
+
+
+def stage_statuses(events: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """The status of each stage whose `stage_complete` event a `--jsonl` run's ``events`` hold,
+    by stage."""
+    return {
+        event["stage"]: event["status"] for event in events if event["type"] == "stage_complete"
+    }
+
+
+def refused_mapped_project(tmp_path: pathlib.Path, code: str) -> tuple[pathlib.Path, pathlib.Path]:
+    """A ``git_project`` whose p/plan (``PRODUCER_PIPELINE``) is current, and where
+    data/p/cut@a.txt, the output p/cut@a would write, is a missing tracked file; then ``code``
+    declares p/cut. The file is tracked before p/cut is declared, since `pivot track` refuses a
+    path an output the pipeline declares holds."""
+    root, home = git_project(tmp_path)
+    (root / "pipeline.py").write_text(PRODUCER_PIPELINE)
+    ok(run_pivot(root, home, "repro"))
+    tracked = root / "data" / "p" / "cut@a.txt"
+    tracked.write_text("tracked bytes")
+    ok(run_pivot(root, home, "track", "data/p/cut@a.txt"))
+    tracked.unlink()
+    (root / "pipeline.py").write_text(code)
+    return root, home
+
+
+def uncached_incremental_project(
+    tmp_path: pathlib.Path, code: str
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """A ``git_project`` where every stage of ``code``, whose p/cut instances keep an
+    incremental output, ran; then p/cut@a's lock is gone, so its output data/p/cut@a.txt is on
+    disk but not in the cache."""
+    root, home = git_project(tmp_path)
+    (root / "pipeline.py").write_text(code)
+    ok(run_pivot(root, home, "repro"))
+    (root / ".pivot" / "stages" / "p" / "cut@a.lock").unlink()
+    return root, home
 
 
 def one_stage_pipeline_code(name: str, stage_name: str) -> str:

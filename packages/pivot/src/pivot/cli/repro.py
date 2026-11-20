@@ -259,6 +259,32 @@ def _refused_upstream(
     return found[0] if found else None
 
 
+def _scheduled(
+    plan: _LeaveOut, kept: expansion.Expansion
+) -> tuple[list[str] | None, list[str] | None]:
+    """The stages the leave-out dry run explains for the targets it keeps, and the mapped stages
+    it shows a row for, as the run's own execution order holds them: the order the run
+    schedules for those targets over the stages and mapped stages it keeps
+    (``cli_helpers.run_order``, as ``Engine._orchestrate_execution`` orders them, each instance
+    target standing for its mapped stage), every stage upstream of a mapped stage included.
+    Each stage of it is explained, and so is every instance of each mapped stage of it that
+    expands (``kept``), which the run adds and runs; each mapped stage of it that does not
+    expand has a row. With no target the order holds every stage and mapped stage the run
+    keeps, for which None and None stand: every stage explained, every row shown."""
+    if plan.targets is None:
+        return None, None
+    templates = set(cli_helpers.get_pipeline().list_templates())
+    order = cli_helpers.run_order(plan.targets, plan.stages)
+    stages = [name for name in order if name not in templates]
+    stages += [
+        instance
+        for name in order
+        if name in kept["expanded"]
+        for instance in kept["expanded"][name]
+    ]
+    return stages, [name for name in order if name in templates and name not in kept["expanded"]]
+
+
 def _log_restore_limits(
     not_expanded: list[PipelineStatusInfo],
     plan: _LeaveOut,
@@ -354,16 +380,19 @@ def _get_explanations(
     ``refused``: any refusal but an unread listing of a producer current only by a pull, which
     the run runs again) is in ``refused``, not ``not_expanded``, and each template mapped over
     its instances, directly or through other mapped stages, is in ``blocked``, as the run blocks
-    it. A target naming a mapped stage not expanded stands for its producer, as in any mode, and
-    for the instances of each mapped stage it is mapped over that expands, which the run runs. A
+    it. The targets stand for the run's own execution order for them (``_scheduled``): each
+    stage of it, every stage upstream of a mapped stage included, the instances of each mapped
+    stage of it that expands, and a row for each mapped stage of it that does not. A
     left-out stage, every instance of a left-out mapped stage, its not-expanded row and its
     orphaned instances are not shown, and a left-out stage changes no orphan the run would
     remove (``cli_helpers.eligible_templates`` over the stages the run keeps). With
     ``--checkout-missing``, a notice on stderr names each mapped stage shown as not yet expanded
     that the run may expand (``_log_restore_limits``).
     Any other mode leaves out nothing (``_no_leave_out``), expands every key with no run checks
-    and shows each refused mapped stage as not yet expanded, as 0.10.4 does, and stops on a
-    missing dependency unless ``allow_missing``.
+    and shows each refused mapped stage as not yet expanded, as 0.10.4 does, resolves the
+    targets as `pivot status` does (``cli_helpers.resolve_mapped_targets``: a mapped stage not
+    expanded stands for its producer), and stops on a missing dependency unless
+    ``allow_missing``.
 
     Shared by --explain and --dry-run modes.
     """
@@ -415,24 +444,11 @@ def _get_explanations(
         )
     )
     orphans = status_mod.orphaned_instances(pipeline, kept, removing)
-    targets, shown_templates = cli_helpers.resolve_mapped_targets(plan.targets, kept)
-    if leave_out and targets is not None and shown_templates:
-        # A target naming a mapped stage not expanded stands for its producer, and the mapped
-        # stages it is mapped over are shown; the run expands each of those that expands here
-        # and runs its instances, so they are targets too
-        targets = list(
-            dict.fromkeys(
-                [
-                    *targets,
-                    *(
-                        instance
-                        for template in shown_templates
-                        if template in kept["expanded"]
-                        for instance in kept["expanded"][template]
-                    ),
-                ]
-            )
-        )
+    targets, shown_templates = (
+        _scheduled(plan, kept)
+        if leave_out
+        else cli_helpers.resolve_mapped_targets(plan.targets, kept)
+    )
     # Each left-out stage and template, and every instance of a left-out template
     hidden = set(plan.left_out).union(
         *(result["expanded"][name] for name in plan.left_out if name in result["expanded"])

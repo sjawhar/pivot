@@ -24,7 +24,7 @@ import random
 import re
 import shutil
 import stat
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import pytest
 import yaml
@@ -35,15 +35,23 @@ from tests import helpers
 
 if TYPE_CHECKING:
     import subprocess
-    from collections.abc import Collection, Sequence
+    from collections.abc import Callable, Collection, Mapping, Sequence
 
 _SEEDS_VARIABLE = "PIVOT_DIFFERENTIAL_SEEDS"
 
-# Chosen so that, between them, they generate every kind of change, both run options and every
-# kind of target (``test_dry_run_keep_going_fixed_seeds_cover_every_kind``), with seeds that
-# found two disagreements this test was written for: 435, 480 and 1126 a pulled producer whose
-# directory a --no-commit dry run read, 2651 a target hiding the instances it is mapped over
-_FIXED_SEEDS = (4, 13, 18, 39, 48, 52, 61, 80, 106, 117, 193, 435, 480, 1126, 2651)
+# Chosen so that, between them, they generate every kind of change, both run options, every
+# kind of target and every restore of a deleted tracked path that --checkout-missing reaches
+# (``test_dry_run_keep_going_fixed_seeds_cover_every_kind``), with the seeds that found the
+# disagreements this test was written for
+_FIXED_SEEDS = (
+    *(4, 13, 14, 18, 39, 48, 52, 61, 76, 80, 106, 117, 193, 380, 522, 729),
+    # A pulled producer whose directory a --no-commit dry run read
+    *(435, 480, 1126),
+    # A target hiding the instances it is mapped over
+    2651,
+    # A target naming a mapped stage not expanded, which hid a stage the run schedules upstream
+    *(32, 211, 265),
+)
 
 # The keys every producer writes, and the key a dropping producer wrote in the first run alone
 _KEYS = ("a", "b")
@@ -62,6 +70,9 @@ class _Input(NamedTuple):
     """"no"; "whole": `pivot track` of the path; "member": of the directory's file x.txt."""
 
 
+_StageKind = Literal["plain", "producer", "mapped", "chained"]
+
+
 class _Stage(NamedTuple):
     """A stage of a generated pipeline."""
 
@@ -69,7 +80,7 @@ class _Stage(NamedTuple):
     """``<pipeline>/<function>``."""
     pipeline: str
     function: str
-    kind: str
+    kind: _StageKind
     """"plain" (one text output), "producer" (a directory output of one file per key),
     "mapped" (over a producer's files) or "chained" (over a mapped stage's instances)."""
     reads: tuple[str, ...]
@@ -91,13 +102,34 @@ class _Project(NamedTuple):
     instances of key z are orphans."""
 
 
-class _Change(NamedTuple):
-    """One change made to the tree after the first run (``_apply``)."""
+# Each kind of change a case makes after the first run (``_APPLY`` makes it)
+_ChangeKind = Literal[
+    "lose_outputs",
+    "empty_cache",
+    "delete_listing",
+    "edit_listed",
+    "delete_output",
+    "track_output",
+    "delete_lock",
+    "delete_tracked",
+    "delete_input",
+    "change_input",
+    "change_code",
+    "change_params",
+]
 
-    kind: str
+
+class _Change(NamedTuple):
+    """One change made to the tree after the first run (``_APPLY``)."""
+
+    kind: _ChangeKind
     subject: str
     """An input path, a stage name, an instance name, or "" for the whole cache."""
-    detail: str
+    detail: dict[str, str]
+    """How the change is made, by what it changes: for `delete_tracked`, what happens to each
+    cache object the restore reads (``_OBJECTS``), to the committed listing and to the
+    directory holding the path (``_tracked_detail``); for `lose_outputs`, what else the stage
+    loses (``_lost_detail``); for `edit_listed`, the edit; for any other, nothing."""
 
 
 class _Case(NamedTuple):
@@ -196,8 +228,8 @@ def _generate_changes(
                 (
                     _WEIGHTS["input"],
                     [
-                        _Change("delete_input", item.path, ""),
-                        _Change("change_input", item.path, ""),
+                        _Change("delete_input", item.path, {}),
+                        _Change("change_input", item.path, {}),
                     ],
                 )
             )
@@ -206,18 +238,22 @@ def _generate_changes(
         detail = _tracked_detail(rng, directory=item.directory and item.tracked == "whole")
         if not locked_out:
             # Root reads and writes whatever the modes say
-            detail = re.sub(r"=(unreadable|unsearchable)", "=kept", detail)
-            detail = detail.replace("parent=read_only", "parent=writable")
+            detail = {
+                key: "kept"
+                if key in _OBJECTS and value in ("unreadable", "unsearchable")
+                else value
+                for key, value in detail.items()
+            } | {"parent": "writable"}
         choices.append((_WEIGHTS["input"], [_Change("delete_tracked", path, detail)]))
     for item in project.stages:
-        options = [_Change("change_code", item.name, "")]
+        options = [_Change("change_code", item.name, {})]
         if item.params:
-            options.append(_Change("change_params", item.name, ""))
+            options.append(_Change("change_params", item.name, {}))
         if item.kind in ("plain", "producer"):
             producer = item.kind == "producer"
             options += [
-                _Change("delete_output", item.name, ""),
-                _Change("delete_lock", item.name, ""),
+                _Change("delete_output", item.name, {}),
+                _Change("delete_lock", item.name, {}),
                 # A stage whose cache objects are gone, a pull-only one with a remote, twice
                 _Change("lose_outputs", item.name, _lost_detail(rng, producer=producer)),
                 _Change("lose_outputs", item.name, _lost_detail(rng, producer=producer)),
@@ -225,20 +261,20 @@ def _generate_changes(
         if item.kind == "producer":
             edit = rng.choice(("add c.txt", "add c d.txt", "remove a.txt"))
             options += [
-                _Change("edit_listed", item.name, edit),
-                _Change("delete_listing", item.name, ""),
+                _Change("edit_listed", item.name, {"edit": edit}),
+                _Change("delete_listing", item.name, {}),
             ]
         if item.over:
             instance = f"{item.name}@{rng.choice(_KEYS)}"
             options += [
-                _Change("delete_output", instance, ""),
-                _Change("delete_lock", instance, ""),
-                _Change("lose_outputs", instance, "listing=kept;workspace=kept"),
-                _Change("track_output", instance, ""),
-                _Change("track_output", instance, ""),
+                _Change("delete_output", instance, {}),
+                _Change("delete_lock", instance, {}),
+                _Change("lose_outputs", instance, {"listing": "kept", "workspace": "kept"}),
+                _Change("track_output", instance, {}),
+                _Change("track_output", instance, {}),
             ]
         choices.append((_WEIGHTS[item.kind], options))
-    choices.append((0.5, [_Change("empty_cache", "", "")]))
+    choices.append((0.5, [_Change("empty_cache", "", {})]))
     count = rng.randint(1, min(3, len(choices)))
     # Drawn without replacement by weight: the largest of random() ** (1 / weight)
     ranked = sorted(choices, key=lambda choice: rng.random() ** (1 / choice[0]), reverse=True)
@@ -247,7 +283,10 @@ def _generate_changes(
         # Every object is gone, so a tracked path's restore finds none, locked out or not
         picked = [
             change._replace(
-                detail=re.sub(r"=(kept|unreadable|unsearchable)", "=removed", change.detail)
+                detail={
+                    key: "removed" if key in _OBJECTS else value
+                    for key, value in change.detail.items()
+                }
             )
             if change.kind == "delete_tracked"
             else change
@@ -256,54 +295,36 @@ def _generate_changes(
     return tuple(sorted(picked, key=lambda change: _ORDER.index(change.kind)))
 
 
-# The order ``_apply`` makes changes in: each reads what the ones before it leave
-_ORDER = (
-    "lose_outputs",
-    "empty_cache",
-    "delete_listing",
-    "edit_listed",
-    "delete_output",
-    "track_output",
-    "delete_lock",
-    "delete_tracked",
-    "delete_input",
-    "change_input",
-    "change_code",
-    "change_params",
-)
+# The keys of a `delete_tracked` detail that each say what happens to a cache object the
+# restore reads: kept, removed, unreadable, or in a prefix directory this user cannot search
+_OBJECTS = ("object", "listing", "members")
 
 
-def _tracked_detail(rng: random.Random, *, directory: bool) -> str:
-    """What deleting a tracked path does to what its restore reads, as ``key=value;...``: its
-    object (a file), or its cached listing object, committed listing and member objects (a
-    directory), each kept, removed, unreadable or in a prefix directory this user cannot search;
-    and whether the directory that holds it is read-only."""
+def _tracked_detail(rng: random.Random, *, directory: bool) -> dict[str, str]:
+    """What deleting a tracked path does to what its restore reads: its object (a file), or its
+    cached listing object, committed listing and member objects (a directory), each kept,
+    removed, unreadable or in a prefix directory this user cannot search (``_OBJECTS``); and
+    whether the directory that holds it is read-only."""
     parent = rng.choice(("writable", "read_only"))
     objects = ("kept", "removed", "unreadable", "unsearchable")
     if not directory:
-        return f"object={rng.choice(objects)};parent={parent}"
-    return (
-        f"listing={rng.choice(objects)};"
-        + f"committed={rng.choice(('intact', 'stale', 'empty', 'missing'))};"
-        + f"members={rng.choice(objects[:3])};parent={parent}"
-    )
+        return {"object": rng.choice(objects), "parent": parent}
+    return {
+        "listing": rng.choice(objects),
+        "committed": rng.choice(("intact", "stale", "empty", "missing")),
+        "members": rng.choice(objects[:3]),
+        "parent": parent,
+    }
 
 
-def _lost_detail(rng: random.Random, *, producer: bool) -> str:
+def _lost_detail(rng: random.Random, *, producer: bool) -> dict[str, str]:
     """What else a stage that lost its cache objects lost: its committed listing (a producer),
     and its output in the workspace, removed or, for a producer, edited."""
     workspace = ("kept", "removed")
     if not producer:
-        return f"listing=kept;workspace={rng.choice(workspace)}"
+        return {"listing": "kept", "workspace": rng.choice(workspace)}
     edits = (*workspace, "add c.txt", "add c d.txt", "remove a.txt")
-    return f"listing={rng.choice(('kept', 'removed'))};workspace={rng.choice(edits)}"
-
-
-def _details(change: _Change) -> dict[str, str]:
-    """A change's ``key=value;...`` detail, by key."""
-    return {
-        key: value for key, _, value in (part.partition("=") for part in change.detail.split(";"))
-    }
+    return {"listing": rng.choice(("kept", "removed")), "workspace": rng.choice(edits)}
 
 
 # =============================================================================
@@ -500,55 +521,107 @@ def _edit_listed(directory: pathlib.Path, edit: str) -> None:
         (directory / name).unlink()
 
 
-def _apply(change: _Change, root: pathlib.Path, case: _Case) -> list[tuple[pathlib.Path, int]]:
-    """Make ``change`` in the tree at ``root``, but for the modes it sets: those it returns, as
-    (path, mode), for ``_prepare`` to set once every change is made."""
-    project = case.project
-    kind, subject = change.kind, change.subject
-    if kind == "lose_outputs":
-        _lose_outputs(root, project, subject, _details(change))
-    elif kind == "empty_cache":
-        for entry in (root / ".pivot" / "cache" / "files").iterdir():
-            shutil.rmtree(entry)
-    elif kind == "delete_listing":
-        _listing_path(root, subject).unlink()
-    elif kind == "edit_listed":
-        _edit_listed(_output_path(root, project, subject), change.detail)
-    elif kind == "delete_output":
-        cache.remove_output(_output_path(root, project, subject))
-    elif kind == "track_output":
-        output = _output_path(root, project, subject)
-        cache.remove_output(output)
-        helpers.track_without_data(output)
-    elif kind == "delete_lock":
-        _lock_path(root, subject).unlink()
-    elif kind == "delete_tracked":
-        return _delete_tracked(root, subject, _details(change))
-    elif kind == "delete_input":
-        cache.remove_output(root / subject)
-    elif kind == "change_input":
-        path = root / subject
-        if path.is_dir():
-            (path / "z.txt").write_text("z")
-        else:
-            path.unlink()
-            path.write_text(f"{subject} changed\n")
-    elif kind == "change_params":
-        params = root / "params.yaml"
-        values = yaml.safe_load(params.read_text()) if params.exists() else {}
-        values[subject] = {"k": 1}
-        params.write_text(yaml.safe_dump(values))
-    else:
-        # _prepare writes the pipelines of every code change at once
-        assert kind == "change_code", kind
+# What a change made by ``_APPLY`` leaves for ``_prepare`` to do last: each (path, mode) to set
+type _Modes = list[tuple[pathlib.Path, int]]
+
+
+def _apply_lose_outputs(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    _lose_outputs(root, case.project, change.subject, change.detail)
     return []
+
+
+def _apply_empty_cache(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    for entry in (root / ".pivot" / "cache" / "files").iterdir():
+        shutil.rmtree(entry)
+    return []
+
+
+def _apply_delete_listing(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    _listing_path(root, change.subject).unlink()
+    return []
+
+
+def _apply_edit_listed(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    _edit_listed(_output_path(root, case.project, change.subject), change.detail["edit"])
+    return []
+
+
+def _apply_delete_output(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    cache.remove_output(_output_path(root, case.project, change.subject))
+    return []
+
+
+def _apply_track_output(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    output = _output_path(root, case.project, change.subject)
+    cache.remove_output(output)
+    helpers.track_without_data(output)
+    return []
+
+
+def _apply_delete_lock(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    _lock_path(root, change.subject).unlink()
+    return []
+
+
+def _apply_delete_tracked(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    return _delete_tracked(root, change.subject, change.detail)
+
+
+def _apply_delete_input(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    cache.remove_output(root / change.subject)
+    return []
+
+
+def _apply_change_input(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    path = root / change.subject
+    if path.is_dir():
+        (path / "z.txt").write_text("z")
+    else:
+        path.unlink()
+        path.write_text(f"{change.subject} changed\n")
+    return []
+
+
+def _apply_change_code(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    # Each pipeline holds every stage whose code the case changes, whichever change writes it
+    changed = [other.subject for other in case.changes if other.kind == "change_code"]
+    _write_pipelines(root, case.project, changed=changed)
+    return []
+
+
+def _apply_change_params(change: _Change, root: pathlib.Path, case: _Case) -> _Modes:
+    params = root / "params.yaml"
+    values = yaml.safe_load(params.read_text()) if params.exists() else {}
+    values[change.subject] = {"k": 1}
+    params.write_text(yaml.safe_dump(values))
+    return []
+
+
+# How ``_prepare`` makes each kind of change in the tree at a root, but for the modes it sets,
+# which it returns; in the order it makes them, each reading what the ones before it leave
+_APPLY: dict[_ChangeKind, Callable[[_Change, pathlib.Path, _Case], _Modes]] = {
+    "lose_outputs": _apply_lose_outputs,
+    "empty_cache": _apply_empty_cache,
+    "delete_listing": _apply_delete_listing,
+    "edit_listed": _apply_edit_listed,
+    "delete_output": _apply_delete_output,
+    "track_output": _apply_track_output,
+    "delete_lock": _apply_delete_lock,
+    "delete_tracked": _apply_delete_tracked,
+    "delete_input": _apply_delete_input,
+    "change_input": _apply_change_input,
+    "change_code": _apply_change_code,
+    "change_params": _apply_change_params,
+}
+_ORDER = tuple(_APPLY)
 
 
 def _lose_outputs(
     root: pathlib.Path, project: _Project, name: str, details: dict[str, str]
 ) -> None:
-    """Remove from the cache every object stage or instance ``name``'s lock names (with a remote,
-    a pull brings them back), and its committed listing or workspace output as ``details`` say."""
+    """Remove from the cache every output object stage or instance ``name``'s lock names (with a
+    remote, a pull brings them back), and its committed listing or workspace output as
+    ``details`` say."""
     recorded = yaml.safe_load(_lock_path(root, name).read_text())
     # A lock that records a directory, read or written, keeps every entry under `records`
     outs = recorded["records"]["outs"] if "records" in recorded else recorded["outs"]
@@ -569,9 +642,7 @@ def _lose_outputs(
         _edit_listed(output, details["workspace"])
 
 
-def _delete_tracked(
-    root: pathlib.Path, subject: str, details: dict[str, str]
-) -> list[tuple[pathlib.Path, int]]:
+def _delete_tracked(root: pathlib.Path, subject: str, details: dict[str, str]) -> _Modes:
     """Delete tracked path ``subject`` from the workspace and change what its restore reads, as
     ``_tracked_detail`` says; return the modes to set."""
     path = root / subject
@@ -615,12 +686,9 @@ def _prepare(case: _Case, base: pathlib.Path, root: pathlib.Path) -> None:
     """A copy of ``base`` at ``root`` with ``case``'s changes made; the modes they set last, so
     no change meets a path another one locked."""
     _copy_tree(base, root)
-    changed = [change.subject for change in case.changes if change.kind == "change_code"]
-    if changed:
-        _write_pipelines(root, case.project, changed=changed)
     modes = list[tuple[pathlib.Path, int]]()
     for change in case.changes:
-        modes += _apply(change, root, case)
+        modes += _APPLY[change.kind](change, root, case)
     for path, mode in modes:
         path.chmod(mode)
 
@@ -656,10 +724,15 @@ def _limited(case: _Case) -> set[str]:
 # =============================================================================
 
 
+_RowKind = Literal[
+    "would run", "after upstream", "unchanged", "would fail", "blocked", "not expanded"
+]
+
+
 class _Row(NamedTuple):
     """A row of the dry run's document, by what it says the run does with the stage."""
 
-    kind: str
+    kind: _RowKind
     """"would run"; "after upstream" (would run only because a stage upstream would);
     "unchanged"; "would fail"; "blocked"; "not expanded" (a mapped stage's row standing for the
     instances the run adds)."""
@@ -684,18 +757,32 @@ def _row(entry: dict[str, Any]) -> _Row:
     return _Row("would fail", reason)
 
 
-def _outcome(event: dict[str, Any]) -> str:
-    """What the run did with a stage: "ran" (a run-cache hit counts), "skipped", "failed",
-    "blocked", or the status it gave."""
+def _not_expanded(rows: Mapping[str, _Row]) -> set[str]:
+    """The mapped stages the dry run shows as not yet expanded."""
+    return {name for name, row in rows.items() if row.kind == "not expanded"}
+
+
+class _Outcome(NamedTuple):
+    """What the run did with a stage, by its `stage_complete` event (``_outcome``)."""
+
+    stage: str
+    status: str
+    """"ran" (a run-cache hit counts), "skipped", "failed", "blocked", or the status it gave."""
+    reason: str
+
+
+def _outcome(event: dict[str, Any]) -> _Outcome:
     if event["status"] == "ran" or event["reason"] == "unchanged (run cache)":
-        return "ran"
-    if event["status"] == "cached":
-        return "skipped"
-    return event["status"]
+        did = "ran"
+    elif event["status"] == "cached":
+        did = "skipped"
+    else:
+        did = event["status"]
+    return _Outcome(event["stage"], did, event["reason"])
 
 
 # Each kind of row, with what the run may do with its stage
-_AGREES = {
+_AGREES: dict[_RowKind, set[str]] = {
     "would run": {"ran"},
     "after upstream": {"ran", "skipped"},
     "unchanged": {"skipped"},
@@ -708,7 +795,7 @@ _AGREES = {
 # What the run may do with a mapped stage the dry run shows as not yet expanded, which adds no
 # instance: fail its expansion, or block it behind one that failed. Which files the producer
 # writes is known only once it has run (``test_dry_run_keep_going_limit_a_mapped_stage_its_
-# producer_must_run_for`` in tests/cli/test_dry_run_keep_going.py)
+# producer_must_run_for`` in tests/cli/test_dry_run_keep_going_chain.py)
 _UNEXPANDED = {"failed", "blocked"}
 
 
@@ -735,61 +822,72 @@ def _restored(stderr: str, roots: Sequence[pathlib.Path]) -> list[str]:
     )
 
 
-def _disagreements(
+def _is_limited(name: str, limited: Collection[str]) -> bool:
+    """Whether stage or instance ``name`` is of ``limited`` (``_limited``)."""
+    return name in limited or registry.template_of(name, limited) is not None
+
+
+def _stderr_disagreements(
     dry: subprocess.CompletedProcess[str],
     ran: subprocess.CompletedProcess[str],
+    roots: Sequence[pathlib.Path],
+) -> list[str]:
+    """Each gives the same `Skipping:` lines, names the same paths in its `Cannot restore`
+    warnings, and ends with the same error, its stderr from its last `Error:` line, or with
+    none (a run whose only problem is a stage it fails prints none)."""
+    found = list[str]()
+    dry_skipping = _normal("\n".join(helpers.skipping_lines(dry.stderr)), roots)
+    run_skipping = _normal("\n".join(helpers.skipping_lines(ran.stderr)), roots)
+    if dry_skipping != run_skipping:
+        found.append(f"the same Skipping: lines: {dry_skipping!r} != {run_skipping!r}")
+    dry_restores, run_restores = _restored(dry.stderr, roots), _restored(ran.stderr, roots)
+    if dry_restores != run_restores:
+        found.append(f"the same failed restores: {dry_restores} != {run_restores}")
+    dry_error, run_error = _error(dry.stderr, roots), _error(ran.stderr, roots)
+    if dry_error != run_error:
+        found.append(f"the same error: {dry_error!r} != {run_error!r}")
+    return found
+
+
+def _stop_disagreements(
+    dry: subprocess.CompletedProcess[str],
+    ran: subprocess.CompletedProcess[str],
+    completed: Sequence[_Outcome],
+) -> list[str]:
+    """A dry run that stops before its document stops as the run does: both exit non-zero, and
+    the run before any stage completes."""
+    if dry.returncode != 0 and ran.returncode != 0 and not completed:
+        return []
+    return [
+        "a dry run that stops stops the run before any stage: exits "
+        + f"{dry.returncode} and {ran.returncode}, {len(completed)} stages completed"
+    ]
+
+
+def _row_disagreements(
+    rows: Mapping[str, _Row],
+    completed: Sequence[_Outcome],
     *,
     roots: Sequence[pathlib.Path],
     limited: Collection[str],
 ) -> list[str]:
-    """Each way the leave-out dry run ``dry`` and the run ``ran`` of one tree (copies at
-    ``roots``) disagree, by spec R5 (version 7), each named.
-
-    The keys of the dry run's `stages` are the stages the run runs, skips, fails or blocks; a
-    row of a mapped stage not yet expanded stands for the instances the run adds. A row that
-    would run is a stage the run runs; a run-cache hit counts, since the dry run does not
-    predict one. A row that would run only because a stage upstream of it would (its reason
-    `Upstream stale`) is a stage the run runs or skips: what that stage writes is known only
-    once it has run. A row that is unchanged is a stage the run skips; one that would fail, a
-    stage the run fails with the same reason; one that is blocked, a stage the run blocks. The
-    instances a not-yet-expanded row stands for are each run or skipped, for the same reason;
-    or, the limit, the run fails that mapped stage's expansion, or blocks it, once the producer
-    has run (``_UNEXPANDED``). `would_remove` names the instances the run removes, but for a
-    mapped stage not yet expanded, whose plan is known only once its producer has run. A
-    left-out stage is absent from both, and each gives the same `Skipping:` lines and names the
-    same paths in its `Cannot restore` warnings. A dry run that stops before its document stops
-    as the run does, before any stage, with the same error; else it exits 1 only for a left-out
-    target, with the run's error, and the run exits 1 for that or a stage it fails. Not
-    compared: the stages of ``limited``, whose rows need only be present (``_limited``), and
-    the dry run's notices, which are stderr only."""
+    """The keys of the dry run's `stages` are the stages the run runs, skips, fails or blocks;
+    a row of a mapped stage not yet expanded stands for the instances the run adds, and a
+    left-out stage is absent from both. A row that would run is a stage the run runs; a
+    run-cache hit counts, since the dry run does not predict one. A row that would run only
+    because a stage upstream of it would (its reason `Upstream stale`) is a stage the run runs
+    or skips: what that stage writes is known only once it has run. A row that is unchanged is
+    a stage the run skips; one that would fail, a stage the run fails with the same reason; one
+    that is blocked, a stage the run blocks. The instances a not-yet-expanded row stands for are
+    each run or skipped; or, the limit, the run fails that mapped stage's expansion, or blocks
+    it, once the producer has run (``_UNEXPANDED``). The rows of the stages of ``limited`` need
+    only be present (``_limited``)."""
+    not_expanded = _not_expanded(rows)
+    by_row = dict[str, list[_Outcome]]()
+    for outcome in completed:
+        key = registry.template_of(outcome.stage, not_expanded) or outcome.stage
+        by_row.setdefault(key, []).append(outcome)
     found = list[str]()
-    events = [json.loads(line) for line in ran.stdout.splitlines()]
-    completed = [event for event in events if event["type"] == "stage_complete"]
-    skipping = (helpers.skipping_lines(dry.stderr), helpers.skipping_lines(ran.stderr))
-    if _normal("\n".join(skipping[0]), roots) != _normal("\n".join(skipping[1]), roots):
-        found.append(f"the same Skipping: lines: {skipping[0]} != {skipping[1]}")
-    if _restored(dry.stderr, roots) != _restored(ran.stderr, roots):
-        found.append(
-            "the same failed restores: "
-            + f"{_restored(dry.stderr, roots)} != {_restored(ran.stderr, roots)}"
-        )
-    errors = (_error(dry.stderr, roots), _error(ran.stderr, roots))
-    if not dry.stdout.strip():
-        if dry.returncode == 0 or ran.returncode == 0 or completed:
-            found.append(
-                "a dry run that stops stops the run before any stage: exits "
-                + f"{dry.returncode} and {ran.returncode}, {len(completed)} stages completed"
-            )
-        if errors[0] != errors[1]:
-            found.append(f"the same error: {errors[0]!r} != {errors[1]!r}")
-        return found
-    document = json.loads(dry.stdout)
-    rows = {name: _row(entry) for name, entry in document["stages"].items()}
-    not_expanded = {name for name, row in rows.items() if row.kind == "not expanded"}
-    by_row = dict[str, list[dict[str, Any]]]()
-    for event in completed:
-        key = registry.template_of(event["stage"], not_expanded) or event["stage"]
-        by_row.setdefault(key, []).append(event)
     if rows.keys() != by_row.keys():
         found.append(
             "the same stages: only in the dry run "
@@ -798,20 +896,33 @@ def _disagreements(
         )
     for name in sorted(rows.keys() & by_row.keys()):
         row = rows[name]
-        if name in limited or registry.template_of(name, limited) is not None:
+        if _is_limited(name, limited):
             continue
-        outcomes = [(event["stage"], _outcome(event), event["reason"]) for event in by_row[name]]
+        outcomes = by_row[name]
         if row.kind == "not expanded":
             agrees = all(
-                outcome in (_UNEXPANDED if stage == name else _AGREES[row.kind])
-                for stage, outcome, _ in outcomes
+                outcome.status in (_UNEXPANDED if outcome.stage == name else _AGREES[row.kind])
+                for outcome in outcomes
             )
+        elif len(outcomes) != 1:
+            agrees = False
         else:
-            agrees = len(outcomes) == 1 and outcomes[0][1] in _AGREES[row.kind]
-            if agrees and row.kind == "would fail":
-                agrees = _normal(row.reason, roots) == _normal(outcomes[0][2], roots)
+            (outcome,) = outcomes
+            agrees = outcome.status in _AGREES[row.kind] and (
+                row.kind != "would fail"
+                or _normal(row.reason, roots) == _normal(outcome.reason, roots)
+            )
         if not agrees:
             found.append(f"{row.kind} <-> the run: {name}: {row.reason!r} vs {outcomes}")
+    return found
+
+
+def _removal_disagreements(
+    document: dict[str, Any], events: Sequence[dict[str, Any]], rows: Mapping[str, _Row]
+) -> list[str]:
+    """`would_remove` names the instances the run removes, but for a mapped stage not yet
+    expanded, whose plan is known only once its producer has run."""
+    not_expanded = _not_expanded(rows)
     # `would_remove` is absent from a document that removes nothing, and `removed` from an
     # expansion that removes nothing
     predicted = sorted(document["would_remove"]) if "would_remove" in document else list[str]()
@@ -821,20 +932,72 @@ def _disagreements(
         if event["type"] == "stages_expanded" and event["template"] not in not_expanded
         for name in (event["removed"] if "removed" in event else list[str]())
     )
-    if predicted != removed:
-        found.append(f"would_remove <-> the run's removals: {predicted} != {removed}")
-    refused = any(row.kind == "would fail" for row in rows.values())
-    if (dry.returncode != 0) != bool(errors[0]) or dry.returncode not in (0, 1):
-        found.append(f"the dry run exits 1 for a left-out target alone: {dry.returncode}")
-    unexpanded = any(
-        event["stage"] in not_expanded and event["status"] == "failed" for event in completed
+    if predicted == removed:
+        return []
+    return [f"would_remove <-> the run's removals: {predicted} != {removed}"]
+
+
+def _exit_disagreements(
+    dry: subprocess.CompletedProcess[str],
+    ran: subprocess.CompletedProcess[str],
+    rows: Mapping[str, _Row],
+    completed: Sequence[_Outcome],
+    *,
+    limited: Collection[str],
+) -> list[str]:
+    """The dry run's exit code is non-zero exactly when its stderr has an `Error:` line, a
+    target it leaves out, and is 1 then. The run exits 1 exactly when the dry run does, a row of
+    a stage outside ``limited`` would fail, or the run fails a stage whose failure the dry run
+    need not predict: a mapped stage it shows as not yet expanded (``_UNEXPANDED``), or a stage
+    of ``limited``, whose row may say it would fail or not either way; it exits 0 otherwise."""
+    found = list[str]()
+    has_error = bool(_error(dry.stderr, ()))
+    if (dry.returncode != 0) != has_error or dry.returncode not in (0, 1):
+        found.append(
+            "the dry run's exit code is non-zero exactly when its stderr has an Error: line, "
+            + f"and is 1 then: exit {dry.returncode}, an Error: line {has_error}"
+        )
+    not_expanded = _not_expanded(rows)
+    refused = any(
+        row.kind == "would fail" for name, row in rows.items() if not _is_limited(name, limited)
     )
-    expected = 1 if dry.returncode != 0 or refused or unexpanded else 0
+    unpredicted = any(
+        outcome.status == "failed"
+        and (outcome.stage in not_expanded or _is_limited(outcome.stage, limited))
+        for outcome in completed
+    )
+    expected = 1 if dry.returncode != 0 or refused or unpredicted else 0
     if ran.returncode != expected:
         found.append(f"the run's exit code: {ran.returncode}, expected {expected}")
-    if dry.returncode != 0 and errors[0] != errors[1]:
-        found.append(f"the same left-out targets: {errors[0]!r} != {errors[1]!r}")
     return found
+
+
+def _disagreements(
+    dry: subprocess.CompletedProcess[str],
+    ran: subprocess.CompletedProcess[str],
+    *,
+    roots: Sequence[pathlib.Path],
+    limited: Collection[str],
+) -> list[str]:
+    """Each way the leave-out dry run ``dry`` and the run ``ran`` of one tree (copies at
+    ``roots``) disagree, by spec R5 (version 7), each named, rule by rule: their stderr
+    (``_stderr_disagreements``); a dry run that stops before its document
+    (``_stop_disagreements``); else the rows (``_row_disagreements``, the stages of ``limited``
+    present alone), `would_remove` (``_removal_disagreements``) and the exit codes
+    (``_exit_disagreements``). Not compared: the dry run's notices, which are stderr only."""
+    events = [json.loads(line) for line in ran.stdout.splitlines()]
+    completed = [_outcome(event) for event in events if event["type"] == "stage_complete"]
+    found = _stderr_disagreements(dry, ran, roots)
+    if not dry.stdout.strip():
+        return [*found, *_stop_disagreements(dry, ran, completed)]
+    document = json.loads(dry.stdout)
+    rows = {name: _row(entry) for name, entry in document["stages"].items()}
+    return [
+        *found,
+        *_row_disagreements(rows, completed, roots=roots, limited=limited),
+        *_removal_disagreements(document, events, rows),
+        *_exit_disagreements(dry, ran, rows, completed, limited=limited),
+    ]
 
 
 # =============================================================================
@@ -863,9 +1026,11 @@ def initialized_project(
     return root, home
 
 
-def _report(case: _Case, root: pathlib.Path, found: list[str], *procs: Any) -> str:
-    """What a failure prints: the seed, each disagreement, the case, its pipelines as the
-    commands ran them, and the commands' output."""
+def _report(
+    case: _Case, root: pathlib.Path, found: list[str], *procs: subprocess.CompletedProcess[str]
+) -> str:
+    """What a failure prints: the seed, how to run it again, each disagreement, the case, its
+    pipelines as the commands ran them, and the commands' output."""
     pipelines = "".join(
         f"--- {path.relative_to(root)}\n{path.read_text()}"
         for path in sorted(root.glob("p*/pipeline.py"))
@@ -874,9 +1039,13 @@ def _report(case: _Case, root: pathlib.Path, found: list[str], *procs: Any) -> s
         f"--- {' '.join(proc.args[1:])} (exit {proc.returncode})\n{proc.stdout}{proc.stderr}"
         for proc in procs
     )
+    uid = os.geteuid()
+    user = "root" if uid == 0 else "a user who is not root"
     return (
-        f"seed {case.seed} ({_SEEDS_VARIABLE}={case.seed}:{case.seed + 1}): "
-        + f"{len(found)} disagreements\n"
+        f"seed {case.seed}: {len(found)} disagreements; run it again with "
+        + f"{_SEEDS_VARIABLE}={case.seed}:{case.seed + 1} as {user} (this run's uid is {uid}): "
+        + "for root a seed draws the same case but locks no path, so the case printed below, "
+        + "its details, holds for this kind of user alone\n"
         + "".join(f"  - {problem}\n" for problem in found)
         + f"{case}\n{pipelines}{outputs}"
     )
@@ -899,10 +1068,13 @@ def test_dry_run_keep_going_agrees_with_the_run_on_generated_projects(
     roots = (tmp_path / "dry", tmp_path / "run")
     for root in roots:
         _prepare(case, base, root)
-    arguments = ("repro", "--all", "--keep-going", "--jsonl", *case.options, *case.targets)
 
-    dry = helpers.run_pivot(roots[0], home, *arguments[:3], "--dry-run", *arguments[3:])
-    ran = helpers.run_pivot(roots[1], home, *arguments)
+    dry = helpers.run_pivot(
+        roots[0], home, *helpers.DRY_RUN_KEEP_GOING, *case.options, *case.targets
+    )
+    ran = helpers.run_pivot(
+        roots[1], home, "repro", "--all", "--keep-going", "--jsonl", *case.options, *case.targets
+    )
 
     found = _disagreements(dry, ran, roots=roots, limited=_limited(case))
     assert not found, _report(case, roots[0], found, dry, ran)
@@ -914,22 +1086,56 @@ def _target_kind(case: _Case, target: str) -> str:
     return next(item.kind for item in case.project.stages if item.name == target)
 
 
+def _restores(case: _Case) -> bool:
+    """Whether ``case``'s commands restore a tracked path, or say why not, from a cache that
+    holds objects: they run with --checkout-missing, and no change empties the cache. Without
+    it neither reads a tracked path's object or listing."""
+    return "--checkout-missing" in case.options and all(
+        change.kind != "empty_cache" for change in case.changes
+    )
+
+
+def _restored_read(case: _Case, change: _Change) -> str | None:
+    """What a stage of ``case`` reads that the restore of `delete_tracked` ``change`` brings
+    back, as ``_COVERED`` names it: its object is kept and the directory that holds it is
+    writable, and a stage reads the file, or the directory a tracked member lies in; else None."""
+    if change.detail != {"object": "kept", "parent": "writable"}:
+        return None
+    directory = change.subject.rsplit("/", 1)[0]
+    member = change.subject.endswith("/x.txt")
+    for item in case.project.stages:
+        if member and directory in item.reads:
+            return "a restorable member read through its directory"
+        if not member and change.subject in item.reads:
+            return "a restorable file"
+    return None
+
+
 def test_dry_run_keep_going_fixed_seeds_cover_every_kind() -> None:
     """Between them, the fixed seeds generate every kind of change, each run option, a target
     naming each kind of stage and an instance, two pipelines, each kind of tracked input, a
     configured remote and a producer whose key left its listing (for a user who is not root,
-    as CI's; root gets the same cases but for the modes)."""
+    as CI's; root gets the same cases but for the modes). What a deleted tracked path's restore
+    meets counts only in a case that restores it (``_restores``), so each detail of it is
+    compared as the restore reads it: among them a file and a member of a directory that the
+    restore brings back for the stage reading it (``_restored_read``)."""
     cases = [_generate(seed, locked_out=True) for seed in _FIXED_SEEDS]
+    tracked = [
+        (case, change)
+        for case in cases
+        if _restores(case)
+        for change in case.changes
+        if change.kind == "delete_tracked"
+    ]
 
     found = {
         *(f"change {change.kind}" for case in cases for change in case.changes),
         *(
-            f"{change.kind} {part}"
-            for case in cases
-            for change in case.changes
-            if change.kind == "delete_tracked"
-            for part in change.detail.split(";")
+            f"{change.kind} {key}={value}"
+            for _, change in tracked
+            for key, value in change.detail.items()
         ),
+        *(read for case, change in tracked if (read := _restored_read(case, change)) is not None),
         *(f"option {option}" for case in cases for option in case.options),
         *(f"target {_target_kind(case, target)}" for case in cases for target in case.targets),
         *(
@@ -958,6 +1164,8 @@ _COVERED = {
     ),
     "delete_tracked parent=read_only",
     *(f"delete_tracked committed={value}" for value in ("intact", "stale", "empty", "missing")),
+    "a restorable file",
+    "a restorable member read through its directory",
     "option --no-commit",
     "option --checkout-missing",
     *(f"target {kind}" for kind in ("plain", "producer", "mapped", "chained", "instance")),

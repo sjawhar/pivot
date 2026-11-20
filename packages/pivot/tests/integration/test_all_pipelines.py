@@ -824,6 +824,16 @@ def _helper_read_only_parent(
     return root / "data" / "raw", 0o555
 
 
+def _helper_unstattable_tree_without_member(
+    runner: CliRunner, root: pathlib.Path, modes: str
+) -> tuple[pathlib.Path, int] | None:
+    """`_helper_images_tree_project`'s tree, whose member object is gone from the cache and
+    whose directory is to be locked unsearchable, so its files cannot be stat'd."""
+    _, tree, member_object = _helper_images_tree_project(runner, root, modes)
+    member_object.unlink()
+    return tree, 0
+
+
 def _helper_images_without_tree(
     runner: CliRunner, root: pathlib.Path, modes: str
 ) -> tuple[pathlib.Path, int] | None:
@@ -909,6 +919,20 @@ _READ_ONLY_PARENT = (
         ),
         pytest.param(_helper_images_without_tree, False, "refused", None, id="file_by_file"),
         pytest.param(
+            _helper_unstattable_tree_without_member,
+            True,
+            "absent",
+            None,
+            id="unstattable_tree_without_member-copy_among_modes",
+        ),
+        pytest.param(
+            _helper_unstattable_tree_without_member,
+            False,
+            "absent",
+            None,
+            id="unstattable_tree_without_member",
+        ),
+        pytest.param(
             _helper_empty_listing, True, "restored", None, id="empty_listing-copy_among_modes"
         ),
         pytest.param(_helper_empty_listing, False, "restored", None, id="empty_listing"),
@@ -937,11 +961,15 @@ def test_tracked_keep_going_and_dry_run_keep_going_restore_from_a_read_only_cach
     the symlink restore refuses at the tree before it writes there. In `file_by_file` the cache
     holds no whole tree, so the restore stages the directory and refuses at its first file,
     a.png; in `read_only_parent_file_by_file` it cannot stage it either way and fails, so the
-    run leaves dirs/scan out with a warning, and so does the dry run. In `empty_listing` images'
-    listing holds only the empty directory sub/: either restore links nothing and brings it
-    back, and dirs/scan runs. The dry run's refusal names images and the cache's object store,
-    where the run's names the tree or the file it links, so only the words before those are
-    compared."""
+    run leaves dirs/scan out with a warning, and so does the dry run. In
+    `unstattable_tree_without_member` the cache holds images' whole tree, complete and marked,
+    whose directory this user cannot search (0o000), and a.png's object is gone: the restore
+    cannot stat the tree's files, so it restores file by file, and finds the object absent
+    before it reaches a link, so the run leaves dirs/scan out with no warning, and so does the
+    dry run. In `empty_listing` images' listing holds only the empty directory sub/: either
+    restore links nothing and brings it back, and dirs/scan runs. The dry run's refusal names
+    images and the cache's object store, where the run's names the tree or the file it links,
+    so only the words before those are compared."""
     with isolated_pivot_dir(runner, tmp_path) as cwd:
         images = cwd / "data" / "raw" / "images"
         locked = project(runner, cwd, "symlink, hardlink, copy" if copies else "symlink, hardlink")
@@ -980,6 +1008,11 @@ def test_tracked_keep_going_and_dry_run_keep_going_restore_from_a_read_only_cach
                 assert helpers.restore_warnings(result.stderr) == [], result.output
             assert dry_run.stdout == "", dry_run.output
             assert helpers.completed_stages(ran.stdout) == {}, ran.output
+            assert not images.exists()
+        elif outcome == "absent":
+            _helper_assert_only_alpha_runs(dry_run, ran, _IMAGES_SKIPPED)
+            for result in (dry_run, ran):
+                assert helpers.restore_warnings(result.stderr) == [], result.output
             assert not images.exists()
         else:
             assert dry_run.exit_code == 0, dry_run.output

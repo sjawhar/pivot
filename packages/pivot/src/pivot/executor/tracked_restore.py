@@ -230,8 +230,10 @@ def _check_refusing(
     tree: each looks up its object or tree (a file whose object the cache lacks is absent),
     makes the directory that holds the path, and refuses before it writes there. So it refuses
     once that directory exists or can be made, and fails, with a warning, where it cannot. Any
-    other directory's restore looks each member's object up (one the cache lacks makes it
-    absent) and stages the directory beside the path, as ``_write_failure`` checks, before it
+    other directory's restore, one from a whole tree whose files it cannot stat included (it
+    falls back to restoring file by file), looks each member's object up one by one
+    (``cache.missing_linked_objects``; one the cache lacks makes it absent) before it reaches a
+    link, and stages the directory beside the path, as ``_write_failure`` checks, before it
     links its first file and refuses; a listing that holds no file links nothing, so that
     restore brings the directory back.
 
@@ -251,11 +253,12 @@ def _check_refusing(
             if types.is_dir_hash(source.hash) and source.members is not None
             else None
         )
-        # The restore links a whole tree as it is, looking up no object of it
+        # The restore links a whole tree as it is, looking up no object of it. Any other one
+        # looks up each object it links before it reaches a link
         absent = (
             []
             if tree is not None
-            else cache.missing_cache_objects(source.hash, source.members, cache_dir, checkout_modes)
+            else cache.missing_linked_objects(source.hash, source.members, cache_dir)
         )
     except OSError as e:
         _warn_failed(path, e)
