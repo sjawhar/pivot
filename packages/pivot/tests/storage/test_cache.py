@@ -3595,6 +3595,49 @@ def test_missing_cache_objects_reads_a_whole_tree_where_the_restore_starts_from_
 
 
 @pytest.mark.parametrize(
+    ("kind", "named"),
+    [
+        pytest.param("fifo", "a FIFO", id="fifo"),
+        pytest.param("symlink_to_device", "a device", id="symlink_to_device"),
+    ],
+)
+def test_missing_linked_objects_refuses_an_object_swapped_for_a_fifo_or_a_device_at_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str, named: str
+) -> None:
+    """With ``readable``, each object the lookup finds is opened as ``open_regular_file`` opens
+    it, not by a plain open: a FIFO or a device swapped in for the object once the lookup found
+    it raises ``NotAFileError`` naming that kind and the object, at once, where a plain open of
+    the FIFO waits for a writer and one of ``/dev/null`` passes. Each call must return within
+    the hard timeout of ``helpers.call_without_waiting``."""
+    cache_dir = tmp_path / "cache" / "files"
+    source = tmp_path / "data.csv"
+    source.write_text("data")
+    output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
+    cache_object = cache.get_cache_path(cache_dir, output_hash["hash"])
+    lookup = cache.resolve_cache_object_path
+
+    def _swap_after_lookup(
+        objects: pathlib.Path, file_hash: str, *, directory: bool = False, notice: bool = True
+    ) -> pathlib.Path | None:
+        found = lookup(objects, file_hash, directory=directory, notice=notice)
+        assert found == cache_object, found
+        cache_object.unlink()
+        helpers.occupy(cache_object, kind)
+        return cache_object
+
+    monkeypatch.setattr(cache, "resolve_cache_object_path", _swap_after_lookup)
+
+    with pytest.raises(exceptions.NotAFileError) as raised:
+        helpers.call_without_waiting(
+            lambda: cache.missing_linked_objects(output_hash, None, cache_dir, readable=True),
+            lambda: helpers.free_fifo(cache_object),
+            timeout=10,
+        )
+
+    assert (raised.value.kind, raised.value.filename) == (named, str(cache_object))
+
+
+@pytest.mark.parametrize(
     "old_suffix",
     [
         pytest.param(".layout-checked", id="pivot-0.3.4-layout-checked"),

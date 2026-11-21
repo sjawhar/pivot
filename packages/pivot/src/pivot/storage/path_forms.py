@@ -5,9 +5,7 @@ which resolves a missing path's existing ancestors), so a path that reaches anot
 symlink meets it in its resolved form. A ``pygtrie.Trie`` keyed by ``Path.parts`` decides
 containment, never a string prefix: ``data-backup/x`` is not inside ``data``.
 
-The callers below are this module's; they are not every lookup of a path by both forms, as
-older code asks its own (``engine/engine.py``'s ``_MissingDependencyRun.awaits``,
-``ownership.control_path_refusal``, ``cli/forget_cache.py``). Three compose their own order of
+The callers below are this module's. Three compose their own order of
 forms and questions from these primitives, and say which: the missing tracked files a stage
 reads (``engine.graph.get_runnable_stages``, ``_tracked_file_errors``), the restorable paths a
 dependency's restore changes (``engine.graph.tracked_overlap``), and the stage outputs a

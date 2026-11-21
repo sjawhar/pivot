@@ -66,9 +66,9 @@ def open_regular_file(path: str | os.PathLike[str]) -> int:
     Where the ``O_NONBLOCK`` open fails with ``EAGAIN``, the file is opened again without
     ``O_NONBLOCK``, waiting as ``open`` waits, as ``_open_leased`` says. So the open waits only
     where ``open`` waits on a regular file, but for one race: where ``O_PATH`` or ``/proc`` is
-    missing, and only there, an entry swapped in between the failed ``O_NONBLOCK`` open and
-    that blocking open can make the open wait (a FIFO, for a writer) before the check refuses
-    it.
+    missing, and only there, an entry swapped in before that blocking open, after the failed
+    ``O_NONBLOCK`` open (after the ``O_PATH`` check, where there is one), can make the open
+    wait (a FIFO, for a writer) before the check refuses it.
     """
     try:
         descriptor = os.open(path, _READ_FLAGS | os.O_NONBLOCK)
@@ -102,29 +102,26 @@ def _open_leased(path: str | os.PathLike[str]) -> int:
     ``open``'s would.
 
     Where ``O_PATH`` (Linux-only) is missing, or ``/proc`` (the open through it fails with
-    ``ENOENT``), the path itself is opened without ``O_NONBLOCK``, waiting for the lease to
-    break as 0.10.4's ``open`` did, and that descriptor is checked as ``open_regular_file``
-    checks its own (``_checked``), closed where the check refuses. So in those two cases only,
-    an entry swapped in between the failed ``O_NONBLOCK`` open and that blocking open (after
-    the ``O_PATH`` check, where there is one) is opened before the check refuses it: a FIFO
-    makes the open wait for a writer."""
-    if not hasattr(os, "O_PATH"):
-        return _checked(path, os.open(path, _READ_FLAGS))
-    located = os.open(path, os.O_PATH)
-    try:
-        require_regular_file(path, os.fstat(located).st_mode)
+    ``ENOENT``), the ``O_PATH`` descriptor, where there is one, is closed and the path itself
+    is opened without ``O_NONBLOCK``, waiting for the lease to break as 0.10.4's ``open`` did;
+    the descriptor of that open is checked as ``open_regular_file`` checks its own
+    (``_checked``), closed where the check refuses."""
+    if hasattr(os, "O_PATH"):
+        located = os.open(path, os.O_PATH)
         try:
-            return os.open(f"/proc/self/fd/{located}", _READ_FLAGS)
-        except FileNotFoundError:
-            # No /proc: the path itself is opened below, never "no such file" for a file there
-            pass
-        except OSError as error:
-            # EMFILE or ESTALE names the file, as open's would, never its /proc/self/fd link
-            error.filename = os.fspath(path)
-            raise
-        return _checked(path, os.open(path, _READ_FLAGS))
-    finally:
-        os.close(located)
+            require_regular_file(path, os.fstat(located).st_mode)
+            try:
+                return os.open(f"/proc/self/fd/{located}", _READ_FLAGS)
+            except FileNotFoundError:
+                # No /proc: the path itself is opened below, never "no such file" for a file there
+                pass
+            except OSError as error:
+                # EMFILE or ESTALE names the file, as open's would, never its /proc/self/fd link
+                error.filename = os.fspath(path)
+                raise
+        finally:
+            os.close(located)
+    return _checked(path, os.open(path, _READ_FLAGS))
 
 
 def open_text(path: str | os.PathLike[str], *, newline: str | None = None) -> io.TextIOWrapper:

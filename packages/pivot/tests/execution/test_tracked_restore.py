@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 import xxhash
 
-from pivot import exceptions, project
+from pivot import config, exceptions, project
 from pivot.executor import core as executor_core
 from pivot.executor import tracked_restore
 from pivot.storage import cache, ownership, track
@@ -429,6 +429,66 @@ def test_a_restore_that_cannot_read_its_cache_object_leaves_its_path_missing_in_
         == _NONE_MISSING
     )
     assert data_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("swapped_in", "named"),
+    [
+        pytest.param("fifo", "a FIFO", id="fifo"),
+        pytest.param("symlink_to_device", "a device", id="symlink_to_device"),
+    ],
+)
+def test_a_cache_object_swapped_for_a_fifo_or_a_device_fails_the_predicted_restore_at_once(
+    pipeline_dir: pathlib.Path,
+    runner: click.testing.CliRunner,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    swapped_in: str,
+    named: str,
+) -> None:
+    """With checkout_missing, the dry run's prediction of a missing tracked file's restore
+    (``check_tracked``) opens the cache object its lookup found as the restore's checkout opens
+    it, through ``regular_file.open_regular_file``: a FIFO or a device swapped in for that object
+    once the lookup found it fails the predicted restore (``Outcome.FAILED``) at once, with the
+    restore's warning naming that kind and the object, where a plain open of the FIFO waits for
+    a writer and one of ``/dev/null`` predicts a restore. Each call must return within the hard
+    timeout of ``helpers.call_without_waiting``."""
+    data_path = pipeline_dir / "cached.csv"
+    data_path.write_text("cached data")
+    helpers.track_then_remove(runner, pipeline_dir, data_path.name)
+    record = track.read_pvt_file(track.get_pvt_path(data_path))
+    assert record is not None
+    cache_root = pipeline_dir / ".pivot" / "cache"
+    cache_object = cache.get_cache_path(cache_root / "files", record["hash"])
+    lookup = cache.resolve_cache_object_path
+
+    def _swap_after_lookup(
+        objects: pathlib.Path, file_hash: str, *, directory: bool = False, notice: bool = True
+    ) -> pathlib.Path | None:
+        found = lookup(objects, file_hash, directory=directory, notice=notice)
+        assert found == cache_object, found
+        cache_object.unlink()
+        helpers.occupy(cache_object, swapped_in)
+        return cache_object
+
+    monkeypatch.setattr(cache, "resolve_cache_object_path", _swap_after_lookup)
+    with _caught_warnings(caplog) as warnings:
+        check = helpers.call_without_waiting(
+            lambda: tracked_restore.check_tracked(
+                data_path,
+                record,
+                cache_root,
+                config.get_checkout_mode_order(),
+                links_refused=False,
+            ),
+            lambda: helpers.free_fifo(cache_object),
+            timeout=10,
+        )
+
+    assert check == tracked_restore.Check(tracked_restore.Outcome.FAILED, set())
+    assert warnings == [
+        f"Cannot restore {data_path}: Is {named}, not a regular file: {cache_object}"
+    ]
 
 
 # How the restore's warning names each entry ``helpers.occupy`` puts where a tracked path belongs

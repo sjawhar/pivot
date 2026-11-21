@@ -75,15 +75,9 @@ class Explained(NamedTuple):
 
     explanations: list[StageExplanation]
     rows: list[console.ExplainRow]
-    """A row for each mapped stage shown that does not expand. In leave-out mode
-    (``cli/leave_out_dry_run.py`` ``explanations``), of the kind the run's decision gives: one
-    the run would expand once its producer is current (``NOT_EXPANDED_ROW``); one it refuses to
-    expand (``expansion.Expansion``'s ``refused``, ``REFUSED_ROW``), with the reason it fails
-    that stage with, which runs none of its instances; and one it blocks behind a refused one
-    (``BLOCKED_ROW``), naming that one; in the order of the kinds of ``DRY_RUN_SHOWN``. In any
-    other mode (``cli/repro.py`` ``_get_explanations``), every row is not yet expanded
-    (``NOT_EXPANDED_ROW``), refused and blocked mapped stages included, as 0.10.4 shows them
-    (``status.not_expanded_status``)."""
+    """A row for each mapped stage shown that does not expand: in leave-out mode, of the kinds
+    ``leave_out_dry_run._explain_rows`` gives; otherwise ``NOT_EXPANDED_ROW`` for every row, as
+    0.10.4 shows them."""
     orphans: dict[str, str]
     """Each orphaned instance the run would remove, mapped to its mapped stage."""
     left_out_targets: dict[str, exceptions.DependencyNotFoundError]
