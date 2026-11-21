@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
-import functools
 import hashlib
 import logging
 import mmap
@@ -199,8 +198,7 @@ def hash_file(
         and file_stat is the os.stat_result for the file.
     """
     file_stat = path.stat()
-    if not stat.S_ISREG(file_stat.st_mode):
-        raise regular_file.not_a_file_error(path, file_stat.st_mode)
+    regular_file.require_regular_file(path, file_stat.st_mode)
 
     if state_db is not None:
         cached = state_db.get(path, file_stat)
@@ -1186,7 +1184,7 @@ def copy_to_cache(
         return
 
     with staged_cache_file(cache_path) as staged:
-        regular_file.copy_regular_file(src, staged, chunk_size=CHUNK_SIZE)
+        regular_file.copy_regular_file(src, staged)
         if verify:
             key = cache_path.parent.name + cache_path.name
             copied, _ = hash_file(staged)
@@ -2144,10 +2142,8 @@ def _publish_tree(
     while it is built (see storage/AGENTS.md). An unmarked tree is checked by the next restore
     or commit through it. Only the commit can repair it (``_ensure_tree_complete``).
 
-    Each file is copied by ``regular_file.copy_regular_file``, by the rule
-    ``regular_file.open_regular_file`` states: a FIFO, a socket or a device in the directory,
-    which its listing leaves out, fails the copy, named with its kind, where ``shutil.copy2``
-    refuses a FIFO only when its ``stat`` finds one and reads a device.
+    Each file is copied by ``regular_file.copy_regular_file``: a FIFO or a device in the
+    directory, which its listing leaves out, fails the copy.
     """
     manifest = members["files"]
 
@@ -2172,9 +2168,7 @@ def _publish_tree(
                 path,
                 staged,
                 ignore=_user_symlinks,
-                copy_function=functools.partial(
-                    regular_file.copy_regular_file, chunk_size=CHUNK_SIZE
-                ),
+                copy_function=regular_file.copy_regular_file,
                 dirs_exist_ok=True,
             )
             isexec_by_relpath = {entry["relpath"]: entry["isexec"] for entry in manifest}

@@ -1,21 +1,27 @@
 """Read or copy a file only when it is a regular file.
 
-Every file Pivot hashes or copies into the cache (``storage.cache``), or shows as a metric
-(``show.metrics``), is opened by ``open_regular_file``, which states the rule. ``entry_kind``
-names what stands at a path that is neither a regular file nor a directory, for a refusal
-(``exceptions.NotAFileError``) and for a warning (``track.occupant``).
+Every file ``storage.cache`` reads to hash it or to save it into the cache, and every metric
+file ``show.metrics.parse_metric_file`` reads, is opened by ``open_regular_file``, which states
+the rule. ``entry_kind`` names what stands at a path that is neither a regular file nor a
+directory, for a refusal (``exceptions.NotAFileError``) and for a warning (``track.occupant``).
 """
 
 from __future__ import annotations
 
 import errno
-import io
 import os
 import shutil
 import stat
 import sys
+from typing import TYPE_CHECKING
 
 from pivot import exceptions
+
+if TYPE_CHECKING:
+    import io
+
+# How a file is opened for reading; open_regular_file says why it takes O_NOCTTY
+_READ_FLAGS = os.O_RDONLY | os.O_NOCTTY
 
 
 def entry_kind(mode: int) -> str:
@@ -33,10 +39,16 @@ def entry_kind(mode: int) -> str:
     return "an entry that is neither a file nor a directory"
 
 
-def not_a_file_error(path: str | os.PathLike[str], mode: int) -> OSError:
-    """The error a read of ``path`` raises when what stands there, of ``stat`` mode ``mode``, is
-    not a regular file: ``IsADirectoryError`` for a directory, as ``open`` raises it, else
+def require_regular_file(path: str | os.PathLike[str], mode: int) -> None:
+    """Refuse a read of ``path`` unless what stands there, of ``stat`` mode ``mode``, is a
+    regular file: raise ``IsADirectoryError`` for a directory, as ``open`` raises it, else
     ``exceptions.NotAFileError`` naming its kind."""
+    if not stat.S_ISREG(mode):
+        raise _not_a_file_error(path, mode)
+
+
+def _not_a_file_error(path: str | os.PathLike[str], mode: int) -> OSError:
+    """The error ``require_regular_file`` raises for ``path``, of ``stat`` mode ``mode``."""
     if stat.S_ISDIR(mode):
         return IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), os.fspath(path))
     return exceptions.NotAFileError(os.fspath(path), entry_kind(mode))
@@ -44,32 +56,26 @@ def not_a_file_error(path: str | os.PathLike[str], mode: int) -> OSError:
 
 def open_regular_file(path: str | os.PathLike[str]) -> int:
     """Open the regular file at ``path``, symlinks followed, for reading, and return its
-    descriptor for the caller to close (``open(descriptor, ...)`` takes it over). Every file
-    Pivot hashes (``cache.hash_file``, ``cache.hash_directory``) or copies into the cache
-    (``copy_regular_file``) is opened here, as is a metric output it shows (``open_text``).
+    descriptor for the caller to close (``open(descriptor, ...)`` takes it over).
 
     Pivot never reads a FIFO, a socket or a device: an open of a FIFO waits for a writer, and a
     device such as ``/dev/zero`` never ends. This open keeps that rule, and waits only where
     ``open`` waits on a regular file. It takes ``O_NONBLOCK``, so on a FIFO it returns at once
-    instead of waiting for a writer, and the check is made on the descriptor itself (``fstat``),
-    so an entry swapped in after any earlier ``stat`` of the path is refused too: a directory
-    raises ``IsADirectoryError``, as ``open`` does, and a FIFO or a device
-    ``exceptions.NotAFileError`` naming its kind, the descriptor closed (a socket's open fails
-    first, with ``ENXIO``). It takes ``O_NOCTTY``, so a terminal swapped in never becomes the
-    controlling terminal of a session leader that has none before the check refuses it. A
-    regular file's descriptor is made blocking again before it is returned, so every read of it
-    waits for its bytes, as a read of a file ``open`` opened does. Where the ``O_NONBLOCK`` open
-    fails with ``EAGAIN``, the file is opened again as ``_open_leased`` says.
+    instead of waiting for a writer, and ``require_regular_file`` checks the descriptor itself
+    (``fstat``), so an entry swapped in after any earlier ``stat`` of the path is refused too,
+    the descriptor closed (a socket's open fails first, with ``ENXIO``). It takes ``O_NOCTTY``,
+    so a terminal swapped in never becomes the controlling terminal of a session leader that
+    has none before the check refuses it. A regular file's descriptor is made blocking again
+    before it is returned, so every read of it waits for its bytes, as a read of a file
+    ``open`` opened does. Where the ``O_NONBLOCK`` open fails with ``EAGAIN``, the file is
+    opened again as ``_open_leased`` says.
     """
-    flags = os.O_RDONLY | os.O_NOCTTY
     try:
-        descriptor = os.open(path, flags | os.O_NONBLOCK)
+        descriptor = os.open(path, _READ_FLAGS | os.O_NONBLOCK)
     except BlockingIOError as leased:
-        return _open_leased(path, flags, leased)
+        return _open_leased(path, leased)
     try:
-        mode = os.fstat(descriptor).st_mode
-        if not stat.S_ISREG(mode):
-            raise not_a_file_error(path, mode)
+        require_regular_file(path, os.fstat(descriptor).st_mode)
         os.set_blocking(descriptor, True)
     except BaseException:
         os.close(descriptor)
@@ -77,39 +83,38 @@ def open_regular_file(path: str | os.PathLike[str]) -> int:
     return descriptor
 
 
-def _open_leased(path: str | os.PathLike[str], flags: int, leased: BlockingIOError) -> int:
-    """Open with ``flags`` the file at ``path`` whose ``O_NONBLOCK`` open failed with
-    ``leased`` (``EAGAIN``): a regular file under a conflicting lease, such as a Samba oplock or
-    an nfsd write delegation on this host, which a blocking open waits to see broken. The path
-    is opened with ``O_PATH``, which reads nothing and never waits, and the ``fstat`` of that
-    descriptor decides as in ``open_regular_file``; a regular file is then opened through
+def _open_leased(path: str | os.PathLike[str], leased: BlockingIOError) -> int:
+    """Open for reading the file at ``path`` whose ``O_NONBLOCK`` open failed with ``leased``
+    (``EAGAIN``): a regular file under a conflicting lease, such as a Samba oplock or an nfsd
+    write delegation on this host, which a blocking open waits to see broken. The path is opened
+    with ``O_PATH``, which reads nothing and never waits, and ``require_regular_file`` checks
+    that descriptor as in ``open_regular_file``; a regular file is then opened through
     ``/proc/self/fd`` without ``O_NONBLOCK``, so the open waits as ``open`` waits, on the same
     inode, so nothing swapped in since is read. Where ``O_PATH`` or ``/proc`` is missing,
-    ``leased`` is raised."""
+    ``leased`` is raised; any other error of that open names ``path``, as ``open``'s would."""
     if not hasattr(os, "O_PATH"):
         raise leased
     located = os.open(path, os.O_PATH)
     try:
-        mode = os.fstat(located).st_mode
-        if not stat.S_ISREG(mode):
-            raise not_a_file_error(path, mode)
+        require_regular_file(path, os.fstat(located).st_mode)
         try:
-            return os.open(f"/proc/self/fd/{located}", flags)
+            return os.open(f"/proc/self/fd/{located}", _READ_FLAGS)
         except FileNotFoundError:
             # No /proc: the path's own error, never "no such file" for a file that is there
             raise leased from None
+        except OSError as error:
+            # EMFILE or ESTALE names the file, as open's would, never its /proc/self/fd link
+            error.filename = os.fspath(path)
+            raise
     finally:
         os.close(located)
 
 
 def open_text(path: str | os.PathLike[str], *, newline: str | None = None) -> io.TextIOWrapper:
-    """``open(path, newline=newline)``, a text stream, for the regular file at ``path``, opened
-    by ``open_regular_file``. Its ``name`` is ``path``, as is the name of the stream ``open``
-    returns, so a parser's error names the file (YAML's ``in "<path>", line 1``), not a
-    descriptor number."""
-    raw = io.FileIO(open_regular_file(path))
-    raw.name = os.fspath(path)
-    return io.TextIOWrapper(io.BufferedReader(raw), newline=newline)
+    """``open(path, newline=newline)``, a text stream, for the regular file at ``path``:
+    ``open`` builds it on the descriptor ``open_regular_file`` returns, so its ``name`` is
+    ``path`` and a parser's error names the file (YAML's ``in "<path>", line 1``)."""
+    return open(path, newline=newline, opener=lambda name, _flags: open_regular_file(name))
 
 
 # The least one sendfile call is asked to copy, as shutil.copyfile asks: a larger file is asked
@@ -151,16 +156,15 @@ def _send_file(
         offset += sent
 
 
-def copy_regular_file(
-    src: str | os.PathLike[str], dst: str | os.PathLike[str], *, chunk_size: int
-) -> None:
+def copy_regular_file(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
     """``shutil.copy2(src, dst)`` for the regular file at ``src``, whose bytes are read through
     ``open_regular_file``. ``shutil.copy2`` refuses a FIFO only when its ``stat`` finds one, so
     it waits on a FIFO swapped in after that ``stat``, and it reads a device (``/dev/zero`` for
     ever); this copy refuses both, naming the kind. The bytes are copied in the kernel
-    (``_send_file``), or through userspace, ``chunk_size`` bytes at a time, where it does not;
-    then the metadata, as ``shutil.copy2`` copies it (``shutil.copystat``)."""
+    (``_send_file``), or, where it does not, through userspace by ``shutil.copyfileobj``, as
+    ``shutil.copyfile`` copies them; then the metadata, as ``shutil.copy2`` copies it
+    (``shutil.copystat``)."""
     with open(open_regular_file(src), "rb", buffering=0) as source, open(dst, "wb") as target:
         if not _send_file(source.fileno(), target.fileno(), src, dst):
-            shutil.copyfileobj(source, target, chunk_size)
+            shutil.copyfileobj(source, target)
     shutil.copystat(src, dst)

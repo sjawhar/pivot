@@ -4,25 +4,41 @@ import errno
 import os
 import shutil
 import stat
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
 
 from pivot import exceptions
-from pivot.storage import cache, regular_file
+from pivot.storage import regular_file
 from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
 
+_needs_o_path_and_proc = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="O_PATH and /proc are Linux-only"
+)
+_needs_sendfile = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="shutil copies with sendfile only on Linux"
+)
+# Linux fails a socket's open with ENXIO; other kernels give their own error number
+_needs_linux_socket_open = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="a socket's open fails with ENXIO on Linux"
+)
+
+# What a copy through userspace reads at a time (shutil.copyfileobj); typeshed leaves it out
+_COPY_BUFSIZE: int = shutil.COPY_BUFSIZE  # pyright: ignore[reportAttributeAccessIssue] - not in typeshed
+
 
 def _helper_record_opens(
-    monkeypatch: pytest.MonkeyPatch, *, leased: bool = False, proc: bool = True
+    monkeypatch: pytest.MonkeyPatch, *, leased: bool = False, proc_error: int | None = None
 ) -> list[tuple[str, int]]:
     """Record each ``os.open`` as (path, flags). With ``leased``, an open that takes
     ``O_NONBLOCK`` fails with ``EWOULDBLOCK``, as on a file under a conflicting lease (a Samba
-    oplock, an nfsd write delegation); without ``proc``, an open under ``/proc`` fails with
-    ``ENOENT``, as where ``/proc`` is not mounted."""
+    oplock, an nfsd write delegation); with ``proc_error``, an open under ``/proc`` fails with
+    that errno, naming its ``/proc`` path: ``ENOENT`` where ``/proc`` is not mounted, ``EMFILE``
+    where the process has no descriptor left."""
     real_open = os.open
     opened = list[tuple[str, int]]()
 
@@ -33,8 +49,8 @@ def _helper_record_opens(
         opened.append((name, flags))
         if leased and flags & os.O_NONBLOCK:
             raise OSError(errno.EWOULDBLOCK, os.strerror(errno.EWOULDBLOCK), name)
-        if not proc and name.startswith("/proc/"):
-            raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
+        if proc_error is not None and name.startswith("/proc/"):
+            raise OSError(proc_error, os.strerror(proc_error), name)
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", _open)
@@ -73,14 +89,14 @@ def test_open_regular_file_refuses_a_fifo_or_a_device_at_once(
     ("kind", "error"),
     [
         pytest.param("directory", errno.EISDIR, id="directory"),
-        pytest.param("socket", errno.ENXIO, id="socket"),
+        pytest.param("socket", errno.ENXIO, id="socket", marks=_needs_linux_socket_open),
     ],
 )
 def test_open_regular_file_raises_for_a_directory_and_a_socket_as_open_does(
     tmp_path: pathlib.Path, kind: str, error: int
 ) -> None:
     """A directory raises ``IsADirectoryError``, as ``open`` raises it, and a socket's open
-    fails with ``ENXIO``, both naming the path."""
+    fails with ``ENXIO`` on Linux, both naming the path."""
     path = tmp_path / "input"
     helpers.occupy(path, kind)
 
@@ -108,6 +124,7 @@ def test_open_regular_file_returns_a_blocking_descriptor_of_a_regular_file(
     assert opened == [(str(path), os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)]
 
 
+@_needs_o_path_and_proc
 def test_open_regular_file_waits_as_open_does_on_a_leased_regular_file(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -137,6 +154,7 @@ def test_open_regular_file_waits_as_open_does_on_a_leased_regular_file(
     assert closed.value.errno == errno.EBADF
 
 
+@_needs_o_path_and_proc
 @pytest.mark.parametrize(
     ("kind", "named"),
     [
@@ -168,22 +186,42 @@ def test_open_regular_file_refuses_a_fifo_or_a_device_where_the_open_is_leased(
     ]
 
 
-@pytest.mark.parametrize("missing", ["O_PATH", "/proc"])
+@pytest.mark.parametrize("missing", ["O_PATH", pytest.param("/proc", marks=_needs_o_path_and_proc)])
 def test_open_regular_file_raises_the_lease_error_without_o_path_or_proc(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, missing: str
 ) -> None:
-    """Where ``O_PATH`` or ``/proc`` is missing, the ``O_NONBLOCK`` open's ``EWOULDBLOCK`` is
-    raised, naming the path: never "no such file" for a file that is there."""
+    """Where ``O_PATH`` (Linux-only) or ``/proc`` is missing, the ``O_NONBLOCK`` open's
+    ``EWOULDBLOCK`` is raised, naming the path: never "no such file" for a file that is
+    there."""
     path = tmp_path / "input"
     helpers.occupy(path, "regular_file")
-    _helper_record_opens(monkeypatch, leased=True, proc=missing != "/proc")
+    _helper_record_opens(
+        monkeypatch, leased=True, proc_error=errno.ENOENT if missing == "/proc" else None
+    )
     if missing == "O_PATH":
-        monkeypatch.delattr(os, "O_PATH")
+        monkeypatch.delattr(os, "O_PATH", raising=False)
 
     with pytest.raises(BlockingIOError) as raised:
         regular_file.open_regular_file(path)
 
     assert (raised.value.errno, raised.value.filename) == (errno.EWOULDBLOCK, str(path))
+
+
+@_needs_o_path_and_proc
+def test_open_regular_file_names_the_file_where_its_reopen_through_proc_fails(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any other error of the reopen through ``/proc/self/fd`` after an ``EWOULDBLOCK``
+    (``EMFILE``: no descriptor left) is raised naming the file, as ``open`` names it, never its
+    ``/proc/self/fd`` link."""
+    path = tmp_path / "input"
+    helpers.occupy(path, "regular_file")
+    _helper_record_opens(monkeypatch, leased=True, proc_error=errno.EMFILE)
+
+    with pytest.raises(OSError) as raised:
+        regular_file.open_regular_file(path)
+
+    assert (raised.value.errno, raised.value.filename) == (errno.EMFILE, str(path))
 
 
 def _helper_copy_source(path: pathlib.Path, size: int, mode: int) -> bytes:
@@ -206,6 +244,7 @@ def _helper_assert_copied(src: pathlib.Path, dst: pathlib.Path, data: bytes) -> 
     )
 
 
+@_needs_sendfile
 @pytest.mark.parametrize(
     ("size", "mode"),
     [
@@ -234,7 +273,7 @@ def test_copy_regular_file_copies_in_the_kernel_bytes_and_metadata_exactly(
     monkeypatch.setattr(os, "sendfile", _sendfile_4096)
     monkeypatch.setattr(shutil, "copyfileobj", helpers.no_userspace_copy)
 
-    regular_file.copy_regular_file(src, dst, chunk_size=cache.CHUNK_SIZE)
+    regular_file.copy_regular_file(src, dst)
 
     _helper_assert_copied(src, dst, data)
     assert offsets == [*range(0, size, 4096), size]
@@ -243,6 +282,7 @@ def test_copy_regular_file_copies_in_the_kernel_bytes_and_metadata_exactly(
 _FIRST_CALL_ERRORS = [errno.ENODATA, errno.EIO, errno.ENOTSOCK, errno.EINVAL]
 
 
+@_needs_sendfile
 @pytest.mark.parametrize(
     "failure", _FIRST_CALL_ERRORS, ids=[errno.errorcode[e] for e in _FIRST_CALL_ERRORS]
 )
@@ -254,7 +294,7 @@ def test_copy_regular_file_copies_through_userspace_where_the_first_sendfile_cal
     bytes go through userspace instead, chunk by chunk, and the copy is the same, as
     ``shutil.copyfile`` falls back."""
     src = tmp_path / "src"
-    data = _helper_copy_source(src, 2 * cache.CHUNK_SIZE + 7, 0o755)
+    data = _helper_copy_source(src, 2 * _COPY_BUFSIZE + 7, 0o755)
     dst = tmp_path / "dst"
     offsets = list[int]()
 
@@ -264,10 +304,37 @@ def test_copy_regular_file_copies_through_userspace_where_the_first_sendfile_cal
 
     monkeypatch.setattr(os, "sendfile", _fail)
 
-    regular_file.copy_regular_file(src, dst, chunk_size=cache.CHUNK_SIZE)
+    regular_file.copy_regular_file(src, dst)
 
     _helper_assert_copied(src, dst, data)
     assert offsets == [0]
+
+
+@_needs_sendfile
+def test_copy_regular_file_raises_a_full_filesystem_on_the_first_sendfile_call(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ENOSPC, a full filesystem, on the first sendfile call is raised, naming both files, and
+    never gives way to a copy through userspace: the one first-call error ``shutil.copyfile``
+    raises too."""
+    src = tmp_path / "src"
+    _helper_copy_source(src, 8192, 0o644)
+    dst = tmp_path / "dst"
+
+    def _full(out_fd: int, in_fd: int, offset: int, count: int) -> int:
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr(os, "sendfile", _full)
+    monkeypatch.setattr(shutil, "copyfileobj", helpers.no_userspace_copy)
+
+    with pytest.raises(OSError) as raised:
+        regular_file.copy_regular_file(src, dst)
+
+    assert (raised.value.errno, raised.value.filename, raised.value.filename2) == (
+        errno.ENOSPC,
+        str(src),
+        str(dst),
+    )
 
 
 def test_copy_regular_file_copies_through_userspace_where_shutil_calls_no_sendfile(
@@ -277,7 +344,7 @@ def test_copy_regular_file_copies_through_userspace_where_shutil_calls_no_sendfi
     sendfile is broken), the copy never calls sendfile, as ``shutil.copyfile`` does not, and
     copies the bytes and metadata exactly through userspace."""
     src = tmp_path / "src"
-    data = _helper_copy_source(src, 2 * cache.CHUNK_SIZE + 7, 0o644)
+    data = _helper_copy_source(src, 2 * _COPY_BUFSIZE + 7, 0o644)
     dst = tmp_path / "dst"
 
     def _no_sendfile(out_fd: int, in_fd: int, offset: int, count: int) -> int:
@@ -286,11 +353,12 @@ def test_copy_regular_file_copies_through_userspace_where_shutil_calls_no_sendfi
     monkeypatch.setattr(shutil, "_USE_CP_SENDFILE", False)
     monkeypatch.setattr(os, "sendfile", _no_sendfile)
 
-    regular_file.copy_regular_file(src, dst, chunk_size=cache.CHUNK_SIZE)
+    regular_file.copy_regular_file(src, dst)
 
     _helper_assert_copied(src, dst, data)
 
 
+@_needs_sendfile
 @pytest.mark.parametrize(
     "failure",
     [errno.EINVAL, errno.ENODATA],
@@ -315,7 +383,7 @@ def test_copy_regular_file_raises_an_error_once_bytes_were_sent(
     monkeypatch.setattr(shutil, "copyfileobj", helpers.no_userspace_copy)
 
     with pytest.raises(OSError) as raised:
-        regular_file.copy_regular_file(src, dst, chunk_size=cache.CHUNK_SIZE)
+        regular_file.copy_regular_file(src, dst)
 
     assert (raised.value.errno, raised.value.filename, raised.value.filename2) == (
         failure,

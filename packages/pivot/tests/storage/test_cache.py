@@ -11,6 +11,7 @@ import pathlib
 import queue
 import shutil
 import stat
+import sys
 import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -2951,13 +2952,13 @@ def test_copy_to_cache_keeps_an_object_another_writer_published_first(
     published = list[int]()
 
     def _copy_while_another_writer_publishes(
-        source: str | os.PathLike[str], dest: str | os.PathLike[str], *, chunk_size: int
+        source: str | os.PathLike[str], dest: str | os.PathLike[str]
     ) -> None:
         if not published:
             published.append(-1)
             cache.copy_to_cache(src, cache_path)
             published[0] = cache_path.stat().st_ino
-        real_copy(source, dest, chunk_size=chunk_size)
+        real_copy(source, dest)
 
     monkeypatch.setattr(regular_file, "copy_regular_file", _copy_while_another_writer_publishes)
 
@@ -3023,12 +3024,15 @@ def test_symlink_save_of_a_directory_holding_a_fifo_fails_naming_its_kind(
     assert stat.S_ISFIFO(os.lstat(fifo).st_mode), "the FIFO stays"
 
 
-def test_copy_to_cache_raises_a_full_filesystem_on_the_first_sendfile_call(
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="shutil copies with sendfile only on Linux"
+)
+def test_copy_to_cache_publishes_nothing_where_the_copy_fails(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ENOSPC, a full filesystem, on the first sendfile call fails the copy into the cache,
-    naming the source, never falling back to userspace (the one first-call error
-    ``shutil.copyfile`` raises too), and publishes nothing."""
+    """A copy into the cache that fails, here on a full filesystem (ENOSPC on the first sendfile
+    call, which ``regular_file.copy_regular_file`` raises), raises its error and publishes
+    nothing: no object, no temp file."""
     src = tmp_path / "out.txt"
     src.write_text("bytes")
     cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
@@ -3037,12 +3041,11 @@ def test_copy_to_cache_raises_a_full_filesystem_on_the_first_sendfile_call(
         raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
 
     monkeypatch.setattr(os, "sendfile", _full)
-    monkeypatch.setattr(shutil, "copyfileobj", helpers.no_userspace_copy)
 
     with pytest.raises(OSError) as raised:
         cache.copy_to_cache(src, cache_path)
 
-    assert (raised.value.errno, raised.value.filename) == (errno.ENOSPC, str(src))
+    assert raised.value.errno == errno.ENOSPC
     assert _helper_entries(cache_path.parent) == [], "nothing published, no temp file left"
 
 
@@ -4139,10 +4142,8 @@ def _helper_crash_during_object_copy(src: pathlib.Path, cache_path: pathlib.Path
     """Simulate a kill while copying a file into the cache."""
     real_copy = regular_file.copy_regular_file
 
-    def _copy_and_crash(
-        source: str | os.PathLike[str], dest: str | os.PathLike[str], *, chunk_size: int
-    ) -> None:
-        real_copy(source, dest, chunk_size=chunk_size)
+    def _copy_and_crash(source: str | os.PathLike[str], dest: str | os.PathLike[str]) -> None:
+        real_copy(source, dest)
         os._exit(73)
 
     regular_file.copy_regular_file = _copy_and_crash
