@@ -625,6 +625,9 @@ class WorkspaceStore:
         """Hash dependency ``ref`` as it is in the workspace.
 
         A directory input leaves out the files ``.pivotignore`` names (``_input_member_filter``).
+        A file input that is a FIFO, a socket or a device raises ``exceptions.NotAFileError``
+        without being opened (``cache.hash_file``), so the dependency is unreadable, never waited
+        on.
         """
         path = self._resolve_path(ref)
         if ref.directory is None and (ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir()):

@@ -39,7 +39,10 @@ class MetricsError(Exception):
 
 
 def parse_metric_file(path: pathlib.Path) -> MetricData:
-    """Parse metric file, auto-detecting format by extension. Returns flattened dict."""
+    """Parse metric file, auto-detecting format by extension. Returns flattened dict.
+
+    The file is read through ``cache.open_regular_file``: a FIFO, a socket or a device at
+    ``path`` is a ``MetricsError``, never waited on or read for ever."""
     suffix = path.suffix.lower()
     if suffix not in _METRIC_EXTENSIONS:
         raise MetricsError(f"Unsupported metric file format: {suffix}")
@@ -64,14 +67,14 @@ def _validate_and_flatten(data: object, format_name: str) -> MetricData:
 
 def _parse_json(path: pathlib.Path) -> MetricData:
     """Parse JSON file and flatten nested dicts."""
-    with open(path) as f:
+    with open(cache.open_regular_file(path)) as f:
         data = json.load(f)
     return _validate_and_flatten(data, "JSON")
 
 
 def _parse_yaml(path: pathlib.Path) -> MetricData:
     """Parse YAML file and flatten nested dicts."""
-    with open(path) as f:
+    with open(cache.open_regular_file(path)) as f:
         data: object = yaml.load(f, Loader=yaml_config.Loader)
     return _validate_and_flatten(data, "YAML")
 
@@ -79,7 +82,7 @@ def _parse_yaml(path: pathlib.Path) -> MetricData:
 def _parse_csv(path: pathlib.Path) -> MetricData:
     """Parse CSV file (first column = key, second = value)."""
     result = dict[str, MetricValue]()
-    with open(path, newline="") as f:
+    with open(cache.open_regular_file(path), newline="") as f:
         reader = csv.reader(f)
         for line_num, row in enumerate(reader, start=1):
             if len(row) == 0:

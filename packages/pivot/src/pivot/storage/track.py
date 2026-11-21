@@ -355,9 +355,9 @@ def present_kind(path: pathlib.Path) -> Literal["file", "directory"] | None:
 def occupant(path: pathlib.Path) -> str | None:
     """What stands at the tracked path ``path``, making it missing (``present_kind``), that a
     restore does not replace, named for a warning: "a socket", "a FIFO", "a device" or "an entry
-    that is neither a file nor a directory", each as "a symlink to ..." when ``path`` is a
-    symlink to it. None for nothing, a dangling or looping symlink, a regular file or a
-    directory, symlinks followed.
+    that is neither a file nor a directory" (``cache.entry_kind``, the one naming of them), each
+    as "a symlink to ..." when ``path`` is a symlink to it. None for nothing, a dangling or
+    looping symlink, a regular file or a directory, symlinks followed.
 
     One ``stat`` decides whether such an entry stands there, as for ``present_kind``, and an
     error of it other than "no such file" is raised (``_followed_mode``). An ``lstat``
@@ -366,14 +366,7 @@ def occupant(path: pathlib.Path) -> str | None:
     mode = _followed_mode(path)
     if mode is None or stat.S_ISREG(mode) or stat.S_ISDIR(mode):
         return None
-    if stat.S_ISSOCK(mode):
-        kind = "a socket"
-    elif stat.S_ISFIFO(mode):
-        kind = "a FIFO"
-    elif stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
-        kind = "a device"
-    else:
-        kind = "an entry that is neither a file nor a directory"
+    kind = cache.entry_kind(mode)
     return f"a symlink to {kind}" if os.path.islink(path) else kind
 
 

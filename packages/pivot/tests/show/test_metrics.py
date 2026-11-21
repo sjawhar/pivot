@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import typing
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,7 @@ from pivot import loaders, project
 from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.show import metrics
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, ChangeType, OutputFormat
+from tests import helpers
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -589,6 +591,25 @@ def test_collect_metrics_from_stages_parse_error(
 
     assert "my_stage" not in result
     assert "Failed to parse metrics" in caplog.text
+
+
+def test_collect_metrics_from_stages_skips_a_fifo_at_a_metric_output_at_once(
+    mock_discovery: PipelineLike,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A FIFO at a stage's metric output is never opened (``cache.open_regular_file``): the
+    metric is skipped with the parse warning, which names the FIFO, at once, where an open of it
+    would wait for a writer."""
+    metric_file = _register_metric_stage(mock_discovery, "my_stage")
+    os.mkfifo(metric_file, 0o600)
+
+    result = helpers.call_without_waiting(
+        metrics.collect_metrics_from_stages, lambda: helpers.free_fifo(metric_file), timeout=10
+    )
+
+    assert "my_stage" not in result
+    assert "Failed to parse metrics from metrics/my_stage.json" in caplog.text
+    assert f"Is a FIFO, not a regular file: {metric_file}" in caplog.text
 
 
 def test_collect_all_stage_metrics_flat(mock_discovery: PipelineLike) -> None:

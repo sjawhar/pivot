@@ -13,6 +13,7 @@ import posixpath
 import secrets
 import shutil
 import stat
+import sys
 import tempfile
 import time
 from typing import TYPE_CHECKING, NewType, TypedDict
@@ -157,9 +158,110 @@ def atomic_write_file(
     return written
 
 
+def entry_kind(mode: int) -> str:
+    """What an entry of ``stat`` mode ``mode`` that is neither a regular file nor a directory
+    is, named for a message: "a socket", "a FIFO", "a device" or "an entry that is neither a file
+    nor a directory". The one naming of these kinds: a read that refuses one
+    (``exceptions.NotAFileError``) and what stands at a missing tracked path
+    (``track.occupant``) both take it."""
+    if stat.S_ISSOCK(mode):
+        return "a socket"
+    if stat.S_ISFIFO(mode):
+        return "a FIFO"
+    if stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
+        return "a device"
+    return "an entry that is neither a file nor a directory"
+
+
+def _not_a_file_error(path: str | os.PathLike[str], mode: int) -> OSError:
+    """The error a read of ``path`` raises when what stands there, of ``stat`` mode ``mode``, is
+    not a regular file: ``IsADirectoryError`` for a directory, as ``open`` raises it, else
+    ``exceptions.NotAFileError`` naming its kind."""
+    if stat.S_ISDIR(mode):
+        return IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), os.fspath(path))
+    return exceptions.NotAFileError(os.fspath(path), entry_kind(mode))
+
+
+def open_regular_file(path: str | os.PathLike[str]) -> int:
+    """Open the regular file at ``path``, symlinks followed, for reading, and return its
+    descriptor for the caller to close (``open(descriptor, ...)`` takes it over). Every file
+    Pivot hashes (``hash_file``, ``hash_directory``) or copies into the cache (``copy_to_cache``,
+    a whole-directory tree's ``_publish_tree``) is opened here, as is a metric output it shows.
+
+    It never waits, and it reads nothing that is not a regular file. The open takes
+    ``O_NONBLOCK``, so on a FIFO it returns at once instead of waiting for a writer, and the
+    check is made on the descriptor itself (``fstat``), so an entry swapped in after any earlier
+    ``stat`` of the path is refused too: a directory raises ``IsADirectoryError``, as ``open``
+    does, and a FIFO or a device ``exceptions.NotAFileError`` naming its kind, the descriptor
+    closed (a socket's open fails first, with ``ENXIO``). A regular file's descriptor is made
+    blocking again before it is returned, so every read of it waits for its bytes, as a read of
+    a file ``open`` opened does.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISREG(mode):
+            raise _not_a_file_error(path, mode)
+        os.set_blocking(descriptor, True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+# The least one sendfile call is asked to copy, as shutil.copyfile asks: a larger file is asked
+# for whole, but on a 32-bit build never more than _SENDFILE_32BIT_BLOCK (bpo-38319).
+_SENDFILE_MIN_BLOCK = 8 * 1024 * 1024
+_SENDFILE_32BIT_BLOCK = 1024 * 1024 * 1024
+# How sendfile refuses a copy between two regular files that it cannot make: the target must
+# be a socket (macOS, Linux before 2.6.33), or the filesystem or kernel lacks it. On its first
+# call, before any byte is written, the copy goes through userspace instead.
+_SENDFILE_REFUSED_ERRNO = frozenset(
+    {errno.ENOTSOCK, errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP}
+)
+
+
+def _send_file(
+    source: int, target: int, src: str | os.PathLike[str], dst: str | os.PathLike[str]
+) -> bool:
+    """Copy every byte of the regular file open at ``source`` to ``target``, open at its start,
+    in the kernel (``os.sendfile``, as ``shutil.copyfile`` copies on Linux), and return True.
+    Return False, having written nothing, when the first call refuses
+    (``_SENDFILE_REFUSED_ERRNO``). Any other error (ENOSPC, EIO), or a refusal once a byte was
+    written, is raised, naming ``src`` and ``dst``."""
+    block = max(os.fstat(source).st_size, _SENDFILE_MIN_BLOCK)
+    if sys.maxsize < 2**32:
+        block = min(block, _SENDFILE_32BIT_BLOCK)
+    offset = 0
+    while True:
+        try:
+            sent = os.sendfile(target, source, offset, block)
+        except OSError as error:
+            if offset == 0 and error.errno in _SENDFILE_REFUSED_ERRNO:
+                return False
+            error.filename, error.filename2 = os.fspath(src), os.fspath(dst)
+            raise
+        if sent == 0:
+            return True
+        offset += sent
+
+
+def _copy_regular_file(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+    """``shutil.copy2(src, dst)`` for the regular file at ``src``, whose bytes are read through
+    ``open_regular_file``: a FIFO, a socket or a device at ``src`` raises, where a copy would
+    wait on the FIFO or read the device for ever. The bytes are copied in the kernel
+    (``_send_file``), or through userspace where it refuses; then the metadata, as
+    ``shutil.copy2`` copies it (``shutil.copystat``)."""
+    with open(open_regular_file(src), "rb", buffering=0) as source, open(dst, "wb") as target:
+        if not _send_file(source.fileno(), target.fileno(), src, dst):
+            shutil.copyfileobj(source, target, CHUNK_SIZE)
+    shutil.copystat(src, dst)
+
+
 def _hash_contents(path: str | os.PathLike[str], size: int) -> str:
-    """Return the xxhash64 hex digest of the file at ``path``, whose size is ``size``."""
-    with open(path, "rb", buffering=0) as f:
+    """Return the xxhash64 hex digest of the file at ``path``, whose size is ``size``, read
+    through ``open_regular_file``."""
+    with open(open_regular_file(path), "rb", buffering=0) as f:
         if size >= MMAP_THRESHOLD:
             try:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -185,11 +287,19 @@ def hash_file(
     appended to it instead, for the caller to save in one transaction, or, when ``state_db`` is
     read-only, to hand to a process that can write.
 
+    Only a regular file is hashed, symlinks followed. The ``stat`` decides before anything else
+    (the state cache included): a directory raises ``IsADirectoryError``, and a FIFO, a socket or
+    a device ``exceptions.NotAFileError`` naming its kind, without opening it, so the call never
+    waits on a FIFO or reads a device for ever; the read itself refuses what was swapped in after
+    the ``stat`` (``open_regular_file``). A missing path raises ``FileNotFoundError``.
+
     Returns:
         Tuple of (file_hash, file_stat) where file_hash is the xxhash64 hex digest
         and file_stat is the os.stat_result for the file.
     """
     file_stat = path.stat()
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise _not_a_file_error(path, file_stat.st_mode)
 
     if state_db is not None:
         cached = state_db.get(path, file_stat)
@@ -1162,14 +1272,20 @@ def copy_to_cache(
     the unit: the source may have changed since, and storing new bytes under the old key would
     hand them to every project whose record names that key.
 
+    The source is read as ``shutil.copy2`` would copy it, but through ``open_regular_file``
+    (``_copy_regular_file``), however it was hashed before: what was swapped in since that is no
+    regular file raises there, and nothing is published.
+
     Raises:
         exceptions.CacheError: ``verify`` is set and the copy does not hash to the key.
+        exceptions.NotAFileError: ``src`` is a FIFO or a device (a socket's open fails, with
+            ``ENXIO``).
     """
     if cache_path.exists():
         return
 
     with staged_cache_file(cache_path) as staged:
-        shutil.copy2(src, staged)
+        _copy_regular_file(src, staged)
         if verify:
             key = cache_path.parent.name + cache_path.name
             copied, _ = hash_file(staged)
@@ -2126,6 +2242,10 @@ def _publish_tree(
     another host whose flock is not coherent with this host's can remove files from the copy
     while it is built (see storage/AGENTS.md). An unmarked tree is checked by the next restore
     or commit through it. Only the commit can repair it (``_ensure_tree_complete``).
+
+    Each file is read through ``open_regular_file`` (``_copy_regular_file``): a FIFO, a socket
+    or a device in the directory, which its listing leaves out, fails the copy at once instead
+    of being waited on or read for ever.
     """
     manifest = members["files"]
 
@@ -2146,7 +2266,13 @@ def _publish_tree(
             tempfile.mkdtemp(prefix=_CACHE_TEMP_PREFIX, dir=cache_dir_path.parent)
         )
         try:
-            shutil.copytree(path, staged, ignore=_user_symlinks, dirs_exist_ok=True)
+            shutil.copytree(
+                path,
+                staged,
+                ignore=_user_symlinks,
+                copy_function=_copy_regular_file,
+                dirs_exist_ok=True,
+            )
             isexec_by_relpath = {entry["relpath"]: entry["isexec"] for entry in manifest}
             for f in staged.rglob("*"):
                 # Skip symlinks to avoid changing permissions on target files outside cache

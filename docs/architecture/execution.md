@@ -244,6 +244,8 @@ Before skip checks, dependency hashes are looked up via StateDB. Each cached has
 
 When all four match the current file's `stat()` result, the cached hash is returned in O(1) without re-reading the file. The inode check detects file replacement (delete + create with same name), which keeps mtime/size but changes inode. The device check detects a path that now reaches another filesystem (a directory symlink re-pointed at another mount), where an inode number can repeat. The entry holds no ctime: a new hard link changes it, so every hardlink checkout would invalidate the entries of the files it links. Only files with changed metadata require actual hashing.
 
+A dependency is hashed only when it is a regular file or a directory, symlinks followed: `storage.cache.hash_file` decides from the file's `stat`, before the StateDB lookup. A FIFO, a socket or a device is never opened: an open of a FIFO for reading waits for a writer, and a device such as `/dev/zero` never ends. Such a dependency is unreadable, as a file this user cannot read is, and named with its kind: the stage fails with `unreadable deps: data (a FIFO, not a file)`, and its explanation says `Unreadable deps: data (a FIFO, not a file)`. The hash reads a file through `storage.cache.open_regular_file`, as a copy into the cache does: the open takes `O_NONBLOCK`, and the check is made on the open descriptor (`fstat`), so an entry swapped in after the `stat` is refused at once too.
+
 ### Tier 1: Generation Check (O(1))
 
 The fastest check uses monotonic generation counters to detect changes without comparing hashes:

@@ -71,6 +71,10 @@ _FIXED_SEEDS = (
     # A FIFO, which the pre-flight counts as missing, where a tracked file a stage reads was,
     # its object kept, with --checkout-missing: the run once ran its reader over it
     1647,
+    # A FIFO where a tracked file was that a producer read when it last ran, and a target naming
+    # an instance of the stage mapped over it: every mode hashed the producer's inputs to expand
+    # the mapped stage, and the hash opened the FIFO and waited on it for ever
+    559,
 )
 
 _REMOTE = "s3://bucket/differential"

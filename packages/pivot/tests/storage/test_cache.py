@@ -15,10 +15,12 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+import xxhash
 
 from pivot import exceptions, project
 from pivot.storage import cache, listing, ownership, state, track
 from pivot.types import DirHash, FileHash, HashInfo, is_dir_hash
+from tests import helpers
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
@@ -194,6 +196,108 @@ def test_hash_file_mmap_fallback(tmp_path: pathlib.Path, monkeypatch: pytest.Mon
     # Should fall back to buffered read and produce same hash
     fallback_hash, _ = cache.hash_file(test_file)
     assert fallback_hash == expected_hash
+
+
+def _helper_not_a_file(path: pathlib.Path, kind: str) -> None:
+    """Put at ``path`` an entry of ``kind``: one ``helpers.occupy`` makes, or a
+    "symlink_to_device", a symlink to ``/dev/null``, a device that a read takes for an empty
+    file."""
+    if kind == "symlink_to_device":
+        path.symlink_to(os.devnull)
+    else:
+        helpers.occupy(path, kind)
+
+
+@pytest.mark.parametrize(
+    ("kind", "named"),
+    [
+        pytest.param("fifo", "a FIFO", id="fifo"),
+        pytest.param("socket", "a socket", id="socket"),
+        pytest.param("symlink_to_fifo", "a FIFO", id="symlink_to_fifo"),
+        pytest.param("symlink_to_device", "a device", id="symlink_to_device"),
+    ],
+)
+def test_hash_file_refuses_an_entry_that_is_not_a_regular_file_at_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str, named: str
+) -> None:
+    """A FIFO, a socket or a device, or a symlink to one, is never opened: ``hash_file`` raises
+    ``NotAFileError`` at once, naming what its ``stat`` follows to (never the symlink), where an
+    open of the FIFO would wait for a writer and a read of ``/dev/null`` would hash it as empty.
+    Each call must return within the hard timeout of ``helpers.call_without_waiting``."""
+    monkeypatch.chdir(tmp_path)  # a socket is bound by its path from here (``helpers.occupy``)
+    path = tmp_path / "input"
+    _helper_not_a_file(path, kind)
+
+    with pytest.raises(exceptions.NotAFileError) as raised:
+        helpers.call_without_waiting(
+            lambda: cache.hash_file(path), lambda: helpers.free_fifo(path), timeout=10
+        )
+
+    assert (raised.value.kind, raised.value.filename) == (named, str(path))
+    assert str(raised.value) == f"Is {named}, not a regular file: {path}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "content"),
+    [
+        pytest.param("regular_file", b"data", id="regular_file"),
+        pytest.param("symlink_to_file", b"target", id="symlink_to_file"),
+    ],
+)
+def test_hash_file_hashes_a_regular_file_and_a_symlink_to_one(
+    tmp_path: pathlib.Path, kind: str, content: bytes
+) -> None:
+    """A regular file, or a symlink to one, hashes to its bytes' xxhash64 as before."""
+    path = tmp_path / "input"
+    helpers.occupy(path, kind)
+
+    file_hash, file_stat = cache.hash_file(path)
+
+    assert (file_hash, file_stat.st_size) == (xxhash.xxh64(content).hexdigest(), len(content))
+
+
+def test_hash_file_raises_for_a_directory_and_a_missing_path_as_before(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A directory raises ``IsADirectoryError``, as an open of one does, and a dependency read
+    as a file there stays "a directory, not a file"; a missing path raises
+    ``FileNotFoundError``, a missing dependency."""
+    with pytest.raises(IsADirectoryError) as directory:
+        cache.hash_file(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        cache.hash_file(tmp_path / "absent")
+
+    assert (directory.value.errno, directory.value.filename) == (errno.EISDIR, str(tmp_path))
+
+
+def test_hash_file_refuses_a_fifo_swapped_in_after_its_stat_at_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read checks the descriptor it reads (``cache.open_regular_file``), not the ``stat``
+    before it: a regular file replaced by a FIFO between ``hash_file``'s ``stat`` and its open
+    (here inside the state-cache lookup, which runs between them) is refused at once, never
+    waited on."""
+    path = tmp_path / "input"
+    path.write_text("data")
+    (tmp_path / "state").mkdir()
+    with state.StateDB(tmp_path / "state") as db:
+        lookup = db.get
+
+        def _swap_for_a_fifo(file_path: pathlib.Path, file_stat: os.stat_result) -> str | None:
+            path.unlink()
+            os.mkfifo(path, 0o600)
+            return lookup(file_path, file_stat)
+
+        monkeypatch.setattr(db, "get", _swap_for_a_fifo)
+        with pytest.raises(exceptions.NotAFileError) as raised:
+            helpers.call_without_waiting(
+                lambda: cache.hash_file(path, db, pending=[]),
+                lambda: helpers.free_fifo(path),
+                timeout=10,
+            )
+
+    assert raised.value.kind == "a FIFO"
+    assert stat.S_ISFIFO(os.lstat(path).st_mode), "the swap happened before the read"
 
 
 # === Hash Directory Tests ===
@@ -2854,22 +2958,217 @@ def test_copy_to_cache_keeps_an_object_another_writer_published_first(
     src = tmp_path / "out.txt"
     src.write_text("same bytes")
     cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
-    real_copy2 = shutil.copy2
+    real_copy = cache._copy_regular_file
     published = list[int]()
 
-    def _copy2_while_another_writer_publishes(source: str, dest: str) -> object:
+    def _copy_while_another_writer_publishes(
+        source: str | os.PathLike[str], dest: str | os.PathLike[str]
+    ) -> None:
         if not published:
             published.append(-1)
             cache.copy_to_cache(src, cache_path)
             published[0] = cache_path.stat().st_ino
-        return real_copy2(source, dest)
+        real_copy(source, dest)
 
-    monkeypatch.setattr(shutil, "copy2", _copy2_while_another_writer_publishes)
+    monkeypatch.setattr(cache, "_copy_regular_file", _copy_while_another_writer_publishes)
 
     cache.copy_to_cache(src, cache_path)
 
     assert cache_path.stat().st_ino == published[0]
     assert _helper_entries(cache_path.parent) == [cache_path.name], "no temp file left"
+
+
+@pytest.mark.parametrize(
+    ("kind", "named"),
+    [
+        pytest.param("fifo", "a FIFO", id="fifo"),
+        pytest.param("symlink_to_fifo", "a FIFO", id="symlink_to_fifo"),
+        pytest.param("symlink_to_device", "a device", id="symlink_to_device"),
+    ],
+)
+def test_copy_to_cache_refuses_a_source_that_is_not_a_regular_file_at_once(
+    tmp_path: pathlib.Path, kind: str, named: str
+) -> None:
+    """The copy reads its source through ``cache.open_regular_file``, however a caller hashed it
+    before: a FIFO, or a symlink to a FIFO or to a device, raises ``NotAFileError`` at once
+    (``shutil.copy2`` waits on a FIFO swapped in after its own ``stat``, and copies
+    ``/dev/null`` as an empty object), and nothing is published."""
+    src = tmp_path / "out.txt"
+    _helper_not_a_file(src, kind)
+    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
+
+    with pytest.raises(exceptions.NotAFileError) as raised:
+        helpers.call_without_waiting(
+            lambda: cache.copy_to_cache(src, cache_path),
+            lambda: helpers.free_fifo(src),
+            timeout=10,
+        )
+
+    assert raised.value.kind == named
+    assert _helper_entries(cache_path.parent) == [], "nothing published, no temp file left"
+
+
+def test_symlink_save_of_a_directory_holding_a_fifo_fails_at_once(tmp_path: pathlib.Path) -> None:
+    """A SYMLINK save copies the whole directory into the cache's tree, each file read through
+    ``cache.open_regular_file``: a FIFO in it, which its listing leaves out, fails the copy at
+    once, naming it, and stays where it is."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "a.txt").write_text("a")
+    fifo = out / "pipe"
+    os.mkfifo(fifo, 0o600)
+
+    with pytest.raises(shutil.Error) as raised:
+        helpers.call_without_waiting(
+            lambda: cache.save_to_cache(
+                out, tmp_path / "cache", checkout_mode=cache.CheckoutMode.SYMLINK
+            ),
+            lambda: helpers.free_fifo(fifo),
+            timeout=10,
+        )
+
+    assert f"Is a FIFO, not a regular file: {fifo}" in str(raised.value)
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode), "the FIFO stays"
+
+
+def _helper_copy_source(path: pathlib.Path, size: int, mode: int) -> bytes:
+    """Write ``size`` bytes, each other than its neighbours, at ``path``, with mode ``mode`` and
+    times long past; return the bytes."""
+    data = bytes(i % 251 for i in range(size))
+    path.write_bytes(data)
+    path.chmod(mode)
+    os.utime(path, ns=(1_000_000_000, 2_000_000_000))
+    return data
+
+
+def _helper_assert_copied(src: pathlib.Path, dst: pathlib.Path, data: bytes) -> None:
+    """``dst`` holds ``data`` and has ``src``'s mode and mtime, as ``shutil.copy2`` leaves it."""
+    assert dst.read_bytes() == data
+    src_stat, dst_stat = src.stat(), dst.stat()
+    assert (stat.S_IMODE(dst_stat.st_mode), dst_stat.st_mtime_ns) == (
+        stat.S_IMODE(src_stat.st_mode),
+        src_stat.st_mtime_ns,
+    )
+
+
+def _helper_no_userspace_copy(*args: object, **kwargs: object) -> None:
+    """Stands for ``shutil.copyfileobj`` where the copy must not go through userspace."""
+    raise AssertionError("the bytes were copied through userspace")
+
+
+@pytest.mark.parametrize(
+    ("size", "mode"),
+    [
+        pytest.param(3 * 4096 + 7, 0o644, id="several_calls"),
+        pytest.param(0, 0o644, id="empty"),
+        pytest.param(4096, 0o755, id="executable"),
+    ],
+)
+def test_copy_regular_file_copies_in_the_kernel_bytes_and_metadata_exactly(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, size: int, mode: int
+) -> None:
+    """The copy into the cache sends the bytes with ``os.sendfile``, call after call from where
+    the last one stopped until one returns 0 (each call is held to 4096 bytes here), never
+    through userspace, and gives the copy the source's mode and mtime, as ``shutil.copy2``
+    does."""
+    src = tmp_path / "src"
+    data = _helper_copy_source(src, size, mode)
+    dst = tmp_path / "dst"
+    real_sendfile = os.sendfile
+    offsets = list[int]()
+
+    def _sendfile_4096(out_fd: int, in_fd: int, offset: int, count: int) -> int:
+        offsets.append(offset)
+        return real_sendfile(out_fd, in_fd, offset, min(count, 4096))
+
+    monkeypatch.setattr(os, "sendfile", _sendfile_4096)
+    monkeypatch.setattr(shutil, "copyfileobj", _helper_no_userspace_copy)
+
+    cache._copy_regular_file(src, dst)
+
+    _helper_assert_copied(src, dst, data)
+    assert offsets == [*range(0, size, 4096), size]
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [errno.ENOTSOCK, errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP],
+    ids=[
+        errno.errorcode[e] for e in (errno.ENOTSOCK, errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP)
+    ],
+)
+def test_copy_regular_file_copies_through_userspace_where_sendfile_refuses_at_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, refusal: int
+) -> None:
+    """Where the first sendfile call refuses the copy before writing anything (macOS, where its
+    target must be a socket, or a filesystem without it), the bytes go through userspace
+    instead, chunk by chunk, and the copy is the same."""
+    src = tmp_path / "src"
+    data = _helper_copy_source(src, 2 * cache.CHUNK_SIZE + 7, 0o755)
+    dst = tmp_path / "dst"
+    offsets = list[int]()
+
+    def _refuse(out_fd: int, in_fd: int, offset: int, count: int) -> int:
+        offsets.append(offset)
+        raise OSError(refusal, os.strerror(refusal))
+
+    monkeypatch.setattr(os, "sendfile", _refuse)
+
+    cache._copy_regular_file(src, dst)
+
+    _helper_assert_copied(src, dst, data)
+    assert offsets == [0]
+
+
+def test_copy_to_cache_raises_a_sendfile_error_that_is_no_refusal(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sendfile error that is not a refusal (here ENOSPC, a full filesystem) fails the copy
+    into the cache, naming both files, never falling back to userspace, and publishes
+    nothing."""
+    src = tmp_path / "out.txt"
+    src.write_text("bytes")
+    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
+
+    def _full(out_fd: int, in_fd: int, offset: int, count: int) -> int:
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr(os, "sendfile", _full)
+    monkeypatch.setattr(shutil, "copyfileobj", _helper_no_userspace_copy)
+
+    with pytest.raises(OSError) as raised:
+        cache.copy_to_cache(src, cache_path)
+
+    assert (raised.value.errno, raised.value.filename) == (errno.ENOSPC, str(src))
+    assert _helper_entries(cache_path.parent) == [], "nothing published, no temp file left"
+
+
+def test_copy_regular_file_raises_a_refusal_once_bytes_were_sent(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal after a sendfile call wrote bytes is raised, naming both files: a copy through
+    userspace then would not start where the sent bytes end."""
+    src = tmp_path / "src"
+    _helper_copy_source(src, 8192, 0o644)
+    dst = tmp_path / "dst"
+    real_sendfile = os.sendfile
+
+    def _refuse_after_4096(out_fd: int, in_fd: int, offset: int, count: int) -> int:
+        if offset:
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+        return real_sendfile(out_fd, in_fd, offset, 4096)
+
+    monkeypatch.setattr(os, "sendfile", _refuse_after_4096)
+    monkeypatch.setattr(shutil, "copyfileobj", _helper_no_userspace_copy)
+
+    with pytest.raises(OSError) as raised:
+        cache._copy_regular_file(src, dst)
+
+    assert (raised.value.errno, raised.value.filename, raised.value.filename2) == (
+        errno.EINVAL,
+        str(src),
+        str(dst),
+    )
 
 
 @pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP, errno.ENOSYS])
@@ -3963,13 +4262,13 @@ def test_sweep_reports_and_skips_a_temporary_entry_it_cannot_remove(
 
 def _helper_crash_during_object_copy(src: pathlib.Path, cache_path: pathlib.Path) -> None:
     """Simulate a kill while copying a file into the cache."""
-    real_copy2 = shutil.copy2
+    real_copy = cache._copy_regular_file
 
-    def _copy_and_crash(source: str, dest: str) -> None:
-        real_copy2(source, dest)
+    def _copy_and_crash(source: str | os.PathLike[str], dest: str | os.PathLike[str]) -> None:
+        real_copy(source, dest)
         os._exit(73)
 
-    shutil.copy2 = _copy_and_crash
+    cache._copy_regular_file = _copy_and_crash
     cache.copy_to_cache(src, cache_path)
 
 

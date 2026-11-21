@@ -516,6 +516,135 @@ def test_repro_all_tracked_keep_going_and_its_dry_run_agree_on_what_stands_at_a_
             assert stat.S_IFMT(os.lstat(tracked).st_mode) == entry, "the entry stays"
 
 
+# p/plan reads data/raw/f0.txt, and p/cut is mapped over p/plan's files (keys a and b): the shape
+# of seed 559 of tests/cli/test_dry_run_keep_going_generated.py
+_FIFO_PRODUCER_CODE = """\
+from typing import Annotated
+
+from pivot.compose import Pipeline, directory, stage
+
+
+@stage
+def plan(raw: str) -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a" + raw, "b.txt": "b" + raw}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan(pipeline.input("f0.txt", t=str))))
+"""
+
+_PLAN_SKIPPED = (
+    "Skipping: Stage 'p/plan' depends on input 'f0.txt' (path data/raw/f0.txt), which does "
+    + "not exist"
+)
+
+
+def _helper_fifo_producer_project(runner: CliRunner, root: pathlib.Path) -> pathlib.Path:
+    """Seed 559's tree: p/plan, which reads the tracked file data/raw/f0.txt, and p/cut, mapped
+    over it, ran; then alpha/stage_a is declared and a FIFO takes f0.txt's place, its object kept
+    in the cache. Returns the FIFO's path."""
+    helpers.write_pipeline(root, "p", _FIFO_PRODUCER_CODE)
+    tracked = root / "data" / "raw" / "f0.txt"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("raw")
+    assert runner.invoke(cli.cli, ["track", "data/raw/f0.txt"]).exit_code == 0
+    ran = runner.invoke(cli.cli, ["repro", "--all"])
+    assert ran.exit_code == 0, ran.output
+    assert (root / "data" / "p" / "cut@a.txt").read_text() == "araw", "p/cut@a ran"
+    helpers.write_pipeline(root, "alpha", helpers.one_stage_pipeline_code("alpha", "stage_a"))
+    tracked.unlink()
+    helpers.occupy(tracked, "fifo")
+    return tracked
+
+
+@pytest.mark.parametrize("checkout_missing", [False, True], ids=["missing", "checkout_missing"])
+def test_repro_all_tracked_keep_going_and_its_dry_run_leave_out_a_producer_reading_a_fifo(
+    runner: CliRunner, tmp_path: pathlib.Path, checkout_missing: bool
+) -> None:
+    """R1, R4, R5 on seed 559's tree (``_helper_fifo_producer_project``), the targets p/cut@a
+    and alpha/stage_a. Naming the instance makes each command expand p/cut before anything runs,
+    which asks whether p/plan, which ran, is current, and so hashes its input, the FIFO: the
+    hash never opens it (``cache.hash_file``), where an open would wait for a writer for ever.
+    So the dry run and the run both finish, within the hard timeout of
+    ``helpers.call_without_waiting``, and agree: the dry run lists alpha/stage_a alone and the
+    run runs it alone; each gives one `Skipping:` line, for p/plan, and exits 1 naming the
+    left-out target p/cut@a. With --checkout-missing the restore leaves the FIFO in place, with
+    one `Cannot restore` warning each."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        tracked = _helper_fifo_producer_project(runner, cwd)
+        options = ["--checkout-missing"] if checkout_missing else []
+        targets = ["p/cut@a", "alpha/stage_a"]
+
+        dry_run = helpers.call_without_waiting(
+            lambda: runner.invoke(cli.cli, [*helpers.DRY_RUN_KEEP_GOING, *options, *targets]),
+            lambda: helpers.free_fifo(tracked),
+        )
+        ran = helpers.call_without_waiting(
+            lambda: runner.invoke(
+                cli.cli, ["repro", "--all", "--keep-going", "--jsonl", *options, *targets]
+            ),
+            lambda: helpers.free_fifo(tracked),
+        )
+
+        left_out = (
+            "  - p/cut@a: Stage 'p/plan' depends on input 'f0.txt' (path data/raw/f0.txt), "
+            + "which does not exist"
+        )
+        warnings = (
+            [
+                f"Cannot restore {tracked}: a FIFO is in its place, which the restore does not replace"
+            ]
+            if checkout_missing
+            else []
+        )
+        assert dry_run.exit_code == 1, dry_run.output
+        assert json.loads(dry_run.stdout) == {
+            "stages": {"alpha/stage_a": {"would_run": True, "reason": "No previous run"}}
+        }, dry_run.output
+        assert ran.exit_code == 1, ran.output
+        assert helpers.stage_statuses(ran.stdout) == {"alpha/stage_a": "ran"}, ran.output
+        for result in (dry_run, ran):
+            assert helpers.skipping_lines(result.stderr) == [_PLAN_SKIPPED], result.output
+            assert helpers.restore_warnings(result.stderr) == warnings, result.output
+            assert left_out in result.stderr.splitlines(), result.output
+        assert stat.S_ISFIFO(os.lstat(tracked).st_mode), "the FIFO stays"
+
+
+def test_repro_and_status_without_all_stop_on_a_fifo_at_a_tracked_path_at_once(
+    runner: CliRunner, tmp_path: pathlib.Path
+) -> None:
+    """R6 apart from the fix: on seed 559's tree, outside leave-out mode, `pivot repro p/cut@a`
+    and `pivot status` from p/ hash p/plan's input, the FIFO, to expand p/cut, as 0.10.4 does,
+    and no longer wait on it. The repro stops at its pre-flight on the missing tracked file
+    (``TrackedFileMissingError``), as 0.10.4 stops on one, and status fails naming the FIFO, as
+    on a tracked file it cannot read; both within the hard timeout of
+    ``helpers.call_without_waiting``."""
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        tracked = _helper_fifo_producer_project(runner, cwd)
+        with contextlib.chdir(cwd / "p"):
+            ran = helpers.call_without_waiting(
+                lambda: runner.invoke(cli.cli, ["repro", "p/cut@a"]),
+                lambda: helpers.free_fifo(tracked),
+            )
+            status = helpers.call_without_waiting(
+                lambda: runner.invoke(cli.cli, ["status"]), lambda: helpers.free_fifo(tracked)
+            )
+
+        assert ran.exit_code == 1, ran.output
+        assert f"The following tracked files are missing:\n  - {tracked}\n" in ran.stderr, (
+            ran.output
+        )
+        assert "Skipping:" not in ran.output, ran.output
+        assert status.exit_code == 1, status.output
+        assert f"Error: Is a FIFO, not a regular file: {tracked}\n" in status.stderr, status.output
+        assert stat.S_ISFIFO(os.lstat(tracked).st_mode), "the FIFO stays"
+
+
 def _helper_checkout_missing_dry_run_and_run(runner: CliRunner) -> tuple[Result, Result]:
     """`pivot repro --all --keep-going --checkout-missing` in the current project, as a dry run
     (``--dry-run --jsonl``) and then as a run (``--jsonl``), after checking that the dry run
