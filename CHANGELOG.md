@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.11.2 (2026-11-21)
+
+### Bug Fixes
+
+- **repro**: Leave out only the readers of a missing tracked file under --all --keep-going
+  ([#565](https://github.com/sjawhar/pivot/pull/565),
+  [`0b33013`](https://github.com/sjawhar/pivot/commit/0b33013ec44e6e82fac8cd4f0a0eb906e95c3445))
+
+
 ## v0.11.1 (2026-11-21)
 
 ### Performance Improvements
