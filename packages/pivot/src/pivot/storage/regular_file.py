@@ -3,7 +3,7 @@
 Every file ``storage.cache`` reads to hash it or to save it into the cache, and every metric
 file ``show.metrics.parse_metric_file`` reads, is opened by ``open_regular_file``, which states
 the rule. ``entry_kind`` names what stands at a path that is neither a regular file nor a
-directory, for a refusal (``exceptions.NotAFileError``) and for a warning (``track.occupant``).
+directory.
 """
 
 from __future__ import annotations
@@ -43,15 +43,10 @@ def require_regular_file(path: str | os.PathLike[str], mode: int) -> None:
     """Refuse a read of ``path`` unless what stands there, of ``stat`` mode ``mode``, is a
     regular file: raise ``IsADirectoryError`` for a directory, as ``open`` raises it, else
     ``exceptions.NotAFileError`` naming its kind."""
-    if not stat.S_ISREG(mode):
-        raise _not_a_file_error(path, mode)
-
-
-def _not_a_file_error(path: str | os.PathLike[str], mode: int) -> OSError:
-    """The error ``require_regular_file`` raises for ``path``, of ``stat`` mode ``mode``."""
     if stat.S_ISDIR(mode):
-        return IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), os.fspath(path))
-    return exceptions.NotAFileError(os.fspath(path), entry_kind(mode))
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), os.fspath(path))
+    if not stat.S_ISREG(mode):
+        raise exceptions.NotAFileError(os.fspath(path), entry_kind(mode))
 
 
 def open_regular_file(path: str | os.PathLike[str]) -> int:
@@ -161,9 +156,9 @@ def copy_regular_file(src: str | os.PathLike[str], dst: str | os.PathLike[str]) 
     ``open_regular_file``. ``shutil.copy2`` refuses a FIFO only when its ``stat`` finds one, so
     it waits on a FIFO swapped in after that ``stat``, and it reads a device (``/dev/zero`` for
     ever); this copy refuses both, naming the kind. The bytes are copied in the kernel
-    (``_send_file``), or, where it does not, through userspace by ``shutil.copyfileobj``, as
-    ``shutil.copyfile`` copies them; then the metadata, as ``shutil.copy2`` copies it
-    (``shutil.copystat``)."""
+    (``_send_file``), or, where ``_send_file`` declines, through userspace by
+    ``shutil.copyfileobj``, as ``shutil.copyfile`` copies them; then the metadata, as
+    ``shutil.copy2`` copies it (``shutil.copystat``)."""
     with open(open_regular_file(src), "rb", buffering=0) as source, open(dst, "wb") as target:
         if not _send_file(source.fileno(), target.fileno(), src, dst):
             shutil.copyfileobj(source, target)

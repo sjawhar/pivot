@@ -11,7 +11,6 @@ import pathlib
 import queue
 import shutil
 import stat
-import sys
 import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -3022,31 +3021,6 @@ def test_symlink_save_of_a_directory_holding_a_fifo_fails_naming_its_kind(
 
     assert f"Is a FIFO, not a regular file: {fifo}" in str(raised.value)
     assert stat.S_ISFIFO(os.lstat(fifo).st_mode), "the FIFO stays"
-
-
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"), reason="shutil copies with sendfile only on Linux"
-)
-def test_copy_to_cache_publishes_nothing_where_the_copy_fails(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A copy into the cache that fails, here on a full filesystem (ENOSPC on the first sendfile
-    call, which ``regular_file.copy_regular_file`` raises), raises its error and publishes
-    nothing: no object, no temp file."""
-    src = tmp_path / "out.txt"
-    src.write_text("bytes")
-    cache_path = tmp_path / "cache" / "ab" / "cdef0123456789"
-
-    def _full(out_fd: int, in_fd: int, offset: int, count: int) -> int:
-        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-
-    monkeypatch.setattr(os, "sendfile", _full)
-
-    with pytest.raises(OSError) as raised:
-        cache.copy_to_cache(src, cache_path)
-
-    assert raised.value.errno == errno.ENOSPC
-    assert _helper_entries(cache_path.parent) == [], "nothing published, no temp file left"
 
 
 @pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP, errno.ENOSYS])

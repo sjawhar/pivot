@@ -22,12 +22,10 @@ _needs_o_path_and_proc = pytest.mark.skipif(
 _needs_sendfile = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="shutil copies with sendfile only on Linux"
 )
-# Linux fails a socket's open with ENXIO; other kernels give their own error number
 _needs_linux_socket_open = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="a socket's open fails with ENXIO on Linux"
 )
 
-# What a copy through userspace reads at a time (shutil.copyfileobj); typeshed leaves it out
 _COPY_BUFSIZE: int = shutil.COPY_BUFSIZE  # pyright: ignore[reportAttributeAccessIssue] - not in typeshed
 
 
