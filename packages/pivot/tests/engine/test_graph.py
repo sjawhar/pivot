@@ -499,6 +499,28 @@ def test_get_runnable_stages_leaves_out_stages_downstream_of_a_missing_dependenc
     assert found.left_out == ({} if runnable is None else {"bad/b": error, "bad/c": error})
 
 
+@pytest.mark.parametrize(
+    ("all_pipelines", "on_error", "watching", "leave_out"),
+    [
+        pytest.param(True, OnError.KEEP_GOING, False, True, id="all-keep-going"),
+        pytest.param(True, OnError.KEEP_GOING, True, False, id="all-keep-going-watching"),
+        pytest.param(True, OnError.FAIL, False, False, id="all-fail"),
+        pytest.param(False, OnError.KEEP_GOING, False, False, id="one-keep-going"),
+    ],
+)
+def test_missing_tracked_file_leave_out_mode_is_an_unwatched_keep_going_run_of_all_pipelines(
+    all_pipelines: bool, on_error: OnError, watching: bool, leave_out: bool
+) -> None:
+    """Leave-out mode, where a missing tracked file leaves out only the stages that read it, is a
+    run across all pipelines that keeps going past failures outside a watch session: the engine
+    and the dry run both take it from ``is_leave_out_mode``."""
+    found = graph.is_leave_out_mode(
+        all_pipelines=all_pipelines, on_error=on_error, watching=watching
+    )
+
+    assert found is leave_out
+
+
 def _helper_input_stage(name: str, inputs: list[str]) -> RegistryStageInfo:
     """A stage that reads the pipeline inputs named ``inputs``, in that order, and writes one
     output."""

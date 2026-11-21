@@ -1,7 +1,7 @@
 """The notice of `pivot repro --all --keep-going --dry-run --checkout-missing` (and `--explain`)
 for a mapped stage it shows as not yet expanded although the run may expand it
-(``cli/repro.py`` ``_log_restore_limits``; ``status.restore_limits`` owns the rule). Each test
-name holds ``dry_run_keep_going``, check c4's ``-k`` word.
+(``cli/leave_out_dry_run.py`` ``_log_restore_limits``; ``status.restore_limits`` owns the rule).
+Each test name holds ``dry_run_keep_going``, check c4's ``-k`` word.
 """
 
 from __future__ import annotations

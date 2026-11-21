@@ -1636,11 +1636,10 @@ class Engine:
         # restore, as it leaves out those with any other missing input (leave-out mode). It
         # still stops on one that is, lies inside or contains an output of a loaded stage, whose
         # write would delete its sidecar. Any other run stops on every missing tracked file.
-        leave_out = (
-            engine_graph.skips_missing_dependencies(
-                all_pipelines=self._all_pipelines, on_error=on_error
-            )
-            and not self._watches_filesystem()
+        leave_out = engine_graph.is_leave_out_mode(
+            all_pipelines=self._all_pipelines,
+            on_error=on_error,
+            watching=self._watches_filesystem(),
         )
         missing_tracked = executor_core.verify_tracked_files(
             project_root,
@@ -1667,7 +1666,7 @@ class Engine:
             project_root, all_stages, store, config.get_state_dir(), cache_dir / "files"
         ):
             _logger.warning(warning)
-        runnable, dep_errors, left_out = engine_graph.get_runnable_stages(
+        runnable, dep_errors, left_out, _ = engine_graph.get_runnable_stages(
             graph_stages,
             store,
             all_pipelines=self._all_pipelines,
@@ -1717,13 +1716,12 @@ class Engine:
             # A target left out for a missing input, its stage's or one upstream of it, is no
             # unknown stage: the run runs the other targets, and the command then fails naming
             # it (``left_out_targets``)
-            self._left_out_targets = expansion.left_out_targets(targets, templates, left_out)
-            if self._left_out_targets:
-                targets = [t for t in targets if t not in self._left_out_targets]
-                if not targets:
-                    # No target is left; get_execution_order would take no target as every stage
-                    return {}
-                stages, wanted = expansion.mapped_targets(targets, templates)
+            kept = expansion.keep_targets(targets, templates, left_out)
+            self._left_out_targets = kept.left_out
+            if not kept.targets:
+                # No target is left; get_execution_order would take no target as every stage
+                return {}
+            targets, stages, wanted = kept.targets, kept.stages, kept.wanted
         if dep_errors:
             graph = engine_graph.build_graph(runnable)
         all_stages = {name: info for name, info in runnable.items() if name not in templates}

@@ -14,7 +14,7 @@ from pivot.remote import config as remote_config
 from pivot.remote import sync as transfer
 from pivot.storage import cache, listing, track
 from pivot.storage import state as state_mod
-from pivot.types import ArtifactRef, OnError, Recovery, StageExplanation
+from pivot.types import OnError, Recovery, StageExplanation
 from tests import helpers
 
 if TYPE_CHECKING:
@@ -939,7 +939,6 @@ def test_dry_run_keep_going_restore_reads_name_each_stage_whose_explanation_miss
         name="pair",
         deps={"first": "data/raw/dir", "second": "data/raw/images/sub"},
     )
-    present = list[tuple[str, ArtifactRef]]()
     runnable = engine_graph.get_runnable_stages(
         mock_discovery.snapshot(),
         status._make_workspace_store(mock_discovery),
@@ -947,11 +946,10 @@ def test_dry_run_keep_going_restore_reads_name_each_stage_whose_explanation_miss
         on_error=OnError.KEEP_GOING,
         missing_tracked=found.missing.paths,
         restored_tracked=found.restored,
-        present=present,
     )
     assert runnable.errors == []
 
-    reads = status._restore_reads(mock_discovery, present, found.restorable)
+    reads = status._restore_reads(mock_discovery, runnable.present, found.restorable)
 
     held, images, x = raw / "dir" / "f.txt", raw / "images", raw / "inputs" / "x.txt"
     assert reads == {
@@ -971,7 +969,7 @@ def test_dry_run_keep_going_restore_reads_name_each_stage_whose_explanation_miss
             mock_discovery,
             {"test/dir"},
             engine_graph.build_graph(mock_discovery.snapshot()),
-            present=present,
+            present=runnable.present,
             restorable={},
             known={},
             force=False,

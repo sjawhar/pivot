@@ -28,6 +28,7 @@ __all__ = [
     "build_graph",
     "validate_dependency_sources",
     "skips_missing_dependencies",
+    "is_leave_out_mode",
     "RunnableStages",
     "get_runnable_stages",
     "tracked_overlap",
@@ -330,6 +331,20 @@ def skips_missing_dependencies(*, all_pipelines: bool, on_error: pivot_types.OnE
     return all_pipelines and on_error == pivot_types.OnError.KEEP_GOING
 
 
+def is_leave_out_mode(
+    *, all_pipelines: bool, on_error: pivot_types.OnError, watching: bool
+) -> bool:
+    """Whether a run is in leave-out mode: one that skips missing dependencies
+    (``skips_missing_dependencies``) outside a watch or serve session (``watching``: the engine
+    has a filesystem source). Such a run also leaves out each stage that reads a tracked file
+    still missing after the restore, instead of stopping on it, and each target whose stage it
+    leaves out (``expansion.keep_targets``). The run (``Engine._orchestrate_execution``) and its
+    dry run and ``--explain`` (``pivot repro``) both decide the mode here."""
+    return (
+        skips_missing_dependencies(all_pipelines=all_pipelines, on_error=on_error) and not watching
+    )
+
+
 class RunnableStages(NamedTuple):
     """The stages a run executes, with the missing dependencies found
     (``get_runnable_stages``)."""
@@ -341,6 +356,11 @@ class RunnableStages(NamedTuple):
     left_out: dict[str, DependencyNotFoundError]
     """Each stage a run that skips missing dependencies leaves out, with its cause: the first
     error of ``errors`` whose stage is that stage or upstream of it. Empty in any other run."""
+    present: list[tuple[str, pivot_types.ArtifactRef]]
+    """Each dependency that no stage produces and that exists, or that the restore creates, with
+    its stage (``validate_dependency_sources``' ``present``), of every stage, left out or not:
+    for a caller to read them without checking the disk again (a dry run's notice,
+    ``status.restore_limits``)."""
 
 
 def get_runnable_stages(
@@ -351,7 +371,6 @@ def get_runnable_stages(
     on_error: pivot_types.OnError,
     missing_tracked: Collection[str] = (),
     restored_tracked: Mapping[str, AbstractSet[tuple[str, ...]]] | None = None,
-    present: list[tuple[str, pivot_types.ArtifactRef]] | None = None,
 ) -> RunnableStages:
     """Return the stages a run executes, with the missing dependencies found.
 
@@ -370,17 +389,14 @@ def get_runnable_stages(
     ``--checkout-missing``): a missing dependency the restore creates, or that holds a path the
     restore creates, counts as one that exists, as the run finds it after its restore
     (``_restore_creates``), so a directory among them that holds a missing tracked file leaves
-    its stage out too. ``present``, when given, receives each dependency that no stage produces
-    and that exists, or that the restore creates, with its stage (``validate_dependency_sources``'
-    ``present``), for a caller to read them without checking the disk again (a dry run's notice,
-    ``status.restore_limits``).
+    its stage out too. ``RunnableStages.present`` holds the dependencies found on disk or
+    created by the restore.
     """
     from pivot import exceptions
 
     # The dependencies on disk, or created by the restore, read for the missing tracked files
     # each is, lies inside or holds
-    if present is None:
-        present = list[tuple[str, pivot_types.ArtifactRef]]()
+    present = list[tuple[str, pivot_types.ArtifactRef]]()
     errors = validate_dependency_sources(
         stages,
         store=store,
@@ -390,9 +406,9 @@ def get_runnable_stages(
     if missing_tracked:
         errors = _tracked_file_errors(errors, present, store, missing_tracked)
     if not errors:
-        return RunnableStages(stages, errors, {})
+        return RunnableStages(stages, errors, {}, present)
     if not skips_missing_dependencies(all_pipelines=all_pipelines, on_error=on_error):
-        return RunnableStages(None, errors, {})
+        return RunnableStages(None, errors, {}, present)
     graph = build_graph(stages)
     left_out = dict[str, exceptions.DependencyNotFoundError]()
     for error in errors:
@@ -403,7 +419,10 @@ def get_runnable_stages(
             # A stage's cause is the first error that leaves it out
             left_out.setdefault(name, error)
     return RunnableStages(
-        {name: info for name, info in stages.items() if name not in left_out}, errors, left_out
+        {name: info for name, info in stages.items() if name not in left_out},
+        errors,
+        left_out,
+        present,
     )
 
 

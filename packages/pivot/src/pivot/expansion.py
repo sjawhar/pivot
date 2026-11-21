@@ -30,7 +30,7 @@ from pivot.storage import cache, listing, lock, ownership
 from pivot.storage import state as state_mod
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterable, Mapping
+    from collections.abc import Collection, Mapping
 
     from pivot.storage import store as store_mod
 
@@ -278,23 +278,39 @@ def mapped_targets(
     return list(dict.fromkeys(targets)), filtered
 
 
-def left_out_targets(
-    targets: Iterable[str],
-    templates: Collection[str],
+class KeptTargets(NamedTuple):
+    """What a run in leave-out mode keeps of its targets (``keep_targets``)."""
+
+    left_out: dict[str, exceptions.DependencyNotFoundError]
+    """Each target, as given, whose stage the run leaves out, with that stage's cause."""
+    targets: list[str]
+    """The other targets, as given, in their order."""
+    stages: list[str]
+    """``targets`` with each instance name replaced by its template (``mapped_targets``)."""
+    wanted: dict[str, dict[str, set[str]]]
+    """The keys each template expands for ``targets`` (``mapped_targets``)."""
+
+
+def keep_targets(
+    targets: list[str],
+    templates: Mapping[str, registry.MapTemplate],
     left_out: Mapping[str, exceptions.DependencyNotFoundError],
-) -> dict[str, exceptions.DependencyNotFoundError]:
-    """Each of run targets ``targets``, as given, whose stage a run leaves out, with that stage's
-    cause. ``left_out`` holds the stages a run across all pipelines that keeps going past
-    failures leaves out for a missing input (``engine.graph.get_runnable_stages``); an instance
-    target (``<template>@<key>``) stands for its template (``registry.run_target``). The run
-    (``Engine``) and its dry run (``pivot repro --dry-run``) both call this, so they leave out
-    the same targets."""
+) -> KeptTargets:
+    """Run targets ``targets`` split into those whose stage a run leaves out, each with that
+    stage's cause, and the others, with what ``mapped_targets`` gives for the others. ``left_out``
+    holds the stages a run in leave-out mode leaves out for a missing input
+    (``engine.graph.get_runnable_stages``); an instance target (``<template>@<key>``) stands for
+    its template (``registry.run_target``). The run (``Engine``) and its dry run
+    (``pivot repro --dry-run``) both call this, so they leave out the same targets and expand
+    the same keys for the others."""
     found = dict[str, exceptions.DependencyNotFoundError]()
     for target in targets:
         stage = registry.run_target(target, templates)
         if stage in left_out:
             found[target] = left_out[stage]
-    return found
+    kept = [target for target in targets if target not in found]
+    stages, wanted = mapped_targets(kept, templates)
+    return KeptTargets(left_out=found, targets=kept, stages=stages, wanted=wanted)
 
 
 def stage_lock(
