@@ -617,16 +617,11 @@ def test_hash_dependencies_reports_unreadable_dependency(
     [pytest.param("fifo", "a FIFO", id="fifo"), pytest.param("socket", "a socket", id="socket")],
 )
 def test_hash_dependencies_reports_a_dependency_that_is_not_a_regular_file_by_its_kind(
-    project: pathlib.Path,
-    state_db: state.StateDB,
-    monkeypatch: pytest.MonkeyPatch,
-    kind: str,
-    named: str,
+    project: pathlib.Path, state_db: state.StateDB, kind: str, named: str
 ) -> None:
     """A FIFO or a socket where a dependency file belongs is unreadable, named with its kind,
     as a directory there is: it is never opened, so the hash returns at once instead of waiting
     on the FIFO for a writer, within the hard timeout of ``helpers.call_without_waiting``."""
-    monkeypatch.chdir(project)  # a socket is bound by its path from here (``helpers.occupy``)
     store = _workspace(project, {"raw": "raw.txt"})
     raw = project / "raw.txt"
     helpers.occupy(raw, kind)

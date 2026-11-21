@@ -341,13 +341,12 @@ def test_get_data_path_invalid_suffix_raises() -> None:
     ],
 )
 def test_present_kind_counts_only_a_regular_file_or_a_directory_as_present(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str, expected: str | None
+    tmp_path: pathlib.Path, kind: str, expected: str | None
 ) -> None:
     """The one rule for whether a tracked path is present: a regular file or a directory,
     symlinks followed, and nothing else. A symlink to nothing or to itself, a socket, a FIFO, a
     symlink to one or no entry at all is missing. It never opens the path: on a FIFO, whose
     open for reading waits for a writer, it returns at once."""
-    monkeypatch.chdir(tmp_path)
     path = tmp_path / "tracked"
     helpers.occupy(path, kind)
 
@@ -374,13 +373,12 @@ def test_present_kind_counts_only_a_regular_file_or_a_directory_as_present(
     ],
 )
 def test_occupant_names_an_entry_at_a_tracked_path_that_is_neither_file_nor_directory(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str, expected: str | None
+    tmp_path: pathlib.Path, kind: str, expected: str | None
 ) -> None:
     """What stands at a tracked path that ``present_kind`` counts missing, and that a restore
     does not replace, named for its warning: a socket, a FIFO, or a symlink to one. Nothing, a
     symlink to nothing or to itself, a regular file and a directory, symlinks followed, are
     None. It never opens the path: on a FIFO it returns at once."""
-    monkeypatch.chdir(tmp_path)
     path = tmp_path / "tracked"
     helpers.occupy(path, kind)
 

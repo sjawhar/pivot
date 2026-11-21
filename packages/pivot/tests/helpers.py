@@ -3,12 +3,14 @@ pipeline.py text, tracked files with no data or removed once tracked, a cache's 
 trees and a cache register on a read-only mount, git projects that the installed `pivot` runs in,
 the output of `pivot repro --jsonl` and its restore warnings, the dry run and the run of `pivot
 repro --all --keep-going`, sockets, a call that must not wait on a FIFO or a lock, an entry of
-each kind where a path belongs, and venvs that CI-only tests install with uv."""
+each kind where a path belongs, a copy that must not go through userspace, and venvs that CI-only
+tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import functools
 import inspect
@@ -357,15 +359,13 @@ def free_fifo(path: pathlib.Path) -> None:
 def occupy(path: pathlib.Path, kind: str) -> None:
     """Put an entry of ``kind`` at ``path``, where none is, and check with ``os.lstat`` that it
     is there, of its type (for "nothing", that no entry is), so no test passes on an entry made
-    elsewhere: "nothing"; a "regular_file"; a "directory" (mode 0o700); a "socket"; a "fifo"
-    (mode 0o600); a symlink to the file target.txt ("symlink_to_file"), the directory somedir
-    ("symlink_to_directory") or the FIFO pipe ("symlink_to_fifo"), each made beside it; a
-    symlink to nothing ("dangling_symlink"); or a symlink to itself ("symlink_loop"). The modes
-    are fixed, so a test may name them (``stat.filemode``).
-
-    A socket is bound by ``os.path.relpath(path)``, which works from any working directory at or
-    above the directory holding ``path``: an address holds at most 108 bytes, which an absolute
-    path under a test's temporary directory may pass. Its file stays once the socket is closed.
+    elsewhere: "nothing"; a "regular_file"; a "directory" (mode 0o700); a "socket", whose file
+    stays once the socket is closed; a "fifo" (mode 0o600); a symlink to the file target.txt
+    ("symlink_to_file"), the directory somedir ("symlink_to_directory") or the FIFO pipe
+    ("symlink_to_fifo"), each made beside it; a symlink to ``/dev/null`` ("symlink_to_device"),
+    a device that a read takes for an empty file, checked with ``os.stat`` too; a symlink to
+    nothing ("dangling_symlink"); or a symlink to itself ("symlink_loop"). The modes are fixed,
+    so a test may name them (``stat.filemode``).
     """
     match kind:
         case "nothing":
@@ -378,8 +378,10 @@ def occupy(path: pathlib.Path, kind: str) -> None:
             path.mkdir(mode=0o700)
             made = stat.S_IFDIR
         case "socket":
-            with socket.socket(socket.AF_UNIX) as bound:
-                bound.bind(os.path.relpath(path))
+            # Bound by its name from its directory: an address holds at most 108 bytes, which an
+            # absolute path under a test's temporary directory may pass
+            with contextlib.chdir(path.parent), socket.socket(socket.AF_UNIX) as bound:
+                bound.bind(path.name)
             made = stat.S_IFSOCK
         case "fifo":
             os.mkfifo(path, 0o600)
@@ -396,6 +398,10 @@ def occupy(path: pathlib.Path, kind: str) -> None:
             os.mkfifo(path.parent / "pipe", 0o600)
             path.symlink_to("pipe")
             made = stat.S_IFLNK
+        case "symlink_to_device":
+            path.symlink_to(os.devnull)
+            assert stat.S_ISCHR(os.stat(path).st_mode), f"{os.devnull} is no device"
+            made = stat.S_IFLNK
         case "dangling_symlink":
             path.symlink_to("nowhere")
             made = stat.S_IFLNK
@@ -405,6 +411,12 @@ def occupy(path: pathlib.Path, kind: str) -> None:
         case _:
             raise ValueError(f"no entry kind {kind!r}")
     assert stat.S_IFMT(os.lstat(path).st_mode) == made, f"{path} is no {kind}"
+
+
+def no_userspace_copy(*args: object, **kwargs: object) -> None:
+    """Stands for ``shutil.copyfileobj`` where a copy must go through the kernel
+    (``storage.regular_file.copy_regular_file``): a call fails the test."""
+    raise AssertionError("the bytes were copied through userspace")
 
 
 def completed_stages(stdout: str) -> dict[str, dict[str, object]]:

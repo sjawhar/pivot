@@ -2813,9 +2813,9 @@ def hash_dependencies(
 
     A dependency that does not exist is missing. One that cannot be read is unreadable, named
     with why where that is known: a directory where a file is read (``key (a directory, not a
-    file)``), a FIFO, a socket or a device, which is never opened, so the hash neither waits on a
-    FIFO nor reads a device for ever (``exceptions.NotAFileError``: ``key (a FIFO, not a
-    file)``), a symlink in a directory input that cannot be classified
+    file)``), a FIFO, a socket or a device, which is never opened, by the rule
+    ``storage.regular_file.open_regular_file`` states (``exceptions.NotAFileError``: ``key (a
+    FIFO, not a file)``), a symlink in a directory input that cannot be classified
     (``exceptions.UnreadableLinkError``), or any other ``OSError`` (a permission error: ``key``).
 
     With a read-only (or no) ``state_db``, the write-backs are the StateDB file-hash entries of

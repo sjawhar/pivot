@@ -626,8 +626,8 @@ class WorkspaceStore:
 
         A directory input leaves out the files ``.pivotignore`` names (``_input_member_filter``).
         A file input that is a FIFO, a socket or a device raises ``exceptions.NotAFileError``
-        without being opened (``cache.hash_file``), so the dependency is unreadable, never waited
-        on.
+        without being opened (``cache.hash_file``, by the rule ``regular_file.open_regular_file``
+        states), so the dependency is unreadable.
         """
         path = self._resolve_path(ref)
         if ref.directory is None and (ref.tag == types.ArtifactTag.DIRECTORY or path.is_dir()):

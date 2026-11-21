@@ -2004,8 +2004,6 @@ def test_memo_path_that_is_no_regular_file_is_refused(
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     path = track._memo_path()
-    # A socket is bound by its path from here (``helpers.occupy``)
-    monkeypatch.chdir(memo_project)
     helpers.occupy(path, kind)
     made = stat.S_IFMT(os.lstat(path).st_mode)
     directories = len(_helper_directories(memo_project))

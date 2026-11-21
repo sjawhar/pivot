@@ -331,10 +331,9 @@ class UnreadableLinkError(CacheError):
 
 class NotAFileError(OSError):
     """A path Pivot reads as a file holds something else, symlinks followed: a FIFO, a socket or
-    a device. Pivot never reads one (``storage.cache.open_regular_file``): an open of a FIFO for
-    reading waits for a writer, and a device such as ``/dev/zero`` never ends. ``kind`` names
-    what is there ("a FIFO", ``storage.cache.entry_kind``). A directory raises
-    ``IsADirectoryError`` instead, as ``open`` does.
+    a device, which Pivot never reads (the rule ``storage.regular_file.open_regular_file``
+    states). ``kind`` names what is there ("a FIFO", ``storage.regular_file.entry_kind``). A
+    directory raises ``IsADirectoryError`` instead, as ``open`` does.
 
     It is an OSError, so every caller that handles a file it cannot read handles this one: a
     dependency is unreadable, an output differs from its lock. It carries no error number, and
