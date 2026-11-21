@@ -1,41 +1,449 @@
-"""Test helpers shared by test modules: pipelines built with the compositional API, sockets, and
-venvs that CI-only tests install with uv."""
+"""Test helpers shared by test modules: pipelines built with the compositional API or written as
+pipeline.py text, tracked files with no data or removed once tracked, a cache's whole-directory
+trees and a cache register on a read-only mount, git projects that the installed `pivot` runs in,
+the output of `pivot repro --jsonl` and its restore warnings, the dry run and the run of `pivot
+repro --all --keep-going`, sockets, a call that must not wait on a FIFO or a lock, an entry of
+each kind where a path belongs, a cache object swapped once its lookup found it, a copy that must
+not go through userspace, and venvs that CI-only tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import functools
 import inspect
+import json
 import os
 import pathlib
 import re
+import socket
 import stat
 import subprocess
 import sys
 import textwrap
+import threading
 import typing
 from typing import TYPE_CHECKING, Any
 
 import anyio
 import pytest
 
-from pivot import compose, discovery, exceptions, project, stage_def
+from pivot import cli, compose, discovery, exceptions, project, stage_def
 from pivot import names as stage_names
+from pivot.storage import cache, naming, state, store, track
 from pivot.storage import mounts as mounts_module
-from pivot.storage import state, store
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
     from multiprocessing.synchronize import Event
 
+    import click.testing
+
     from pivot.registry import PipelineLike
+    from pivot.storage import listing
 
 DepValue = compose.ArtifactHandle | str | list[compose.ArtifactHandle]
 
 # The `pivot` command installed beside the interpreter running the tests. CI runs the suite
 # without uv on PATH, so tests start this path, never `uv run pivot`.
 PIVOT = str(pathlib.Path(sys.executable).parent / "pivot")
+
+# Pipeline p's stage p/plan writes the directory output data/p/plan/, holding a.txt and b.txt
+PRODUCER_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+with Pipeline("p") as pipeline:
+    plan()
+"""
+
+# PRODUCER_PIPELINE with p/cut, mapped over p/plan's files: instance p/cut@<key> writes the file
+# data/p/cut@<key>.txt
+MAPPED_FILE_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str) -> str:
+    return entry
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan()))
+"""
+
+
+def track_without_data(data_path: pathlib.Path) -> pathlib.Path:
+    """Write the ``.pvt`` of ``data_path`` alone, as ``pivot track`` names it, with no data on disk
+    and no object in any cache: a tracked file that is missing and that ``--checkout-missing``
+    cannot restore. Makes the directory that holds the ``.pvt``; returns the ``.pvt``'s path."""
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    pvt_path = track.get_pvt_path(data_path)
+    track.write_pvt_file(
+        pvt_path, track.PvtData(path=data_path.name, hash="0123456789abcdef", size=10)
+    )
+    return pvt_path
+
+
+def track_then_remove(runner: click.testing.CliRunner, root: pathlib.Path, name: str) -> None:
+    """Track ``root / name`` with the real ``pivot track`` (its objects go to the cache), then
+    remove it from the workspace."""
+    assert runner.invoke(cli.cli, ["track", name]).exit_code == 0
+    cache.remove_output(root / name)
+
+
+def cache_whole_tree(root: pathlib.Path, tracked: pathlib.Path) -> listing.DirListing:
+    """Put in the cache of the project at ``root`` the whole-directory tree of tracked directory
+    ``tracked``, complete and marked, as a SYMLINK commit of a stage output with the same files
+    leaves it: the files its ``.pvt`` record lists, built from their cache objects, which hash to
+    that record. Returns the record's listing."""
+    files = root / ".pivot" / "cache" / "files"
+    record = track.read_pvt_file(track.get_pvt_path(tracked))
+    assert record is not None
+    members = track.tracked_members(tracked, record, files)
+    twin = root / "twin"
+    twin.mkdir()
+    for entry in members["files"]:
+        member = twin / entry["relpath"]
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_bytes(cache.get_cache_path(files, entry["hash"]).read_bytes())
+        member.chmod(0o755 if entry["isexec"] else 0o644)
+    for relpath in members["empty_dirs"]:
+        (twin / relpath).mkdir(parents=True)
+    saved = cache.save_to_cache(
+        twin, files, checkout_modes=[cache.CheckoutMode.SYMLINK, cache.CheckoutMode.COPY]
+    )
+    assert saved == track.pvt_to_hash_info(record), "the tree is the tracked directory's"
+    twin.unlink()
+    return members
+
+
+def cache_whole_tree_lacking(root: pathlib.Path, tracked: pathlib.Path, relpath: str) -> str:
+    """``cache_whole_tree`` of tracked directory ``tracked`` in the project at ``root``, then the
+    cache object of its member ``relpath`` removed. Returns that object's hash."""
+    members = cache_whole_tree(root, tracked)
+    member_hash = next(entry["hash"] for entry in members["files"] if entry["relpath"] == relpath)
+    cache.get_cache_path(root / ".pivot" / "cache" / "files", member_hash).unlink()
+    return member_hash
+
+
+def register_on_a_read_only_mount(
+    monkeypatch: pytest.MonkeyPatch, cache_root: pathlib.Path
+) -> None:
+    """Make the register of the cache at ``cache_root`` behave, in this process, as on a
+    filesystem mounted read-only, which this user cannot make: opening a naming lock file there
+    fails with EROFS, as it does on such a mount (``naming.naming_unit`` then refuses this
+    process's links into the cache), and ``os.statvfs`` of the register reports ``ST_RDONLY``
+    beside its real figures. The links a registration refuses go to a table of this test's
+    own."""
+    register = os.path.realpath(naming.register_root(cache_root))
+    real_open_cache_lock = cache.open_cache_lock
+    real_statvfs = os.statvfs
+
+    def open_cache_lock(path: pathlib.Path, *, dir_fd: int | None = None) -> int:
+        if dir_fd is None and os.path.realpath(path.parent) == register:
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(path))
+        return real_open_cache_lock(path, dir_fd=dir_fd)
+
+    def statvfs(path: str | os.PathLike[str]) -> os.statvfs_result:
+        found = real_statvfs(path)
+        if os.path.realpath(path) != register:
+            return found
+        return os.statvfs_result((*found[:8], found.f_flag | os.ST_RDONLY, *found[9:]))
+
+    monkeypatch.setattr(cache, "_UNREGISTERED_ROOTS", dict[str, str]())
+    monkeypatch.setattr(cache, "open_cache_lock", open_cache_lock)
+    monkeypatch.setattr(os, "statvfs", statvfs)
+
+
+# The line `TrackedFileMissingError` ends with when a file it lists overlaps a stage output
+OVERLAP_STOPS = (
+    "Pivot does not run a stage whose output overlaps a file above. "
+    + "That stage replaces its output when it runs."
+)
+
+
+# `pivot repro --all --keep-going --dry-run --jsonl`: its one JSON document on stdout
+DRY_RUN_KEEP_GOING = ["repro", "--all", "--keep-going", "--dry-run", "--jsonl"]
+
+# A row of a DRY_RUN_KEEP_GOING document: a stage the run would skip as unchanged
+UNCHANGED_ROW = {"would_run": False, "reason": "unchanged"}
+
+
+def ok(proc: subprocess.CompletedProcess[str]) -> str:
+    """The output of ``proc``, a command that must exit 0: its stdout, then its stderr."""
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    return out
+
+
+def git_project(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """An initialized pivot project in a git repository under ``tmp_path``, and the home its
+    commands run with (``run_pivot``)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "project"
+    root.mkdir()
+    for args in (
+        ("git", "init", "-q"),
+        ("git", "config", "user.email", "t@example.com"),
+        ("git", "config", "user.name", "t"),
+    ):
+        ok(run_cli(root, home, *args))
+    ok(run_pivot(root, home, "init"))
+    return root, home
+
+
+def dry_run_keep_going(
+    root: pathlib.Path, home: pathlib.Path, *args: str
+) -> tuple[dict[str, Any], str]:
+    """``DRY_RUN_KEEP_GOING`` with ``args`` in project ``root``, which must exit 0: its
+    document, parsed from its stdout alone, and its stderr."""
+    proc = run_pivot(root, home, *DRY_RUN_KEEP_GOING, *args)
+    ok(proc)
+    return json.loads(proc.stdout), proc.stderr
+
+
+def run_keep_going(
+    root: pathlib.Path, home: pathlib.Path, *args: str
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, Any]]]:
+    """The run ``dry_run_keep_going`` with ``args`` predicts, `pivot repro --all --keep-going
+    --jsonl` in project ``root``, and its JSONL events (``jsonl_events``)."""
+    proc = run_pivot(root, home, "repro", "--all", "--keep-going", "--jsonl", *args)
+    return proc, jsonl_events(proc.stdout)
+
+
+def jsonl_events(stdout: str) -> list[dict[str, Any]]:
+    """The events a `--jsonl` run's ``stdout`` holds, one JSON object a line."""
+    return [json.loads(line) for line in stdout.splitlines()]
+
+
+def stage_statuses(stdout: str) -> dict[str, object]:
+    """The status of each stage a `--jsonl` run's ``stdout`` reports (``completed_stages``), by
+    stage."""
+    return {stage: event["status"] for stage, event in completed_stages(stdout).items()}
+
+
+def refused_mapped_project(tmp_path: pathlib.Path, code: str) -> tuple[pathlib.Path, pathlib.Path]:
+    """A ``git_project`` whose p/plan (``PRODUCER_PIPELINE``) is current, and where
+    data/p/cut@a.txt, the output p/cut@a would write, is a missing tracked file; then ``code``
+    declares p/cut. The file is tracked before p/cut is declared, since `pivot track` refuses a
+    path an output the pipeline declares holds."""
+    root, home = git_project(tmp_path)
+    (root / "pipeline.py").write_text(PRODUCER_PIPELINE)
+    ok(run_pivot(root, home, "repro"))
+    tracked = root / "data" / "p" / "cut@a.txt"
+    tracked.write_text("tracked bytes")
+    ok(run_pivot(root, home, "track", "data/p/cut@a.txt"))
+    tracked.unlink()
+    (root / "pipeline.py").write_text(code)
+    return root, home
+
+
+def uncached_incremental_project(
+    tmp_path: pathlib.Path, code: str
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """A ``git_project`` where every stage of ``code``, whose p/cut instances keep an
+    incremental output, ran; then p/cut@a's lock is gone, so its output data/p/cut@a.txt is on
+    disk but not in the cache."""
+    root, home = git_project(tmp_path)
+    (root / "pipeline.py").write_text(code)
+    ok(run_pivot(root, home, "repro"))
+    (root / ".pivot" / "stages" / "p" / "cut@a.lock").unlink()
+    return root, home
+
+
+def one_stage_pipeline_code(name: str, stage_name: str) -> str:
+    """Return a complete compositional pipeline.py with one value-returning stage."""
+    return f'''\
+from pivot.compose import Pipeline, stage
+
+
+@stage
+def {stage_name}() -> str:
+    return "{stage_name} output"
+
+
+with Pipeline("{name}") as pipeline:
+    {stage_name}()
+'''
+
+
+def write_pipeline(root: pathlib.Path, name: str, code: str) -> None:
+    """Write pipeline.py ``code`` into the new directory ``root / name``."""
+    (root / name).mkdir()
+    (root / name / "pipeline.py").write_text(code)
+
+
+def skipping_lines(output: str) -> list[str]:
+    """Each `Skipping:` line of ``output``: a stage a run leaves out, with why."""
+    return [line for line in output.splitlines() if "Skipping:" in line]
+
+
+def restore_warnings(stderr: str) -> list[str]:
+    """Each `Cannot restore` warning line of ``stderr``: a tracked path a restore left missing."""
+    return [line for line in stderr.splitlines() if line.startswith("Cannot restore ")]
+
+
+def call_without_waiting[T](
+    call: Callable[[], T], release: Callable[[], None], timeout: float = 120
+) -> T:
+    """``call()``, run in a thread, and what it returns or raises. When it is still running
+    after ``timeout`` seconds, as an open of a FIFO for reading waits for a writer or a lock
+    waits for its holder, ``release()`` frees what it waits on (``free_fifo`` for a FIFO), the
+    thread has ``timeout`` seconds more to end, and the test fails instead of hanging."""
+    outcome = list[T | BaseException]()
+
+    def _run() -> None:
+        try:
+            outcome.append(call())
+        except BaseException as error:  # re-raised in the test's thread below
+            outcome.append(error)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    waited = thread.is_alive()
+    if waited:
+        release()
+        thread.join(timeout)
+    assert not waited, f"the call was still running after {timeout} s"
+    (result,) = outcome
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def free_fifo(path: pathlib.Path) -> None:
+    """Free each open for reading that waits on the FIFO ``path`` leads to (symlinks followed),
+    and put an empty regular file in its place, so that no later open waits either (a stage's
+    worker hashes an input, then opens it again to load it). Nothing where ``path`` leads to no
+    FIFO: a call that waits elsewhere fails its test all the same."""
+    fifo = pathlib.Path(os.path.realpath(path))
+    try:
+        if not stat.S_ISFIFO(os.lstat(fifo).st_mode):
+            return
+    except FileNotFoundError:
+        return
+    try:
+        # A writer frees each open for reading that waits
+        writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno != errno.ENXIO:  # ENXIO: no open for reading waits
+            raise
+        writer = None
+    try:
+        fifo.unlink()
+        fifo.touch()
+    finally:
+        if writer is not None:
+            os.close(writer)
+
+
+def occupy(path: pathlib.Path, kind: str) -> None:
+    """Put an entry of ``kind`` at ``path``, where none is, and check with ``os.lstat`` that it
+    is there, of its type (for "nothing", that no entry is), so no test passes on an entry made
+    elsewhere: "nothing"; a "regular_file"; a "directory" (mode 0o700); a "socket", whose file
+    stays once the socket is closed; a "fifo" (mode 0o600); a symlink to the file target.txt
+    ("symlink_to_file"), the directory somedir ("symlink_to_directory") or the FIFO pipe
+    ("symlink_to_fifo"), each made beside it; a symlink to ``/dev/null`` ("symlink_to_device"),
+    a device that a read takes for an empty file, checked with ``os.stat`` too; a symlink to
+    nothing ("dangling_symlink"); or a symlink to itself ("symlink_loop"). The modes are fixed,
+    so a test may name them (``stat.filemode``).
+    """
+    match kind:
+        case "nothing":
+            assert not os.path.lexists(path), path
+            return
+        case "regular_file":
+            path.write_text("data")
+            made = stat.S_IFREG
+        case "directory":
+            path.mkdir(mode=0o700)
+            made = stat.S_IFDIR
+        case "socket":
+            # Bound by its name from its directory: an address holds at most 108 bytes, which an
+            # absolute path under a test's temporary directory may pass
+            with contextlib.chdir(path.parent), socket.socket(socket.AF_UNIX) as bound:
+                bound.bind(path.name)
+            made = stat.S_IFSOCK
+        case "fifo":
+            os.mkfifo(path, 0o600)
+            made = stat.S_IFIFO
+        case "symlink_to_file":
+            (path.parent / "target.txt").write_text("target")
+            path.symlink_to("target.txt")
+            made = stat.S_IFLNK
+        case "symlink_to_directory":
+            (path.parent / "somedir").mkdir()
+            path.symlink_to("somedir")
+            made = stat.S_IFLNK
+        case "symlink_to_fifo":
+            os.mkfifo(path.parent / "pipe", 0o600)
+            path.symlink_to("pipe")
+            made = stat.S_IFLNK
+        case "symlink_to_device":
+            path.symlink_to(os.devnull)
+            assert stat.S_ISCHR(os.stat(path).st_mode), f"{os.devnull} is no device"
+            made = stat.S_IFLNK
+        case "dangling_symlink":
+            path.symlink_to("nowhere")
+            made = stat.S_IFLNK
+        case "symlink_loop":
+            path.symlink_to(path.name)
+            made = stat.S_IFLNK
+        case _:
+            raise ValueError(f"no entry kind {kind!r}")
+    assert stat.S_IFMT(os.lstat(path).st_mode) == made, f"{path} is no {kind}"
+
+
+def swap_cache_object_after_lookup(
+    monkeypatch: pytest.MonkeyPatch, cache_object: pathlib.Path, kind: str
+) -> None:
+    """Make ``cache.resolve_cache_object_path`` find ``cache_object`` as it does, then put an
+    entry of ``kind`` (``occupy``) in its place before returning it: an object swapped once the
+    lookup found it, which only the open of the object itself can meet. The lookup must find
+    ``cache_object`` and no other path."""
+    lookup = cache.resolve_cache_object_path
+
+    def _swap_after_lookup(
+        objects: pathlib.Path, file_hash: str, *, directory: bool = False, notice: bool = True
+    ) -> pathlib.Path | None:
+        found = lookup(objects, file_hash, directory=directory, notice=notice)
+        assert found == cache_object, found
+        cache_object.unlink()
+        occupy(cache_object, kind)
+        return cache_object
+
+    monkeypatch.setattr(cache, "resolve_cache_object_path", _swap_after_lookup)
+
+
+def no_userspace_copy(*args: object, **kwargs: object) -> None:
+    """Stands for ``shutil.copyfileobj`` where a copy must go through the kernel
+    (``storage.regular_file.copy_regular_file``): a call fails the test."""
+    raise AssertionError("the bytes were copied through userspace")
+
+
+def completed_stages(stdout: str) -> dict[str, dict[str, object]]:
+    """The `stage_complete` event of each stage a `--jsonl` run reports, by stage."""
+    events = jsonl_events(stdout)
+    return {event["stage"]: event for event in events if event["type"] == "stage_complete"}
 
 
 def cli_env(home: pathlib.Path, **extra: str) -> dict[str, str]:

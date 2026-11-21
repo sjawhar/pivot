@@ -25,8 +25,9 @@ from pivot.engine import engine as engine_mod
 from pivot.engine.types import EngineState, InputEvent, OutputEvent
 from pivot.storage import cache, track
 from pivot.storage import store as store_mod
-from pivot.types import StageStatus
+from pivot.types import OnError, StageStatus
 from pivot_tui import event_poller, rpc_client_impl
+from tests import helpers
 
 if TYPE_CHECKING:
     import pathlib
@@ -1918,6 +1919,76 @@ async def test_reload_declaring_the_output_around_a_missing_tracked_file_keeps_i
     ), "the stage owning the missing tracked file must not run"
     assert len(missing_errors) == 1, "the re-run must stop on the missing tracked file"
     assert "f.txt" in str(missing_errors[0])
+
+
+# a/keep reads data/raw/input.txt; a/use reads data/raw/tracked.txt, a tracked file
+_TRACKED_READER_SOURCE = """\
+from pivot import Pipeline, stage
+
+
+@stage
+def keep(raw: str) -> str:
+    return raw + "-keep"
+
+
+@stage
+def use(raw: str) -> str:
+    return raw + "-use"
+
+
+with Pipeline("a") as pipeline:
+    keep(pipeline.input("input.txt"))
+    use(pipeline.input("tracked.txt"))
+"""
+
+
+@pytest.mark.anyio
+async def test_watch_across_all_pipelines_with_keep_going_stops_on_a_missing_tracked_file(
+    watch_project: pathlib.Path,
+) -> None:
+    """R6: a watching engine across all pipelines that keeps going past failures (`repro --all
+    --keep-going --watch`) does not leave out the reader of a missing tracked file and run the
+    rest: its run stops on that file before any stage runs, as in 0.10.4.
+
+    The tracked file has a .pvt alone: no data on disk and no object in the cache.
+    """
+    (watch_project / "pipeline.py").write_text(_TRACKED_READER_SOURCE)
+    pvt_path = helpers.track_without_data(watch_project / "data" / "raw" / "tracked.txt")
+    pipeline = discovery.discover_pipeline(watch_project, all_pipelines=True)
+    assert pipeline is not None
+    assert sorted(pipeline.list_stages()) == ["a/keep", "a/use"]
+    recorder = _Recorder()
+    missing_errors = list[exceptions.TrackedFileMissingError]()
+
+    try:
+        async with engine_mod.Engine(pipeline=pipeline, all_pipelines=True) as eng:
+            eng.add_sink(recorder)
+            eng.add_source(sources.FilesystemSource(watch_paths=[watch_project], debounce_ms=50))
+            eng.add_source(
+                sources.OneShotSource(
+                    stages=None,
+                    force=False,
+                    reason="test",
+                    max_workers=1,
+                    on_error=OnError.KEEP_GOING,
+                )
+            )
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(functools.partial(eng.run, exit_on_completion=False))
+                # The missing-file error ends eng.run and cancels this wait; reaching a/keep's
+                # completion means the run left out the reader and ran the rest instead
+                keep_done = await recorder.wait_for(_helper_completes("a/keep"))
+                await recorder.wait_for(_helper_is_idle, start=keep_done)
+                tg.cancel_scope.cancel()
+    except* exceptions.TrackedFileMissingError as group:
+        missing_errors.extend(_helper_leaf_errors(group))
+
+    assert not [event for event in recorder.events if event["type"] == "stage_completed"], (
+        "no stage runs, the reader of the missing tracked file among them"
+    )
+    assert len(missing_errors) == 1, "the run must stop on the missing tracked file"
+    assert "data/raw/tracked.txt" in str(missing_errors[0])
+    assert pvt_path.is_file(), "the stopped run keeps the sidecar"
 
 
 _RPC_ROOT_ALONE = """\

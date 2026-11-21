@@ -15,13 +15,13 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
     from pivot.cli import CliContext
-    from pivot.expansion import Expansion
+    from pivot.expansion import Expansion, InstanceChecks
     from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.storage import listing, track
     from pivot.storage.store import WorkspaceStore
     from pivot.types import StageExplanation
 
-from pivot import display, exceptions, names, project
+from pivot import display, exceptions, incremental_checks, names, project
 from pivot.cli import decorators as cli_decorators
 
 
@@ -86,15 +86,29 @@ def expand_mapped_stages(
     force: bool = False,
     allow_missing: bool = False,
     fetched: Mapping[str, listing.DirListing] | None = None,
+    restorable: Mapping[str, track.PvtData] | None = None,
+    checks: InstanceChecks | None = None,
+    no_commit: bool = False,
+    not_current: set[str] | None = None,
 ) -> tuple[Expansion, dict[str, StageExplanation]]:
     """Expand each mapped stage of the Pipeline in context whose producer is current, as a run
-    would (``status.expand_current``, a listing the cache lacks taken from ``fetched``), and
-    return the expansion with the explanations it read. A command that lists stages calls it
-    first, so the stages it lists hold the instances."""
+    would (``status.expand_current``, a listing the cache lacks taken from ``fetched``, the
+    missing tracked files of ``restorable`` counted as present, the instances
+    ``expansion.plan_instances`` plans over ``checks`` added, the keys read as a ``--no-commit``
+    run reads them with ``no_commit``, each stage of the producers' execution order that is not
+    current given to ``not_current``), and return the expansion with the explanations it read. A
+    command that lists stages calls it first, so the stages it lists hold the instances."""
     from pivot import status as status_mod
 
     return status_mod.expand_current(
-        get_pipeline(), force=force, allow_missing=allow_missing, fetched=fetched
+        get_pipeline(),
+        force=force,
+        allow_missing=allow_missing,
+        fetched=fetched,
+        restorable=restorable,
+        checks=checks,
+        no_commit=no_commit,
+        not_current=not_current,
     )
 
 
@@ -311,21 +325,26 @@ def resolve_mapped_targets(
     return list(dict.fromkeys(resolved)), shown
 
 
-def run_order(targets: list[str] | None) -> list[str]:
+def run_order(
+    targets: list[str] | None, stages: dict[str, RegistryStageInfo] | None = None
+) -> list[str]:
     """The execution order a ``pivot repro`` of ``targets`` uses before a template expands:
     stages and templates, an instance target standing for its template
-    (``registry.run_target``). A target is a name as a command takes it, bare or qualified."""
+    (``registry.run_target``). A target is a name as a command takes it, bare or qualified.
+    ``stages`` is the run's graph, its own stages and templates; None for every one (a run in
+    leave-out mode leaves some out, ``engine.graph.get_runnable_stages``)."""
     from pivot import registry
     from pivot.engine import graph as engine_graph
 
     pipeline = get_pipeline()
     templates = pipeline.list_templates()
-    # The run's graph: the pipeline's own stages, each template standing for its instances
-    stages = {
-        name: info
-        for name, info in get_graph_stages().items()
-        if name in templates or registry.template_of(name, templates) is None
-    }
+    if stages is None:
+        # The run's graph: the pipeline's own stages, each template standing for its instances
+        stages = {
+            name: info
+            for name, info in get_graph_stages().items()
+            if name in templates or registry.template_of(name, templates) is None
+        }
     named = None
     if targets is not None:
         named = [
@@ -352,24 +371,25 @@ def run_templates(targets: list[str] | None) -> list[str]:
 
 
 def eligible_templates(
-    targets: list[str] | None,
     result: Expansion,
+    order: list[str],
     *,
     force: bool = False,
     allow_uncached_incremental: bool = False,
+    stages: dict[str, RegistryStageInfo] | None = None,
 ) -> list[str]:
-    """The templates a run of ``targets`` expands and can therefore remove an orphan of: those
-    in its ``run_order`` when no global incremental-output refusal stops the run and no template
-    incremental-output refusal stops that template or one it is mapped over. Status and
-    ``repro --dry-run`` use this rule so neither promises a removal a run never reaches."""
-    from pivot.executor import core as executor_core
-
+    """The templates a run whose execution order is ``order`` (``run_order`` of its targets)
+    expands and can therefore remove an orphan of: those in its order when no global
+    incremental-output refusal stops the run and no template incremental-output refusal stops
+    that template or one it is mapped over. Status and ``repro --dry-run`` use this rule so
+    neither promises a removal a run never reaches. ``stages``: the run's graph, which ``order``
+    is over, as ``run_order`` takes it."""
     pipeline = get_pipeline()
-    order = run_order(targets)
     templates = set(pipeline.list_templates())
-    stages = get_graph_stages()
+    if stages is None:
+        stages = get_graph_stages()
     static = [name for name in order if name not in templates]
-    if executor_core.incremental_refusal(
+    if incremental_checks.incremental_refusal(
         static,
         {name: stages[name] for name in static},
         allow_uncached_incremental=allow_uncached_incremental,
@@ -380,7 +400,7 @@ def eligible_templates(
     for name in (name for name in order if name in templates):
         upstream = {dep for dep in pipeline.get_template(name)["mapped_deps"].values() if dep}
         instances = {stage: pipeline.get_stage(stage) for stage in result["expanded"].get(name, [])}
-        if upstream & refused or executor_core.incremental_refusal(
+        if upstream & refused or incremental_checks.incremental_refusal(
             list(instances),
             instances,
             allow_uncached_incremental=allow_uncached_incremental,

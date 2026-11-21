@@ -1791,8 +1791,9 @@ def _keep_reason(
 ) -> _KeepReason | None:
     """Why this object stays, or None when no record and no rule holds it.
 
-    ``st_ctime`` is the publication time: ``copy_to_cache`` copies with ``shutil.copy2``, so
-    an object's mtime is its source file's and can be arbitrarily older (``storage/cache.py``).
+    ``st_ctime`` is the publication time: ``copy_to_cache`` copies its source's times, as
+    ``shutil.copy2`` does, so an object's mtime is its source file's and can be arbitrarily
+    older (``storage/cache.py``).
     A directory's ``st_nlink`` counts its subdirectories, so the hardlink rule is for files.
     """
     if key in roots["named"]:

@@ -1,5 +1,6 @@
 import os
 import pathlib
+from collections.abc import Collection
 from difflib import get_close_matches
 from typing import ClassVar, override
 
@@ -78,13 +79,18 @@ class CyclicGraphError(DAGError):
 
 
 class DependencyNotFoundError(DAGError):
-    """Raised when a dependency doesn't exist."""
+    """Raised when a dependency doesn't exist.
+
+    With ``directory``, the dependency is an existing directory that holds the missing tracked
+    file ``input_path``."""
 
     _stage: str
     _dep: str
     _available: list[str]
     _input_path: pathlib.Path | None
     _input_path_display: str | None
+    _directory: pathlib.Path | None
+    _directory_display: str | None
 
     def __init__(
         self,
@@ -93,12 +99,16 @@ class DependencyNotFoundError(DAGError):
         available_outputs: list[str] | None = None,
         input_path: pathlib.Path | None = None,
         input_path_display: str | None = None,
+        directory: pathlib.Path | None = None,
+        directory_display: str | None = None,
     ) -> None:
         self._stage = stage
         self._dep = dep
         self._available = available_outputs or []
         self._input_path = input_path
         self._input_path_display = input_path_display
+        self._directory = directory
+        self._directory_display = directory_display
         if input_path is None:
             message = (
                 f"Stage '{stage}' depends on '{dep}' which is not produced by any stage "
@@ -106,10 +116,17 @@ class DependencyNotFoundError(DAGError):
             )
         else:
             display_path = input_path_display or str(input_path)
-            message = (
-                f"Stage '{stage}' depends on input '{dep}' (path {display_path}), "
-                + "which does not exist"
-            )
+            if directory is None:
+                message = (
+                    f"Stage '{stage}' depends on input '{dep}' (path {display_path}), "
+                    + "which does not exist"
+                )
+            else:
+                message = (
+                    f"Stage '{stage}' depends on directory '{dep}' "
+                    + f"(path {directory_display or directory}), which holds tracked file "
+                    + f"'{display_path}' that does not exist"
+                )
         super().__init__(message)
 
     @property
@@ -118,8 +135,15 @@ class DependencyNotFoundError(DAGError):
 
     @property
     def input_path(self) -> pathlib.Path | None:
-        """The missing input's filesystem path; None for a missing stage output."""
+        """The missing input's filesystem path; None for a missing stage output. For a
+        dependency on a directory that holds a missing tracked file, that file's path."""
         return self._input_path
+
+    @property
+    def directory(self) -> pathlib.Path | None:
+        """The path of the directory dependency that holds the missing tracked file
+        ``input_path``; None for a dependency that is missing itself."""
+        return self._directory
 
     @override
     def format_user_message(self) -> str:
@@ -135,10 +159,29 @@ class DependencyNotFoundError(DAGError):
     @override
     def __reduce__(
         self,
-    ) -> tuple[type, tuple[str, str, list[str], pathlib.Path | None, str | None]]:
+    ) -> tuple[
+        type,
+        tuple[
+            str,
+            str,
+            list[str],
+            pathlib.Path | None,
+            str | None,
+            pathlib.Path | None,
+            str | None,
+        ],
+    ]:
         return (
             self.__class__,
-            (self._stage, self._dep, self._available, self._input_path, self._input_path_display),
+            (
+                self._stage,
+                self._dep,
+                self._available,
+                self._input_path,
+                self._input_path_display,
+                self._directory,
+                self._directory_display,
+            ),
         )
 
 
@@ -211,6 +254,30 @@ class StageNotFoundError(DAGError):
         return (self.__class__, (self._unknown, self._available))
 
 
+class TargetsLeftOutError(DAGError):
+    """Raised after a run across all pipelines that keeps going past failures
+    (``repro --all --keep-going``) left out named targets: each one's stage, or a stage upstream
+    of it, has a missing input. ``causes`` maps each target, as given, to that input's error. The
+    run ran every other target first."""
+
+    _causes: dict[str, DependencyNotFoundError]
+
+    def __init__(self, causes: dict[str, DependencyNotFoundError]) -> None:
+        self._causes = causes
+        noun = "target" if len(causes) == 1 else "targets"
+        lines = [f"The run left out {len(causes)} {noun} for a missing input:"]
+        lines.extend(f"  - {target}: {cause}" for target, cause in causes.items())
+        super().__init__("\n".join(lines))
+
+    @override
+    def get_suggestion(self) -> str:
+        return "Ensure each missing file exists or is produced by another stage, then run again"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[dict[str, DependencyNotFoundError]]]:
+        return (self.__class__, (self._causes,))
+
+
 class PivotDBWriteTimeoutError(PivotError):
     """Raised when a StateDB write lock cannot be acquired in time."""
 
@@ -260,6 +327,32 @@ class UnreadableLinkError(CacheError):
     @override
     def __reduce__(self) -> tuple[type, tuple[str, str]]:
         return (self.__class__, (self.path, self.reason))
+
+
+class NotAFileError(OSError):
+    """A path Pivot reads as a file holds something else, symlinks followed: a FIFO, a socket or
+    a device, which Pivot never reads (the rule ``storage.regular_file.open_regular_file``
+    states). ``kind`` names what is there ("a FIFO", ``storage.regular_file.entry_kind``). A
+    directory raises ``IsADirectoryError`` instead, as ``open`` does.
+
+    It is an OSError, so every caller that handles a file it cannot read handles this one: a
+    dependency is unreadable, an output differs from its lock. It carries no error number, and
+    its text is ``Is <kind>, not a regular file: <path>``.
+    """
+
+    kind: str
+
+    def __init__(self, path: str, kind: str) -> None:
+        self.kind = kind
+        super().__init__(None, f"Is {kind}, not a regular file", path)
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.strerror}: {_path_text(self.filename)}"
+
+    @override
+    def __reduce__(self) -> tuple[type, tuple[str, str]]:
+        return (self.__class__, (self.filename, self.kind))
 
 
 class UncachedIncrementalOutputError(CacheError):
@@ -320,6 +413,21 @@ class CorruptListingError(CacheError):
         return f"`pivot pull` fetches the cache's copy of a listing a remote holds. {self.REMEDY}"
 
 
+class ListingUnavailableError(CorruptListingError):
+    """A directory's listing is unavailable, though a cache was read for it: the committed
+    listing file is refused (stale, empty or unreadable) and the cache holds no copy of it to
+    fall back on (the listing is lost, as in a fresh clone), or the cache's listing object
+    cannot be read (``__cause__`` is the ``OSError``). ``storage.listing`` raises it at those two
+    sites alone, with the message a ``CorruptListingError`` gave there in 0.10.4. A read with no
+    cache raises the committed file's own refusal, and a prefix directory of the cache that
+    cannot be searched raises its ``OSError``, as in 0.10.4. A restore in leave-out mode leaves
+    such a directory missing (``executor.tracked_restore``); every other reader takes it as any
+    ``CorruptListingError``: every handler of that class catches it, and the plain CLI prints
+    only its message. Only ``repro --tui``'s shutdown text, which names the error's class
+    (``cli._run_common.run_tui_with_engine``), shows ``ListingUnavailableError`` where 0.10.4
+    showed ``CorruptListingError``."""
+
+
 class ListingMissingError(CacheError):
     """Neither the committed listing file nor the cache holds a directory's listing."""
 
@@ -344,39 +452,83 @@ class PlotsError(PivotError):
 
 
 class TrackedFileMissingError(CacheError):
-    """Raised when .pvt tracked files are missing (user should run pivot checkout)."""
+    """Raised when .pvt tracked files are missing (user should run pivot checkout).
+
+    ``overlaps`` maps a missing file to how it overlaps a stage output
+    (``ownership.tracked_output_refusal``). Such a file stops a run even when the run tolerates
+    missing files (``executor.core.verify_tracked_files``'s ``tolerate_missing``).
+    ``restore_failed`` holds missing files whose ``--checkout-missing`` restore failed, with a
+    ``Cannot restore`` warning naming why (``executor.tracked_restore``); the error keeps those
+    it lists and says so for each, not that the local cache lacks it."""
 
     _missing: list[str]
     _checkout_attempted: bool
+    _overlaps: dict[str, str]
+    _restore_failed: list[str]
+    _every_restore_failed: bool
 
-    def __init__(self, missing_files: list[str], checkout_attempted: bool = False) -> None:
+    def __init__(
+        self,
+        missing_files: list[str],
+        checkout_attempted: bool = False,
+        overlaps: dict[str, str] | None = None,
+        restore_failed: Collection[str] | None = None,
+    ) -> None:
         self._missing = missing_files
         self._checkout_attempted = checkout_attempted
+        # None: no listed file overlaps a stage output
+        self._overlaps = {} if overlaps is None else overlaps
+        # None: no file's restore failed
+        failed = frozenset[str]() if restore_failed is None else frozenset(restore_failed)
+        self._restore_failed = [path for path in missing_files if path in failed]
+        # Each listed file's restore failed: none is one the local cache lacks
+        self._every_restore_failed = 0 < len(self._restore_failed) == len(missing_files)
         super().__init__(self._format_message())
 
     def _format_message(self) -> str:
-        missing_list = "\n".join(f"  - {p}" for p in self._missing)
-        if self._checkout_attempted:
-            return (
-                f"The following tracked files are missing:\n{missing_list}\n\n"
-                + "These files are not in local cache."
+        failed = set(self._restore_failed)
+        lines = list[str]()
+        for path in self._missing:
+            notes = [self._overlaps[path]] if path in self._overlaps else []
+            if path in failed:
+                notes.append("its restore failed")
+            lines.append(f"  - {path}: {'; '.join(notes)}" if notes else f"  - {path}")
+        if not self._checkout_attempted:
+            reason = "These files are tracked by Pivot but don't exist on disk."
+        elif not failed:
+            reason = "These files are not in local cache."
+        elif self._every_restore_failed:
+            reason = "Their restore failed: a 'Cannot restore' warning above names each cause."
+        else:
+            reason = (
+                "A 'Cannot restore' warning above names the cause of each restore that failed. "
+                + "The other files are not in local cache."
             )
-        return (
-            f"The following tracked files are missing:\n{missing_list}\n\n"
-            + "These files are tracked by Pivot but don't exist on disk."
-        )
+        missing_list = "\n".join(lines)
+        message = f"The following tracked files are missing:\n{missing_list}\n\n{reason}"
+        if self._overlaps:
+            message += (
+                "\nPivot does not run a stage whose output overlaps a file above. "
+                + "That stage replaces its output when it runs."
+            )
+        return message
 
     @override
     def get_suggestion(self) -> str:
         if self._checkout_attempted:
+            if self._every_restore_failed:
+                return "Fix what each 'Cannot restore' warning above names, then run again"
             return "Run 'pivot pull' to fetch from remote storage"
         if len(self._missing) == 1:
             return f"Run 'pivot checkout {self._missing[0]}' to restore, or 'pivot checkout --only-missing' to restore all missing files"
         return "Run 'pivot checkout --only-missing' to restore missing files, or 'pivot run --checkout-missing' to restore and run"
 
     @override
-    def __reduce__(self) -> tuple[type, tuple[list[str], bool]]:
-        return (self.__class__, (self._missing, self._checkout_attempted))
+    def __reduce__(self) -> tuple[type, tuple[list[str], bool, dict[str, str], list[str]]]:
+        return (
+            self.__class__,
+            (self._missing, self._checkout_attempted, self._overlaps, self._restore_failed),
+        )
 
 
 class GetError(PivotError):

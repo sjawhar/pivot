@@ -22,6 +22,7 @@ import yaml
 from pivot import cli
 from pivot.storage import track
 from pivot.types import TrackedFileStatus
+from tests import helpers
 from tests.conftest import isolated_pivot_dir
 
 if TYPE_CHECKING:
@@ -169,7 +170,20 @@ def test_status_lists_a_missing_file_tracked_inside_another_pipelines_output(
         ), "status must list the tracked file inside b's output as missing"
 
 
-@_LOADS_B
+_REPRO_LOADS_B = pytest.mark.parametrize(
+    ("root_after_track", "flags"),
+    [
+        pytest.param(_ROOT_PIPELINE, ["--all"], id="all-pipelines"),
+        pytest.param(_ROOT_PIPELINE_INCLUDING_B, [], id="root-includes-b"),
+        # Leave-out mode: the missing file is inside b's output, so it still stops the run
+        pytest.param(_ROOT_PIPELINE, ["--all", "--keep-going"], id="all-pipelines-keep-going"),
+        # Without --all, --keep-going stops on any missing tracked file (R6)
+        pytest.param(_ROOT_PIPELINE_INCLUDING_B, ["--keep-going"], id="root-includes-b-keep-going"),
+    ],
+)
+
+
+@_REPRO_LOADS_B
 def test_repro_refuses_a_missing_file_tracked_inside_another_pipelines_output(
     runner: click.testing.CliRunner,
     tmp_path: pathlib.Path,
@@ -185,6 +199,89 @@ def test_repro_refuses_a_missing_file_tracked_inside_another_pipelines_output(
         assert repro.exit_code != 0, f"repro must refuse a missing tracked file:\n{repro.output}"
         assert "The following tracked files are missing" in repro.output, repro.output
         assert "data/b/tree/f.txt" in repro.output, repro.output
+        assert track.get_pvt_path(tracked).is_file(), "the refused run keeps the sidecar"
+        assert not (cwd / "data" / "a" / "alive.txt").exists(), "no stage runs"
+
+
+# helpers.PRODUCER_PIPELINE with p/cut, mapped over p/plan's files: instance p/cut@<key> writes
+# the directory data/p/cut@<key>/
+_MAPPED_DIRECTORY_PIPELINE = """\
+from typing import Annotated
+
+from pivot import Pipeline, directory, stage
+
+
+@stage
+def plan() -> Annotated[dict[str, str], directory]:
+    return {"a.txt": "a", "b.txt": "b"}
+
+
+@stage
+def cut(entry: str) -> Annotated[dict[str, str], directory]:
+    return {"g.txt": entry}
+
+
+with Pipeline("p") as pipeline:
+    cut(pipeline.map(plan()))
+"""
+
+
+@pytest.mark.parametrize(
+    ("mapped_pipeline", "tracked_path", "overlap"),
+    [
+        pytest.param(
+            _MAPPED_DIRECTORY_PIPELINE,
+            "data/p/cut@a/f.txt",
+            "it is inside output 'data/p/cut@a' of stage 'p/cut@a'",
+            id="inside-an-instance-directory",
+        ),
+        pytest.param(
+            helpers.MAPPED_FILE_PIPELINE,
+            "data/p/cut@a.txt",
+            "it is output 'data/p/cut@a.txt' of stage 'p/cut@a'",
+            id="an-instance-file",
+        ),
+    ],
+)
+def test_repro_keep_going_fails_a_mapped_stage_over_a_missing_file_tracked_inside_its_output(
+    runner: click.testing.CliRunner,
+    tmp_path: pathlib.Path,
+    mapped_pipeline: str,
+    tracked_path: str,
+    overlap: str,
+) -> None:
+    """R3 for instances: under `repro --all --keep-going`, a missing tracked file that an
+    instance's output would hold or be fails the mapped stage with the overlap, before it adds
+    any instance. The producer is current, so no stage runs, and the sidecar stays.
+
+    The file is tracked before p/cut is declared: `pivot track` refuses a path inside an output
+    the pipeline declares, as `_helper_missing_file_inside_b` says.
+    """
+    with isolated_pivot_dir(runner, tmp_path) as cwd:
+        _helper_write(cwd / "pipeline.py", helpers.PRODUCER_PIPELINE)
+        _helper_ok(runner, "repro")
+        tracked = cwd / tracked_path
+        _helper_write(tracked, "tracked bytes")
+        track_output = _helper_ok(runner, "track", tracked_path)
+        assert f"Tracked: {tracked_path}" in track_output, track_output
+        tracked.unlink()
+        _helper_write(cwd / "pipeline.py", mapped_pipeline)
+
+        repro = runner.invoke(cli.cli, ["repro", "--all", "--keep-going", "--jsonl"])
+
+        assert repro.exit_code == 1, repro.output
+        events = [json.loads(line) for line in repro.stdout.splitlines()]
+        assert helpers.stage_statuses(repro.stdout) == {
+            "p/plan": "cached",
+            "p/cut": "failed",
+        }, repro.output
+        reason = helpers.completed_stages(repro.stdout)["p/cut"]["reason"]
+        assert isinstance(reason, str)
+        assert "The following tracked files are missing:" in reason, reason
+        assert f"{tracked_path}: {overlap}" in reason, reason
+        assert not [event for event in events if event["type"] == "stages_expanded"]
+        assert not (cwd / "data" / "p" / "cut@b").exists(), "no instance runs"
+        assert not (cwd / "data" / "p" / "cut@b.txt").exists(), "no instance runs"
         assert track.get_pvt_path(tracked).is_file(), "the refused run keeps the sidecar"
 
 

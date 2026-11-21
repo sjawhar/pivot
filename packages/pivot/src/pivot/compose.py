@@ -1373,18 +1373,22 @@ class Pipeline:
                 msg += f"  {err}\n"
             raise exceptions.StageDefinitionError(msg)
 
+    def _foreign_reads(self, node: _StageNode) -> list[tuple[Pipeline, _StageNode]]:
+        """The stages of other pipelines that ``node`` reads, in ``_iter_stage_handles`` order
+        (single-handle inputs, then list inputs)."""
+        reads = list[tuple[Pipeline, _StageNode]]()
+        for handle in _iter_stage_handles(node):
+            if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+                assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
+                reads.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+        return reads
+
     def _upstream_closure(self) -> list[tuple[Pipeline, _StageNode]]:
         """Collect foreign stages reachable from this pipeline's handles via DFS."""
         visited = set[int]()
         result = list[tuple[Pipeline, _StageNode]]()
-        stack = list[tuple[Pipeline, _StageNode]]()
-
-        for node in self._stages:
-            for handle in _iter_stage_handles(node):
-                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
-                    stack.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+        stack = [read for node in self._stages for read in self._foreign_reads(node)]
 
         while stack:
             foreign_pipeline, stage_node = stack.pop()
@@ -1393,12 +1397,7 @@ class Pipeline:
                 continue
             visited.add(node_id)
             result.append((foreign_pipeline, stage_node))
-
-            for handle in _iter_stage_handles(stage_node):
-                if handle._pipeline is not self:  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    source = handle._source  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
-                    assert isinstance(source, _StageNode)  # guaranteed by _iter_stage_handles
-                    stack.append((handle._pipeline, source))  # pyright: ignore[reportPrivateUsage] - compose owns ArtifactHandle
+            stack.extend(self._foreign_reads(stage_node))
 
         return result
 

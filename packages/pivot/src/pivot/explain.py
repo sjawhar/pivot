@@ -27,7 +27,7 @@ from pivot.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Collection, Iterable, Mapping
     from pathlib import Path
 
     import pygtrie
@@ -162,16 +162,19 @@ def _find_tracked_ancestor(dep: Path, tracked_trie: pygtrie.Trie[str]) -> Path |
     return None
 
 
-def _find_tracked_hash(
+def find_tracked_hash(
     dep: Path,
-    tracked_files: dict[str, track.PvtData],
+    tracked_files: Mapping[str, track.PvtData],
     tracked_trie: pygtrie.Trie[str],
     cache_dir: pathlib.Path | None,
 ) -> HashInfo | None:
     """Find hash for dep from tracked files data.
 
     Returns HashInfo if dep is tracked (exact match or inside tracked directory, found in its
-    listing), None otherwise.
+    listing), None otherwise. ``tracked_trie`` keys each path of ``tracked_files`` by its
+    ``Path.parts``. A missing dependency's explanation takes its hash from here
+    (``get_stage_explanation``), and the dry run's notice of a restore it cannot follow asks the
+    same, with the same store and cache (``status.restore_limits``).
     """
     tracked_path = _find_tracked_ancestor(dep, tracked_trie)
     if not tracked_path:
@@ -217,6 +220,7 @@ def get_stage_explanation(
     producer_hashes: dict[ArtifactIdentity, HashInfo] | None = None,
     file_hash_entries: list[FileHashEntry] | None = None,
     unreadable_listings: Mapping[ArtifactIdentity, str] | None = None,
+    assume_restored: Collection[ArtifactIdentity] = (),
 ) -> StageExplanation:
     """Compute detailed explanation of why a stage would run.
 
@@ -230,6 +234,19 @@ def get_stage_explanation(
     The explanation reads the state database and writes nothing. ``file_hash_entries``, when
     given, receives the file-hash entry of every file whose content it read, for the caller to
     save with ``state.save_file_hashes``.
+
+    ``tracked_files`` (with ``tracked_trie``, keyed by their paths' parts) gives a missing
+    dependency the hash of the ``.pvt`` that tracks it. With ``allow_missing`` they hold every
+    tracked file, and a missing dependency none of them tracks takes the lock's hash. Without it
+    they hold the missing tracked files that the restore brings back (a dry run with
+    ``--checkout-missing``), whose ``.pvt`` hash the restore gives back, and a dependency none
+    of them tracks stays missing: the lock's own hash would compare with itself and call an
+    input the restore changes unchanged.
+
+    ``assume_restored`` names dependencies taken as if a restore brought each back to what the
+    stage last read (the dry run's notice, ``status.restore_limits``): each one ``lock_data``
+    records takes the lock's hash, and the disk is not read for it; one it does not record is
+    hashed from the disk as always, as is every other input.
     """
     if lock_data is None:
         return StageExplanation(
@@ -275,6 +292,13 @@ def get_stage_explanation(
 
     with state.open_readonly(state_dir, create=False) as state_db:
         known_hashes = producer_hashes or {}
+        if assume_restored:
+            # A dependency the lock does not record is hashed as always: it changes the stage
+            recorded = lock_data["dep_hashes"]
+            known_hashes = {
+                **known_hashes,
+                **{key: recorded[key] for key in assume_restored if key in recorded},
+            }
         pending_deps = {name: ref for name, ref in deps.items() if ref.identity not in known_hashes}
         str_hashes, missing_deps, unreadable_deps, dep_entries = worker.hash_dependencies(
             pending_deps,
@@ -288,7 +312,7 @@ def get_stage_explanation(
             if ref.identity in known_hashes:
                 dep_hashes[ref.identity] = known_hashes[ref.identity]
 
-        if allow_missing:
+        if allow_missing or tracked_files is not None:
             unresolved = list[str]()
             for dep_key in missing_deps:
                 ref = next(
@@ -297,7 +321,7 @@ def get_stage_explanation(
                 tracked_hash = None
                 if tracked_files is not None and tracked_trie is not None:
                     dep_path = project.normalize_path(store.checkout(ref))
-                    tracked_hash = _find_tracked_hash(
+                    tracked_hash = find_tracked_hash(
                         dep_path, tracked_files, tracked_trie, store.cache_dir
                     )
                     if tracked_hash is not None and types.is_dir_hash(tracked_hash):
@@ -319,11 +343,12 @@ def get_stage_explanation(
                                     track.tracked_members, dep_path, pvt_data, store.cache_dir
                                 ),
                             )
-                fallback_hash = tracked_hash or lock_data["dep_hashes"].get(ref.identity)
-                if fallback_hash is None:
+                if tracked_hash is None and allow_missing:
+                    tracked_hash = lock_data["dep_hashes"].get(ref.identity)
+                if tracked_hash is None:
                     unresolved.append(dep_key)
                 else:
-                    dep_hashes[ref.identity] = fallback_hash
+                    dep_hashes[ref.identity] = tracked_hash
             missing_deps = unresolved
 
         if missing_deps or unreadable_deps:

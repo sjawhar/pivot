@@ -15,9 +15,7 @@ import os
 import pathlib
 import random
 import shutil
-import socket
 import stat
-import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -27,6 +25,7 @@ from pivot import config, exceptions, project
 from pivot.config import io as config_io
 from pivot.executor import core as executor_core
 from pivot.storage import cache, mounts, state, track
+from tests import helpers
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -317,33 +316,6 @@ def test_state_directory_with_a_nul_byte_means_a_full_listing_not_an_error(
     _helper_assert_matches_main(_helper_preflight(memo_project), memo_project)
 
 
-def _helper_run_without_waiting(
-    call: Callable[[], dict[str, track.PvtData]], release: Callable[[], None]
-) -> dict[str, track.PvtData]:
-    """Run ``call`` in a thread and return its result. When it is still running after
-    ``_NO_WAIT_S``, ``release`` frees what it waits on, and the test fails."""
-    outcome = list[dict[str, track.PvtData] | BaseException]()
-
-    def _run() -> None:
-        try:
-            outcome.append(call())
-        except BaseException as error:  # re-raised in the test's thread below
-            outcome.append(error)
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    thread.join(_NO_WAIT_S)
-    waited = thread.is_alive()
-    if waited:
-        release()
-        thread.join()
-    assert not waited, f"the walk waited more than {_NO_WAIT_S} s"
-    (result,) = outcome
-    if isinstance(result, BaseException):
-        raise result
-    return result
-
-
 def test_preflight_does_not_wait_while_another_preflight_writes_the_memo(
     memo_project: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -357,9 +329,10 @@ def test_preflight_does_not_wait_while_another_preflight_writes_the_memo(
 
     with track._memo_path().open("rb") as other:
         fcntl.flock(other.fileno(), fcntl.LOCK_EX)
-        found = _helper_run_without_waiting(
+        found = helpers.call_without_waiting(
             lambda: _helper_preflight(memo_project),
             lambda: fcntl.flock(other.fileno(), fcntl.LOCK_UN),
+            timeout=_NO_WAIT_S,
         )
 
     _helper_assert_matches_main(found, memo_project)
@@ -1991,50 +1964,30 @@ def test_fifo_at_the_memo_path_is_not_waited_on(
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     fifo = track._memo_path()
-    os.mkfifo(fifo, 0o600)
+    helpers.occupy(fifo, "fifo")
 
-    def _release() -> None:
-        with fifo.open("wb"):
-            pass
-
-    found = _helper_run_without_waiting(lambda: track.discover_pvt_files(memo_project), _release)
-    recorded = _helper_run_without_waiting(lambda: _helper_preflight(memo_project), _release)
+    found = helpers.call_without_waiting(
+        lambda: track.discover_pvt_files(memo_project),
+        lambda: helpers.free_fifo(fifo),
+        timeout=_NO_WAIT_S,
+    )
+    recorded = helpers.call_without_waiting(
+        lambda: _helper_preflight(memo_project),
+        lambda: helpers.free_fifo(fifo),
+        timeout=_NO_WAIT_S,
+    )
 
     _helper_assert_matches_main(found, memo_project)
     _helper_assert_matches_main(recorded, memo_project)
     assert stat.S_ISFIFO(os.lstat(fifo).st_mode), "nothing replaced it"
 
 
-def _helper_fifo(path: pathlib.Path, _patch: pytest.MonkeyPatch) -> Callable[[], None]:
-    os.mkfifo(path, 0o600)
-
-    def _release() -> None:  # frees a walk that waits on it, so the test fails instead of hanging
-        with path.open("wb"):
-            pass
-
-    return _release
-
-
-def _helper_directory(path: pathlib.Path, _patch: pytest.MonkeyPatch) -> Callable[[], None]:
-    path.mkdir(mode=0o700)
-    return lambda: None
-
-
-def _helper_socket(path: pathlib.Path, patch: pytest.MonkeyPatch) -> Callable[[], None]:
-    """A Unix socket file, bound by its short relative name (the absolute path may pass the
-    108-byte limit of a socket address); the file stays after the socket is closed."""
-    patch.chdir(path.parent)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as bound:
-        bound.bind(path.name)
-    return lambda: None
-
-
 @pytest.mark.parametrize(
-    ("make", "read_only_reason"),
+    ("kind", "read_only_reason"),
     [
-        pytest.param(_helper_fifo, "is not a regular file (prw-------)", id="fifo"),
-        pytest.param(_helper_directory, "is not a regular file (drwx------)", id="directory"),
-        pytest.param(_helper_socket, "No such device or address", id="socket"),
+        pytest.param("fifo", "is not a regular file (prw-------)", id="fifo"),
+        pytest.param("directory", "is not a regular file (drwx------)", id="directory"),
+        pytest.param("socket", "No such device or address", id="socket"),
     ],
 )
 def test_memo_path_that_is_no_regular_file_is_refused(
@@ -2042,7 +1995,7 @@ def test_memo_path_that_is_no_regular_file_is_refused(
     monkeypatch: pytest.MonkeyPatch,
     mocker: MockerFixture,
     caplog: pytest.LogCaptureFixture,
-    make: Callable[[pathlib.Path, pytest.MonkeyPatch], Callable[[], None]],
+    kind: str,
     read_only_reason: str,
 ) -> None:
     """The memo must be a regular file: a FIFO or a directory at its path is refused for that
@@ -2051,24 +2004,32 @@ def test_memo_path_that_is_no_regular_file_is_refused(
     _helper_build_tree(memo_project)
     _helper_settle(monkeypatch)
     path = track._memo_path()
-    release = make(path, monkeypatch)
-    kind = stat.S_IFMT(os.lstat(path).st_mode)
+    helpers.occupy(path, kind)
+    made = stat.S_IFMT(os.lstat(path).st_mode)
     directories = len(_helper_directories(memo_project))
     caplog.set_level(logging.DEBUG, logger=track.logger.name)
 
     listed = mocker.spy(os, "scandir")
-    found = _helper_run_without_waiting(lambda: track.discover_pvt_files(memo_project), release)
+    found = helpers.call_without_waiting(
+        lambda: track.discover_pvt_files(memo_project),
+        lambda: helpers.free_fifo(path),
+        timeout=_NO_WAIT_S,
+    )
     read_only_listings = listed.call_count
     read_only_log = caplog.text
     listed.reset_mock()
-    recorded = _helper_run_without_waiting(lambda: _helper_preflight(memo_project), release)
+    recorded = helpers.call_without_waiting(
+        lambda: _helper_preflight(memo_project),
+        lambda: helpers.free_fifo(path),
+        timeout=_NO_WAIT_S,
+    )
     preflight_listings = listed.call_count
 
     assert read_only_reason in read_only_log
     assert (read_only_listings, preflight_listings) == (directories, directories)
     _helper_assert_matches_main(found, memo_project)
     _helper_assert_matches_main(recorded, memo_project)
-    assert stat.S_IFMT(os.lstat(path).st_mode) == kind, "nothing replaced it"
+    assert stat.S_IFMT(os.lstat(path).st_mode) == made, "nothing replaced it"
 
 
 def test_memo_file_content_round_trips_and_rejects_a_partial_memo() -> None:

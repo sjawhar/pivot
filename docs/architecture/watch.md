@@ -133,7 +133,9 @@ Note: JsonlSink renames the engine's `stage_started` and `stage_completed` to th
 When Python files change, `WorkerPool.restart()` replaces the workers, starting the reloaded
 run's width of fresh workers together (see [Pool Size](execution.md#pool-size)). Across all
 pipelines with `--keep-going`, the reload re-runs only the stages a missing dependency leaves
-runnable:
+runnable. A missing tracked file still stops the re-run: a watch session is never in leave-out
+mode, so the re-run's pre-flight raises `TrackedFileMissingError` before any stage runs (see
+[Missing inputs](execution.md#missing-inputs)).
 
 **Why restart instead of hot reload?**
 

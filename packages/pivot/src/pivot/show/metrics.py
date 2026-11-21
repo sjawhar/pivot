@@ -13,7 +13,7 @@ import yaml
 
 from pivot import config, git, project, types, yaml_config
 from pivot.show import common
-from pivot.storage import cache
+from pivot.storage import cache, regular_file
 from pivot.types import ChangeType, MetricData, MetricValue, OutputFormat
 
 if TYPE_CHECKING:
@@ -39,7 +39,10 @@ class MetricsError(Exception):
 
 
 def parse_metric_file(path: pathlib.Path) -> MetricData:
-    """Parse metric file, auto-detecting format by extension. Returns flattened dict."""
+    """Parse metric file, auto-detecting format by extension. Returns flattened dict.
+
+    The file is opened by ``regular_file.open_text``, so a FIFO, a socket or a device at
+    ``path`` is a ``MetricsError`` (the rule ``regular_file.open_regular_file`` states)."""
     suffix = path.suffix.lower()
     if suffix not in _METRIC_EXTENSIONS:
         raise MetricsError(f"Unsupported metric file format: {suffix}")
@@ -64,14 +67,14 @@ def _validate_and_flatten(data: object, format_name: str) -> MetricData:
 
 def _parse_json(path: pathlib.Path) -> MetricData:
     """Parse JSON file and flatten nested dicts."""
-    with open(path) as f:
+    with regular_file.open_text(path) as f:
         data = json.load(f)
     return _validate_and_flatten(data, "JSON")
 
 
 def _parse_yaml(path: pathlib.Path) -> MetricData:
     """Parse YAML file and flatten nested dicts."""
-    with open(path) as f:
+    with regular_file.open_text(path) as f:
         data: object = yaml.load(f, Loader=yaml_config.Loader)
     return _validate_and_flatten(data, "YAML")
 
@@ -79,7 +82,7 @@ def _parse_yaml(path: pathlib.Path) -> MetricData:
 def _parse_csv(path: pathlib.Path) -> MetricData:
     """Parse CSV file (first column = key, second = value)."""
     result = dict[str, MetricValue]()
-    with open(path, newline="") as f:
+    with regular_file.open_text(path, newline="") as f:
         reader = csv.reader(f)
         for line_num, row in enumerate(reader, start=1):
             if len(row) == 0:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import collections
 import sys
+from typing import TYPE_CHECKING, NamedTuple
 
 import click
 import tqdm
@@ -28,6 +30,58 @@ from pivot.types import (
     TrackedFileStatus,
     dep_change_to_json,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+
+NOT_EXPANDED_ROW = console.ExplainRowKind("NOT YET EXPANDED", "cyan", "not yet expanded")
+"""A mapped stage (``Pipeline.map``) not yet expanded, with what it waits for."""
+REFUSED_ROW = console.ExplainRowKind("WILL FAIL", "red", "will fail")
+"""A mapped stage the run refuses to expand: it fails the stage with the reason and runs none
+of its instances."""
+BLOCKED_ROW = console.ExplainRowKind("WILL BE BLOCKED", "red", "will be blocked")
+"""A mapped stage mapped over the instances of one the run refuses, directly or through other
+mapped stages: the run blocks it."""
+ORPHANED_ROW = console.ExplainRowKind("ORPHANED (WILL BE REMOVED)", "red", "orphaned")
+"""An instance of a mapped stage whose key left its producer's listing: the run that expands
+the mapped stage removes it."""
+
+
+class DryRunShown(NamedTuple):
+    """How ``pivot repro --dry-run`` lists a row of one kind among its stages."""
+
+    would_run: bool
+    """The row's ``would_run`` in the JSON document."""
+    words: str
+    """What the row's line of text says the run would do."""
+
+
+DRY_RUN_SHOWN = {
+    NOT_EXPANDED_ROW: DryRunShown(would_run=True, words="would expand"),
+    REFUSED_ROW: DryRunShown(would_run=False, words="would fail"),
+    BLOCKED_ROW: DryRunShown(would_run=False, words="would be blocked"),
+}
+"""Each kind of row that ``pivot repro --dry-run`` lists among its stages, in the order it lists
+them, which is the order ``--explain`` shows the same rows in too (``Explained.rows``), with how
+the dry run lists that kind: the run expands a mapped stage not yet expanded once its producer is
+current and runs its instances (``NOT_EXPANDED_ROW``), fails one it refuses to expand and runs
+none of its instances (``REFUSED_ROW``), and blocks one behind a refused one (``BLOCKED_ROW``)."""
+
+
+class Explained(NamedTuple):
+    """What ``pivot repro --explain`` and ``--dry-run`` show (``cli/repro.py``
+    ``_get_explanations``; in leave-out mode, ``cli/leave_out_dry_run.py`` ``explanations``)."""
+
+    explanations: list[StageExplanation]
+    rows: list[console.ExplainRow]
+    """A row for each mapped stage shown that does not expand: in leave-out mode, of the kinds
+    ``leave_out_dry_run._explain_rows`` gives; otherwise ``NOT_EXPANDED_ROW`` for every row, as
+    0.10.4 shows them."""
+    orphans: dict[str, str]
+    """Each orphaned instance the run would remove, mapped to its mapped stage."""
+    left_out_targets: dict[str, exceptions.DependencyNotFoundError]
+    """Each target the run leaves out (leave-out mode), as given, with its cause."""
 
 
 @cli_decorators.pivot_command(allow_all=True)
@@ -78,7 +132,7 @@ def status(
 
     # Mapped stages expand first, as a run would expand them, so the stages shown hold their
     # instances and a target may name a mapped stage or one of its instances.
-    expansion_result = expansion.Expansion(expanded={}, not_expanded={}, listings={})
+    expansion_result = expansion.empty_expansion()
     known = dict[str, StageExplanation]()
     shown_templates: list[str] | None = None
     given_targets = stages_list
@@ -131,7 +185,9 @@ def status(
             status_mod.orphaned_instances(
                 pipeline,
                 expansion_result,
-                cli_helpers.eligible_templates(given_targets, expansion_result),
+                cli_helpers.eligible_templates(
+                    expansion_result, cli_helpers.run_order(given_targets)
+                ),
             ),
         )
 
@@ -269,8 +325,16 @@ def status(
                 remote_status,
                 suggestions,
                 show_tracked,
-                not_expanded=not_expanded,
-                orphaned=orphaned,
+                rows=[
+                    *(
+                        console.ExplainRow(NOT_EXPANDED_ROW, row["name"], row["reason"])
+                        for row in not_expanded
+                    ),
+                    *(
+                        console.ExplainRow(ORPHANED_ROW, row["name"], row["reason"])
+                        for row in orphaned
+                    ),
+                ],
             )
         else:
             _output_text(
@@ -439,33 +503,27 @@ def output_explain_text(
     suggestions: list[str] | None = None,
     show_tracked: bool = False,
     *,
-    not_expanded: list[PipelineStatusInfo] | None = None,
-    orphaned: list[PipelineStatusInfo] | None = None,
+    rows: Sequence[console.ExplainRow] = (),
 ) -> None:
-    """Output detailed stage explanations as formatted text, then each mapped stage not yet
-    expanded (``not_expanded``) with what it waits for, then each orphaned instance of a mapped
-    stage (``orphaned``), which the run removes."""
+    """Output detailed stage explanations as formatted text, then each of ``rows`` (a mapped
+    stage, ``Pipeline.map``, or an instance of one) in its order, then a summary that counts
+    them by kind, in the order the kinds first come."""
     sections_printed = 0
 
     # Always show stage explanations section
-    if not explanations and not not_expanded and not orphaned:
+    if not explanations and not rows:
         click.echo("No stages to run")
     else:
         con = console.Console()
         for exp in explanations:
             con.explain_stage(exp)
-        for row in not_expanded or []:
-            con.explain_not_expanded(row["name"], row["reason"])
-        for row in orphaned or []:
-            con.explain_orphaned(row["name"], row["reason"])
+        counts = collections.Counter[console.ExplainRowKind]()
+        for row in rows:
+            con.explain_row(row)
+            counts[row.kind] += 1
 
         will_run = sum(1 for e in explanations if e["will_run"])
-        con.explain_summary(
-            will_run,
-            len(explanations) - will_run,
-            len(not_expanded or []),
-            orphaned=len(orphaned or []),
-        )
+        con.explain_summary(will_run, len(explanations) - will_run, counts)
     sections_printed += 1
 
     if show_tracked and tracked_status is not None:

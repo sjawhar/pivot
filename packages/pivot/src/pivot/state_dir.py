@@ -437,25 +437,41 @@ def ensure_state_dir_or_default(root: pathlib.Path) -> pathlib.Path:
     return state_dir
 
 
+def nearest_entry_problem(path: pathlib.Path) -> tuple[pathlib.Path, str] | None:
+    """Why no entry can be made at or below ``path``, or None: the nearest of ``path`` and its
+    parents that exists (``os.path.lexists``), where the first directory missing on the way, or
+    the first new entry, is made, with what keeps it from taking one: it "must be a directory",
+    or it "is not a writable, searchable directory" (this process cannot create entries in it
+    and search it, ``W_OK | X_OK``). None when it is such a directory, or when nothing on the
+    way exists. A state directory is checked here (``state_dir_target_problem``), and the dry
+    run predicts here whether a restore of a missing tracked path can write it
+    (``executor.tracked_restore.check_tracked``); the restore itself learns by trying."""
+    for candidate in (path, *path.parents):
+        if not os.path.lexists(candidate):
+            continue
+        if not os.path.isdir(candidate):
+            return candidate, "must be a directory"
+        if not os.access(candidate, os.W_OK | os.X_OK):
+            return candidate, "is not a writable, searchable directory"
+        return None
+    return None
+
+
 def state_dir_target_problem(target: pathlib.Path) -> str | None:
     """Why ``target`` cannot become a state directory, or None when it is or can be one.
 
     Its nearest existing entry must be a directory this process can create entries in and
-    search (``W_OK | X_OK``). A path holding a NUL byte cannot be opened at all, as 0.5.2 found
-    where it created it.
+    search (``nearest_entry_problem``). A path holding a NUL byte cannot be opened at all, as
+    0.5.2 found where it created it.
     """
     if "\0" in os.fspath(target):
         return f"core.state_dir holds a NUL byte, which no path can: {os.fspath(target)!r}"
-    for candidate in (target, *target.parents):
-        if not os.path.lexists(candidate):
-            continue
-        role = "core.state_dir" if candidate == target else "core.state_dir parent"
-        if not os.path.isdir(candidate):
-            return f"{role} must be a directory: {candidate}"
-        if not os.access(candidate, os.W_OK | os.X_OK):
-            return f"{role} is not a writable, searchable directory: {candidate}"
+    problem = nearest_entry_problem(target)
+    if problem is None:
         return None
-    return None
+    entry, why = problem
+    role = "core.state_dir" if entry == target else "core.state_dir parent"
+    return f"{role} {why}: {entry}"
 
 
 def is_valid_state_dir_value(value: object) -> bool:

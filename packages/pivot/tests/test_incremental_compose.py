@@ -4,7 +4,7 @@ from typing import Annotated, TypedDict
 import pytest
 
 import pivot
-from pivot import compose, exceptions, loaders, project, types
+from pivot import compose, exceptions, incremental_checks, loaders, project, types
 
 
 def _incremental_tag() -> object:
@@ -54,9 +54,7 @@ def test_uncached_incremental_output_is_detected_from_artifact_refs(
     output_path.write_text("count: 1\n")
     monkeypatch.setattr(project, "get_project_root", lambda: tmp_path)
 
-    from pivot.executor import core
-
-    assert core.check_uncached_incremental_outputs(
+    assert incremental_checks.check_uncached_incremental_outputs(
         [stage_name], {stage_name: pipeline.get_stage(stage_name)}
     ) == [(stage_name, str(output_path))]
 

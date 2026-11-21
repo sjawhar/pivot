@@ -14,7 +14,7 @@ import threading
 import types as _stdlib_types
 import typing
 from multiprocessing import managers
-from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple, TypedDict, cast
 
 import cloudpickle
 import loky
@@ -30,11 +30,10 @@ from pivot import (
     parameters,
     project,
     registry,
-    types,
 )
 from pivot import state_dir as state_dir_mod
-from pivot.executor import worker
-from pivot.storage import cache, lock, naming, ownership, track
+from pivot.executor import tracked_restore, worker
+from pivot.storage import cache, naming, ownership, track
 from pivot.storage import state as state_mod
 from pivot.storage import store as store_mod
 from pivot.types import OnError, StageStatus
@@ -683,53 +682,16 @@ def _pickles_alone(module: _stdlib_types.ModuleType, pickle_trials: PickleTrials
 # =========================================================================
 
 
-def _restore_tracked_file(
-    path: pathlib.Path,
-    track_data: track.PvtData,
-    cache_dir: pathlib.Path,
-    project_root: pathlib.Path,
-    state_dir: pathlib.Path,
-    recorded: list[tuple[pathlib.Path, os.stat_result, str]],
-) -> bool:
-    """Restore a tracked file or directory from cache without replacing a user file that lands
-    while staging.
-
-    Each restored file is appended to ``recorded`` for the caller to record in StateDB
-    (``cache.restore_from_cache``). Returns True if successful, False if not in cache. A
-    directory is restored from its committed listing file, else the cache's listing object.
-    """
-    output_hash = track.pvt_to_hash_info(track_data)
-    members = None
-    if types.is_dir_hash(output_hash):
-        try:
-            members = track.tracked_members(path, track_data, cache_dir)
-        except exceptions.ListingMissingError:
-            return False
-    target = ownership.ForcedRestore(
-        replacement=ownership.tracked_restore(path),
-        restored=output_hash,
-        claims=None,
+def _refuse_control_restores(
+    project_root: pathlib.Path, tracked_files: Mapping[str, track.PvtData]
+) -> None:
+    """Refuse ``--checkout-missing`` before it restores anything when a tracked path overlaps a
+    Git or Pivot control path (``ownership.control_path_refusal``)."""
+    refusal = ownership.control_path_refusal(
+        project_root, (ownership.tracked_restore(pathlib.Path(path)) for path in tracked_files)
     )
-    if members is not None:
-        target["restored_members"] = members
-
-    def before_swap(entry: pathlib.Path) -> None:
-        refusal = ownership.swap_refusal(project_root, target, entry)
-        if refusal is not None:
-            raise refusal
-
-    # Use default checkout modes (hardlink with copy fallback).
-    checkout_modes = config.get_checkout_mode_order()
-    return cache.restore_from_cache(
-        path,
-        output_hash,
-        cache_dir,
-        checkout_modes=checkout_modes,
-        state_dir=state_dir,
-        members=members,
-        before_swap=before_swap,
-        recorded=recorded,
-    )
+    if refusal is not None:
+        raise refusal
 
 
 def verify_tracked_files(
@@ -737,8 +699,12 @@ def verify_tracked_files(
     checkout_missing: bool = False,
     *,
     skip: track.PvtSkip | None = None,
-) -> None:
-    """Verify all .pvt tracked files exist and warn on hash mismatches.
+    tolerate_missing: bool = False,
+    outputs: Mapping[pathlib.Path, str] | None = None,
+) -> ownership.MissingTracked:
+    """Verify all .pvt tracked files exist and warn on hash mismatches. A tracked path is
+    missing unless it holds a regular file or a directory, symlinks followed
+    (``track.present_kind``).
 
     Args:
         project_root: Project root directory.
@@ -746,21 +712,51 @@ def verify_tracked_files(
             Only restores files that don't exist - never overwrites existing files.
         skip: Leaves a .pvt out of the tracked files (``track.discover_pvt_files``): a stage's
             own member of its output (``member_skip.own_member_skip``).
+        tolerate_missing: If True, return the tracked files that are still missing after the
+            restore, unless one of them overlaps a path of ``outputs``. A restore that fails
+            then leaves its path missing, with a warning
+            (``tracked_restore.restore_tracked``): a directory whose listing is unavailable
+            (``exceptions.ListingUnavailableError``), an entry the restore does not replace
+            in its place (a socket, a FIFO or a device, or a symlink to one), or a read or
+            write that fails with ``OSError``.
+        outputs: The ``ownership.normalized`` path of each output of the loaded stages, with
+            the stage that writes it (``ownership.stage_output_paths``); an empty mapping for
+            none. Read only with ``tolerate_missing``, which requires it.
+
+    Returns:
+        With ``tolerate_missing``, the tracked files still missing (the absolute normalized
+        paths discovery gives), sorted, with those whose restore failed, for the run's later
+        checks of a mapped stage's instances (``expansion.InstanceChecks``) to name. Else none.
+
+    Raises:
+        ValueError: ``tolerate_missing`` without ``outputs`` (a caller's error), before
+            anything is read.
+        TrackedFileMissingError: Without ``tolerate_missing``, for every tracked file still
+            missing. With it, for each one that is, lies inside or contains a path of
+            ``outputs`` (``ownership.tracked_output_refusal``), and for no other file; a file
+            whose restore failed is named as one.
+        CorruptListingError: A missing directory's listing is corrupt; with
+            ``tolerate_missing``, only when it is not unavailable (``ListingUnavailableError``).
+        OSError: Without ``tolerate_missing``, a restore that fails.
     """
     from pivot import metrics
 
-    tracked_files = track.discover_pvt_files_and_update_memo(project_root, skip=skip)
-    if not tracked_files:
-        return
-    if checkout_missing:
-        refusal = ownership.control_path_refusal(
-            project_root, (ownership.tracked_restore(pathlib.Path(path)) for path in tracked_files)
+    if tolerate_missing and outputs is None:
+        raise ValueError(
+            "verify_tracked_files: tolerate_missing needs outputs, the outputs of the loaded "
+            + "stages (an empty mapping for none)"
         )
-        if refusal is not None:
-            raise refusal
+
+    tracked_files = track.discover_pvt_files_and_update_memo(project_root, skip=skip)
+    none_missing = ownership.MissingTracked(paths=[], checkout_attempted=checkout_missing)
+    if not tracked_files:
+        return none_missing
+    if checkout_missing:
+        _refuse_control_restores(project_root, tracked_files)
 
     _t = metrics.start()
     missing = list[str]()
+    failed = set[str]()
     cache_root = config.locate_cache_dir()
     cache_dir = cache_root / "files"
     state_dir = config.locate_state_dir()
@@ -776,27 +772,36 @@ def verify_tracked_files(
 
             # Try to hash the file - handles race conditions where file disappears
             try:
-                if path.is_file():
-                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
-                elif path.is_dir():
+                kind = track.present_kind(path)
+                if kind is None:
+                    raise FileNotFoundError(data_path)
+                if kind == "directory":
                     current_hash = cache.hash_directory(
                         path, state_db, cache_dir=cache_dir, pending=pending
                     )["record"]["hash"]
                 else:
-                    # Path doesn't exist
-                    raise FileNotFoundError(data_path)
+                    current_hash, _ = cache.hash_file(path, state_db, pending=pending)
             except FileNotFoundError:
                 if checkout_missing:
                     if not registered:
                         naming.register_use(cache_root, project_root, state_dir)
                         registered = True
-                    if _restore_tracked_file(
-                        path, track_data, cache_dir, project_root, state_dir, pending
-                    ):
+                    outcome = tracked_restore.restore_tracked(
+                        path,
+                        track_data,
+                        cache_dir,
+                        project_root,
+                        state_dir,
+                        pending,
+                        tolerate_missing=tolerate_missing,
+                    )
+                    if outcome is tracked_restore.Outcome.RESTORED:
                         logger.info(f"Restored tracked file: {data_path}")
                     else:
                         logger.debug(f"Failed to restore tracked file from cache: {data_path}")
                         missing.append(data_path)
+                        if outcome is tracked_restore.Outcome.FAILED:
+                            failed.add(data_path)
                 else:
                     missing.append(data_path)
                 continue
@@ -811,92 +816,103 @@ def verify_tracked_files(
     state_mod.save_file_hashes(state_dir, pending, create=True)
 
     metrics.end("core.verify_tracked_files", _t)
-    if missing:
+    if not missing:
+        return none_missing
+    if not tolerate_missing:
         raise exceptions.TrackedFileMissingError(missing, checkout_attempted=checkout_missing)
+    # Given with tolerate_missing, which the start refuses without it
+    assert outputs is not None
+    still_missing = ownership.MissingTracked(
+        paths=sorted(missing), failed=frozenset(failed), checkout_attempted=checkout_missing
+    )
+    refusal = ownership.tracked_output_refusal(still_missing, outputs, project_root)
+    if refusal is not None:
+        raise refusal
+    return still_missing
 
 
-def check_uncached_incremental_outputs(
-    execution_order: list[str],
-    all_stages: dict[str, RegistryStageInfo],
-) -> list[tuple[str, str]]:
-    """Check for incremental artifacts that exist without a recorded cache hash."""
-    uncached = list[tuple[str, str]]()
-    default_state_dir = config.locate_state_dir()
-    workspace = store_mod.WorkspaceStore(project.get_project_root(), "", {})
-    cache_dir = config.locate_cache_dir() / "files"
+class MissingTrackedFiles(NamedTuple):
+    """The tracked files the pre-flight finds missing, split by whether its ``--checkout-missing``
+    restore brings them back (``find_missing_tracked_files``)."""
 
-    for stage_name in execution_order:
-        stage_info = all_stages[stage_name]
-        incremental = [
-            out for out in stage_info["outs"] if out.tag is types.ArtifactTag.INCREMENTAL
-        ]
-        if not incremental:
-            continue
-        stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
-        lock_data = stage_lock.read(cache_dir=cache_dir)
-        output_hashes = lock_data["output_hashes"] if lock_data else {}
-
-        for out in incremental:
-            out_path = workspace.resolve_display_path(out)
-            if out_path.exists() and out.identity not in output_hashes:
-                uncached.append((stage_name, str(out_path)))
-
-    return uncached
+    missing: ownership.MissingTracked
+    """Each missing tracked path the restore does not bring back, with those whose restore
+    fails (``tracked_restore.Outcome.FAILED``): what the pre-flight in leave-out mode returns.
+    Without ``checkout_missing``, every missing one, none of them failed."""
+    restorable: dict[str, track.PvtData]
+    """Each missing tracked path that the restore brings back, with its ``.pvt`` data, in sorted
+    order (``tracked_restore.check_tracked``): no entry the restore does not replace stands at
+    the path (a socket, a FIFO or a device, or a symlink to one), the local cache holds every
+    object its restore links and this user can read each one as the restore reads it, the
+    restore can write the path (the nearest existing directory above it is one this user can
+    write in and search), and a tracked directory's listing is available (neither a committed
+    listing that is stale, empty or unreadable with no cached copy, nor a cached copy this user
+    cannot read). Empty without ``checkout_missing``."""
+    restored: dict[str, set[tuple[str, ...]]]
+    """Each path of ``restorable``, with every path its restore creates inside it, as the parts
+    of that path relative to it (``tracked_restore.Check.created``): for a directory, each file
+    and empty directory its listing holds and each directory on the way to them; for a file,
+    none."""
 
 
-def check_restarted_incremental_outputs(
-    execution_order: list[str],
-    all_stages: dict[str, RegistryStageInfo],
-) -> list[str]:
-    """Why each stage in ``execution_order`` whose lock an older pivot rewrote over this
-    pivot's, for a stage with an incremental output, is refused (``lock.restart_proofs``)."""
-    refused = list[str]()
-    default_state_dir = config.locate_state_dir()
-    cache_dir = config.locate_cache_dir() / "files"
-    for stage_name in execution_order:
-        stage_info = all_stages[stage_name]
-        if not any(out.tag is types.ArtifactTag.INCREMENTAL for out in stage_info["outs"]):
-            continue
-        stage_state_dir = registry.get_stage_state_dir(stage_info, default_state_dir)
-        stage_lock = lock.StageLock(stage_name, lock.get_stages_dir(stage_state_dir))
-        restarted = lock.restart_proofs(
-            stage_lock, stage_lock.read(cache_dir=cache_dir), stage_info["outs"]
-        )
-        if restarted:
-            refused.append(f"{stage_name}: {lock.restarted_reason(stage_lock, restarted)}")
-    return refused
-
-
-def incremental_refusal(
-    stage_order: list[str],
-    stages: dict[str, RegistryStageInfo],
+def find_missing_tracked_files(
+    project_root: pathlib.Path,
     *,
-    allow_uncached_incremental: bool,
-    force: bool,
-) -> exceptions.PivotError | None:
-    """Why a run must not start ``stage_order``, or None: an incremental output on disk that
-    the cache does not hold, which running would delete (unless ``allow_uncached_incremental``),
-    or an incremental stage whose lock an older pivot rewrote over this pivot's, as that pivot may
-    have restarted the output from empty (unless ``force``, which accepts its lock on purpose).
-    A run checks its stages before it starts and each mapped stage's instances before it adds
-    them; ``pivot repro --dry-run`` checks the same."""
-    if not allow_uncached_incremental:
-        uncached = check_uncached_incremental_outputs(stage_order, stages)
-        if uncached:
-            files_list = "\n".join(f"  - {stage}: {path}" for stage, path in uncached)
-            return exceptions.UncachedIncrementalOutputError(
-                "The following incremental output files exist but are not in cache:\n"
-                + f"{files_list}\n\n"
-                + "Running the pipeline will DELETE these files and they cannot be restored.\n"
-                + "To proceed anyway, use --allow-uncached-incremental or back up these "
-                + "files first."
-            )
-    if not force:
-        restarted = check_restarted_incremental_outputs(stage_order, stages)
-        if restarted:
-            return exceptions.RestartedIncrementalOutputError(
-                "Pivot will not run these stages:\n"
-                + "\n".join(f"  - {reason}" for reason in restarted)
-            )
-    return None
+    skip: track.PvtSkip | None = None,
+    checkout_missing: bool = False,
+) -> MissingTrackedFiles:
+    """The dry run's view of the pre-flight in leave-out mode (``verify_tracked_files`` with
+    ``tolerate_missing``), reading only.
+
+    Finds the tracked files the pre-flight finds missing, by the one rule for whether a tracked
+    path is present (``track.present_kind``), and with ``checkout_missing`` splits off those its
+    restore brings back, and those whose restore fails, as ``tracked_restore.check_tracked``
+    predicts, warning as the restore would for each that fails. It discovers with
+    ``track.discover_pvt_files``, which never writes the memo. It restores nothing, registers in
+    no cache and writes no state database or workspace file; it predicts whether the run's
+    registration refuses links into the cache (``naming.register_refuses_links``). With
+    ``checkout_missing`` it raises where the pre-flight raises: the refusal of a control path,
+    ``CorruptListingError`` for a missing directory whose listing is corrupt but not
+    unavailable, and, from a cache that refuses links with no COPY among the checkout modes, the
+    refusal to link where the restore reaches a link (``tracked_restore.check_tracked``).
+    ``skip`` is as for ``verify_tracked_files``.
+    """
+    tracked_files = track.discover_pvt_files(project_root, skip=skip)
+    if checkout_missing and tracked_files:
+        _refuse_control_restores(project_root, tracked_files)
+    found = sorted(path for path in tracked_files if track.present_kind(pathlib.Path(path)) is None)
+    if not checkout_missing or not found:
+        return MissingTrackedFiles(
+            missing=ownership.MissingTracked(paths=found, checkout_attempted=checkout_missing),
+            restorable={},
+            restored={},
+        )
+    cache_root = config.locate_cache_dir()
+    checkout_modes = config.get_checkout_mode_order()
+    links_refused = naming.register_refuses_links(cache_root)
+    missing = list[str]()
+    failed = set[str]()
+    restorable = dict[str, track.PvtData]()
+    restored = dict[str, set[tuple[str, ...]]]()
+    for path in found:
+        check = tracked_restore.check_tracked(
+            pathlib.Path(path),
+            tracked_files[path],
+            cache_root,
+            checkout_modes,
+            links_refused=links_refused,
+        )
+        if check.outcome is tracked_restore.Outcome.RESTORED:
+            restorable[path] = tracked_files[path]
+            restored[path] = check.created
+            continue
+        missing.append(path)
+        if check.outcome is tracked_restore.Outcome.FAILED:
+            failed.add(path)
+    return MissingTrackedFiles(
+        missing=ownership.MissingTracked(
+            paths=missing, failed=frozenset(failed), checkout_attempted=True
+        ),
+        restorable=restorable,
+        restored=restored,
+    )

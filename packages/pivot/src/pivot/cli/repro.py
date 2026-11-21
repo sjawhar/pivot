@@ -22,9 +22,9 @@ from typing import TYPE_CHECKING
 import anyio
 import click
 
-from pivot import config, display, project, registry
+from pivot import config, display, exceptions, expansion, project, registry
 from pivot import state_dir as state_dir_mod
-from pivot.cli import _run_common, completion, is_standalone_invocation
+from pivot.cli import _run_common, completion, is_standalone_invocation, leave_out_dry_run
 from pivot.cli import decorators as cli_decorators
 from pivot.cli import helpers as cli_helpers
 from pivot.cli import targets as cli_targets
@@ -47,8 +47,8 @@ if TYPE_CHECKING:
     import networkx as nx
 
     from pivot.cli import console as tui_console
+    from pivot.cli.status import Explained
     from pivot.executor import ExecutionSummary
-    from pivot.types import PipelineStatusInfo, StageExplanation
 
 
 _logger = logging.getLogger(__name__)
@@ -130,30 +130,52 @@ def _get_explanations(
     allow_missing: bool = False,
     no_commit: bool = False,
     allow_uncached_incremental: bool = False,
-) -> tuple[list[StageExplanation], list[PipelineStatusInfo], dict[str, str]]:
+    *,
+    leave_out: bool = False,
+    checkout_missing: bool = False,
+) -> Explained:
     """Resolve dependencies, build graph, and return stage explanations, with a row for each
-    mapped stage not yet expanded (``status.expand_current``: the run would expand it once its
-    producer is current), and each orphaned instance the run would remove, mapped to its mapped
-    stage (``status.orphaned_instances``): of each mapped stage the run expands without refusing
-    (``cli_helpers.eligible_templates``), unless it commits nothing.
+    mapped stage not yet expanded (``status.not_expanded_status``: the run would expand it
+    once its producer is current; a mapped stage the run refuses to expand, or blocks behind
+    one, is shown so too, as 0.10.4 shows it), and each orphaned instance the run would remove,
+    mapped to its mapped stage (``status.orphaned_instances``): of each mapped stage the run
+    expands without refusing (``cli_helpers.eligible_templates``), unless it commits nothing.
+    The targets resolve as `pivot status` resolves them (``cli_helpers.resolve_mapped_targets``:
+    a mapped stage not expanded stands for its producer), and a missing dependency stops it
+    unless ``allow_missing``.
+
+    In leave-out mode (``repro --all --keep-going``, which refuses ``allow_missing``) it shows
+    what that run would do instead, with ``checkout_missing``
+    (``leave_out_dry_run.explanations``).
 
     Shared by --explain and --dry-run modes.
     """
+    if leave_out:
+        return leave_out_dry_run.explanations(
+            stages_list,
+            force=force,
+            no_commit=no_commit,
+            allow_uncached_incremental=allow_uncached_incremental,
+            checkout_missing=checkout_missing,
+        )
     from pivot import status as status_mod
-    from pivot.engine import graph as engine_graph
+    from pivot.cli import console as tui_console_mod
+    from pivot.cli import status as status_cli
 
     result, known = cli_helpers.expand_mapped_stages(force=force, allow_missing=allow_missing)
+    order = cli_helpers.run_order(stages_list)
     removing = (
         []
         if no_commit
         else cli_helpers.eligible_templates(
-            stages_list,
             result,
+            order,
             force=force,
             allow_uncached_incremental=allow_uncached_incremental,
         )
     )
-    orphans = status_mod.orphaned_instances(cli_helpers.get_pipeline(), result, removing)
+    pipeline = cli_helpers.get_pipeline()
+    orphans = status_mod.orphaned_instances(pipeline, result, removing)
     stages_list, shown_templates = cli_helpers.resolve_mapped_targets(stages_list, result)
     all_stages = cli_helpers.get_all_stages()
 
@@ -163,8 +185,6 @@ def _get_explanations(
         ws = cli_helpers.get_workspace_store()
         dep_errors = engine_graph.validate_dependency_sources(all_stages, store=ws)
         if dep_errors:
-            from pivot import exceptions
-
             if len(dep_errors) == 1:
                 raise dep_errors[0]
             raise exceptions.MultipleDependencyError(dep_errors)
@@ -173,13 +193,21 @@ def _get_explanations(
         stages_list,
         single_stage=False,
         all_stages=all_stages,
-        pipeline=cli_helpers.get_pipeline(),
+        pipeline=pipeline,
         force=force,
         allow_missing=allow_missing,
         graph=graph,
         known=known,
     )
-    return explanations, status_mod.not_expanded_status(result, shown_templates), orphans
+    return status_cli.Explained(
+        explanations=explanations,
+        rows=[
+            tui_console_mod.ExplainRow(status_cli.NOT_EXPANDED_ROW, row["name"], row["reason"])
+            for row in status_mod.not_expanded_status(result, shown_templates)
+        ],
+        orphans=orphans,
+        left_out_targets={},
+    )
 
 
 def _output_explain(
@@ -188,19 +216,42 @@ def _output_explain(
     allow_missing: bool = False,
     no_commit: bool = False,
     allow_uncached_incremental: bool = False,
+    *,
+    leave_out: bool = False,
+    checkout_missing: bool = False,
 ) -> None:
-    """Output detailed stage explanations using status logic."""
+    """Output detailed stage explanations using status logic.
+
+    Raises:
+        TargetsLeftOutError: In leave-out mode, after the output, naming each target the run
+            would leave out, as the run does.
+    """
     from pivot import status as status_mod
+    from pivot.cli import console as tui_console_mod
     from pivot.cli import status as status_cli
 
-    explanations, not_expanded, orphans = _get_explanations(
-        stages_list, force, allow_missing, no_commit, allow_uncached_incremental
+    explained = _get_explanations(
+        stages_list,
+        force,
+        allow_missing,
+        no_commit,
+        allow_uncached_incremental,
+        leave_out=leave_out,
+        checkout_missing=checkout_missing,
     )
+    pipeline = cli_helpers.get_pipeline()
     status_cli.output_explain_text(
-        explanations,
-        not_expanded=not_expanded,
-        orphaned=status_mod.orphaned_status(cli_helpers.get_pipeline(), orphans),
+        explained.explanations,
+        rows=[
+            *explained.rows,
+            *(
+                tui_console_mod.ExplainRow(status_cli.ORPHANED_ROW, row["name"], row["reason"])
+                for row in status_mod.orphaned_status(pipeline, explained.orphans)
+            ),
+        ],
     )
+    if explained.left_out_targets:
+        raise exceptions.TargetsLeftOutError(explained.left_out_targets)
 
 
 def _dry_run(
@@ -211,43 +262,67 @@ def _dry_run(
     quiet: bool,
     no_commit: bool,
     allow_uncached_incremental: bool,
+    *,
+    leave_out: bool = False,
+    checkout_missing: bool = False,
 ) -> None:
     """Show what would run without executing. A mapped stage not yet expanded would run: the
-    run expands it once its producer is current, then runs its instances. An instance whose key
-    left its producer's listing would be removed (``status.orphaned_instances``); nothing is."""
-    from pivot import expansion
+    run expands it once its producer is current, then runs its instances. A mapped stage the run
+    refuses to expand would not run: the run fails it, and blocks each mapped stage behind it
+    (``status_cli.DRY_RUN_SHOWN`` says how each such row is listed). An instance whose key left
+    its producer's listing would be removed (``status.orphaned_instances``); nothing is.
+
+    Raises:
+        TargetsLeftOutError: In leave-out mode, after the output, naming each target the run
+            would leave out, as the run does; under ``--quiet`` too, which prints nothing.
+    """
+    from pivot.cli import status as status_cli
 
     # Quiet mode suppresses output (except JSON which is always emitted)
     if quiet and not as_json:
+        if leave_out:
+            # The run's decisions still fail the command, so the exit code is the run's
+            plan = leave_out_dry_run.plan_run(stages_list, checkout_missing=checkout_missing)
+            if plan.left_out_targets:
+                raise exceptions.TargetsLeftOutError(plan.left_out_targets)
         return
 
-    explanations, not_expanded, orphans = _get_explanations(
-        stages_list, force, allow_missing, no_commit, allow_uncached_incremental
+    explained = _get_explanations(
+        stages_list,
+        force,
+        allow_missing,
+        no_commit,
+        allow_uncached_incremental,
+        leave_out=leave_out,
+        checkout_missing=checkout_missing,
     )
     pipeline = cli_helpers.get_pipeline()
     removals = {
         instance: expansion.orphan_reason(pipeline.get_template(template))
-        for instance, template in orphans.items()
+        for instance, template in explained.orphans.items()
     }
 
-    if not explanations and not not_expanded and not removals:
+    if not (explained.explanations or explained.rows or removals):
         if as_json:
             click.echo(display.to_json(_run_common.DryRunJsonOutput(stages={})))
         else:
             click.echo("No stages to run")
-        return
-
-    if as_json:
+    elif as_json:
         stages = {
             exp["stage_name"]: _run_common.DryRunJsonStageOutput(
                 would_run=exp["will_run"],
                 reason=exp["reason"] or "unchanged",
             )
-            for exp in explanations
+            for exp in explained.explanations
         }
         stages.update(
-            (row["name"], _run_common.DryRunJsonStageOutput(would_run=True, reason=row["reason"]))
-            for row in not_expanded
+            (
+                row.name,
+                _run_common.DryRunJsonStageOutput(
+                    would_run=status_cli.DRY_RUN_SHOWN[row.kind].would_run, reason=row.reason
+                ),
+            )
+            for row in explained.rows
         )
         output = _run_common.DryRunJsonOutput(stages=stages)
         if removals:
@@ -255,17 +330,19 @@ def _dry_run(
         click.echo(display.to_json(output, indent=2))
     else:
         click.echo("Would run:")
-        for exp in explanations:
+        for exp in explained.explanations:
             status = "would run" if exp["will_run"] else "would skip"
             reason = display.escape_control(exp["reason"] or "unchanged", keep_newlines=True)
             click.echo(f"  {exp['stage_name']}: {status} ({reason})")
-        for row in not_expanded:
-            reason = display.escape_control(row["reason"], keep_newlines=True)
-            click.echo(f"  {row['name']}: would expand ({reason})")
+        for row in explained.rows:
+            reason = display.escape_control(row.reason, keep_newlines=True)
+            click.echo(f"  {row.name}: {status_cli.DRY_RUN_SHOWN[row.kind].words} ({reason})")
         if removals:
             click.echo("Would remove:")
             for name, reason in removals.items():
                 click.echo(f"  {name}: {display.escape_control(reason, keep_newlines=True)}")
+    if explained.left_out_targets:
+        raise exceptions.TargetsLeftOutError(explained.left_out_targets)
 
 
 def _run_pipeline(
@@ -710,7 +787,12 @@ def _run_oneshot_mode(
     jsonl_callback: Callable[[dict[str, object]], None] | None,
     cancel_event: threading.Event | None,
 ) -> dict[str, ExecutionSummary]:
-    """Run non-watch (one-shot) mode with unified event-driven execution."""
+    """Run non-watch (one-shot) mode with unified event-driven execution.
+
+    Raises:
+        TargetsLeftOutError: The run left out named targets for a missing input
+            (``Engine.left_out_targets``), after it ran the others and reported its results.
+    """
     from pivot.executor import core as executor_core
 
     # Sort for display
@@ -718,6 +800,8 @@ def _run_oneshot_mode(
 
     pipeline = cli_decorators.get_pipeline_from_context()
     use_all_pipelines = cli_decorators.get_all_pipelines_from_context()
+    # The targets the engine left out, copied from it once its run returns
+    left_out = dict[str, exceptions.DependencyNotFoundError]()
 
     # TUI mode for oneshot via RPC
     if tui and run_id:
@@ -778,6 +862,7 @@ def _run_oneshot_mode(
                     checkout_missing=checkout_missing,
                 )
                 await eng.run(exit_on_completion=True)
+                left_out.update(eng.left_out_targets)
                 stage_results = await result_sink.get_results()
                 return _run_common.convert_results(stage_results)
 
@@ -789,9 +874,10 @@ def _run_oneshot_mode(
         )
 
         # Return results (re-raises if engine raised an exception)
-        if result_future.done():
-            return result_future.result()
-        return {}
+        results = result_future.result() if result_future.done() else {}
+        if left_out:
+            raise exceptions.TargetsLeftOutError(left_out)
+        return results
 
     # Non-TUI async mode
     start_time = time.perf_counter()
@@ -818,6 +904,7 @@ def _run_oneshot_mode(
                 checkout_missing=checkout_missing,
             )
             await eng.run(exit_on_completion=True)
+            left_out.update(eng.left_out_targets)
             stage_results = await result_sink.get_results()
             return _run_common.convert_results(stage_results)
 
@@ -861,6 +948,8 @@ def _run_oneshot_mode(
         )
         console.failed_stages(failed_stage_names)
 
+    if left_out:
+        raise exceptions.TargetsLeftOutError(left_out)
     return results
 
 
@@ -927,7 +1016,10 @@ def _run_oneshot_mode(
     "--keep-going",
     "-k",
     is_flag=True,
-    help="Continue running stages after failures; skip only downstream dependents.",
+    help="Continue running stages after failures, and skip only downstream dependents. With "
+    + "--all, also exclude each stage that reads a missing input file, and its downstream "
+    + "dependents. Without --watch, this includes a missing tracked file that overlaps no stage "
+    + "output, and an excluded target fails the command after the other targets run.",
 )
 @click.option(
     "--serve",
@@ -942,12 +1034,20 @@ def _run_oneshot_mode(
 @click.option(
     "--checkout-missing",
     is_flag=True,
-    help="Restore tracked files that don't exist on disk from cache before running.",
+    help="Restore tracked files that don't exist on disk from cache before running. With "
+    + "--all --keep-going, and neither --watch nor --fail-fast, --dry-run and --explain restore "
+    + "nothing and count such a file as present when the cache holds every object its restore "
+    + "needs, unless the restore could not write it or read its cache objects, a socket, a FIFO "
+    + "or a device, or a symlink to one, stands in its place, or it lies in a tracked directory "
+    + "whose committed listing is stale, empty or unreadable with no cached copy; the run warns "
+    + "for each such file and leaves out the stages that read it.",
 )
 @click.option(
     "--allow-missing",
     is_flag=True,
-    help="Allow missing dep files if tracked (.pvt exists). Only affects --dry-run.",
+    help="Allow missing dep files if tracked (.pvt exists). Only affects --dry-run and "
+    + "--explain. Refused with --all --keep-going unless --watch is given, or --explain is "
+    + "given with --fail-fast.",
 )
 @click.pass_context
 def repro(
@@ -1088,6 +1188,21 @@ def repro(
         raise click.ClickException("--serve requires --watch mode")
     if debounce_from_cli and not watch:
         raise click.ClickException("--debounce requires --watch mode")
+    # The run's leave-out mode, decided as the engine decides it: the dry run and --explain show
+    # what that run would do. --explain takes --fail-fast with --keep-going, which is not that
+    # mode.
+    leave_out = engine_graph.is_leave_out_mode(
+        all_pipelines=cli_decorators.get_all_pipelines_from_context(),
+        on_error=OnError.KEEP_GOING if keep_going and not fail_fast else OnError.FAIL,
+        watching=watch,
+    )
+    if allow_missing and leave_out:
+        # Leave-out mode leaves out each stage with a missing input; --allow-missing would show
+        # such a stage as one that runs
+        raise click.UsageError(
+            "--allow-missing cannot be used with --all --keep-going, which leaves out each stage "
+            + "with a missing input"
+        )
     if allow_missing and not dry_run and not explain:
         raise click.ClickException("--allow-missing can only be used with --dry-run or --explain")
 
@@ -1105,6 +1220,8 @@ def repro(
             allow_missing=allow_missing,
             no_commit=no_commit,
             allow_uncached_incremental=allow_uncached_incremental,
+            leave_out=leave_out,
+            checkout_missing=checkout_missing,
         )
         return
 
@@ -1120,6 +1237,8 @@ def repro(
             quiet,
             no_commit,
             allow_uncached_incremental,
+            leave_out=leave_out,
+            checkout_missing=checkout_missing,
         )
         return
 

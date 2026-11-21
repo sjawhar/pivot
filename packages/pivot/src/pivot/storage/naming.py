@@ -1332,6 +1332,27 @@ def lock_paths_in(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     return root / NAMING_TURNSTILE, root / NAMING_LOCK
 
 
+def require_shared_store(cache_dir: pathlib.Path) -> StoreLayout:
+    """``cache_dir``'s layout (``store_layout``), refused when its object store is the root of a
+    mount of its own (``StoreLayout.unshared``), whose register cannot show every project of the
+    store: the check every naming unit makes first (``naming_unit``), so a run refuses at its
+    start (``register_use``), and which a command that only plans a run makes without writing
+    (``--dry-run`` and ``--explain`` of ``pivot repro --all --keep-going``, without ``--watch``
+    or ``--fail-fast``). A cache root that does not exist has a plain layout.
+
+    Raises:
+        exceptions.CacheError: The object store is the root of a mount of its own.
+    """
+    layout = store_layout(cache_dir)
+    if layout.unshared:
+        raise exceptions.CacheError(
+            f"Refusing to name objects in {cache_dir}: "
+            + unshared_store_problem(cache_dir, layout)
+            + "\nNothing was recorded."
+        )
+    return layout
+
+
 @contextlib.contextmanager
 def naming_unit(
     cache_dir: pathlib.Path, *, project: tuple[pathlib.Path, pathlib.Path] | None
@@ -1357,21 +1378,15 @@ def naming_unit(
     exist yet and this user cannot create them), the unit refuses: another user's collection
     could create them and delete while this writer named objects unlocked. The one exception
     is a read-only filesystem, where nothing — a collection included — can delete. A cache whose
-    object store is the root of a mount of its own (``StoreLayout.unshared``) is refused too: its
-    register is not where every view that mounts the store looks, so a collection through
-    another root of the store could not see this project.
+    object store is the root of a mount of its own (``StoreLayout.unshared``) is refused too,
+    first (``require_shared_store``): its register is not where every view that mounts the store
+    looks, so a collection through another root of the store could not see this project.
 
     Raises:
         exceptions.CacheError: the lock files cannot be opened on a writable filesystem, or the
             object store is the root of a mount of its own.
     """
-    layout = store_layout(cache_dir)
-    if layout.unshared:
-        raise exceptions.CacheError(
-            f"Refusing to name objects in {cache_dir}: "
-            + unshared_store_problem(cache_dir, layout)
-            + "\nNothing was recorded."
-        )
+    layout = require_shared_store(cache_dir)
     ts_path, nm_path = lock_paths_in(layout.register_root)
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1440,6 +1455,25 @@ def register_use(
     if cache_root.is_dir():
         with naming_unit(cache_root, project=(project_root, state_dir)):
             pass
+
+
+def register_refuses_links(cache_root: pathlib.Path) -> bool:
+    """Whether a command's registration in the cache ``cache_root`` (``register_use``) refuses
+    this process's links into it, told without writing: the cache's register
+    (``register_root``) lies on a filesystem mounted read-only here (``os.statvfs``'s
+    ``ST_RDONLY``). There every write of a registration meets ``EROFS``, on which
+    ``naming_unit`` refuses the links (``cache.refuse_links_from``) and lets the command go on,
+    so a restore copies each object, or refuses to link without COPY among its checkout modes
+    (``cache.refused_link_modes``). A cache that does not exist is registered in by no one.
+
+    A register this user cannot write on a writable filesystem is not one: the registration
+    then stops the command, in every mode, where it writes there (a new or old entry, or a
+    kernel that refuses even the removal of an absent file in such a directory), and passes
+    where it writes nothing. Only the write tells which, so the dry run of a restore
+    (``executor.core.find_missing_tracked_files``), which asks here, does not predict it."""
+    if not cache_root.is_dir():
+        return False
+    return bool(os.statvfs(register_root(cache_root)).f_flag & os.ST_RDONLY)
 
 
 def _unopenable_naming_lock(

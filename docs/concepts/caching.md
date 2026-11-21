@@ -260,8 +260,10 @@ mount the store need not reach, so the register cannot follow the store: it stay
 root. That is so when `files/` links to such a mount, and when `files/` is itself a mount point
 (another device than the cache root, or a bind mount the mount table lists). Pivot refuses both
 layouts: every command that names objects (a run, `pivot commit`, `pivot track`, `pivot
-checkout`) refuses before it names anything, and `pivot gc` refuses, each naming the layout. So
-no host or container writes into a store whose register is not where every user of the store
+checkout`) refuses before it names anything, as do `--dry-run` and `--explain` of `pivot repro
+--all --keep-going`, without `--watch` or `--fail-fast`, which plan a run; and `pivot gc`
+refuses, each naming the layout. So no host or container writes into a store whose register is
+not where every user of the store
 looks (a container given only another root's `files/` would register in its own cache root, out
 of sight of that root's collection). Two layouts are supported instead: mount the filesystem at
 the cache root (or point `cache.dir` at a directory inside it), so `files/` is a plain directory

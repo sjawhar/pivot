@@ -13,6 +13,7 @@ from pivot import loaders, project
 from pivot.registry import PipelineLike, RegistryStageInfo
 from pivot.show import metrics
 from pivot.types import ArtifactIdentity, ArtifactRef, ArtifactTag, ChangeType, OutputFormat
+from tests import helpers
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -165,6 +166,24 @@ def test_parse_yaml_non_dict(tmp_path: Path) -> None:
 
     with pytest.raises(metrics.MetricsError, match="Expected dict"):
         metrics.parse_metric_file(metric_file)
+
+
+def test_parse_invalid_yaml_names_the_file_at_each_mark(tmp_path: Path) -> None:
+    """A YAML parse error names the metric file at each place it marks, as for a stream
+    ``open`` returned, never the number of the descriptor it was read through. The problem's
+    wording differs between libyaml and the pure-Python loader; the marks do not."""
+    metric_file = tmp_path / "bad.yaml"
+    metric_file.write_text("a: [1\n")
+
+    with pytest.raises(metrics.MetricsError) as raised:
+        metrics.parse_metric_file(metric_file)
+
+    lines = str(raised.value).splitlines()
+    assert lines[0] == f"Failed to parse {metric_file}: while parsing a flow sequence"
+    assert [line for line in lines if line.startswith("  in ")] == [
+        f'  in "{metric_file}", line 1, column 4',
+        f'  in "{metric_file}", line 2, column 1',
+    ]
 
 
 def test_parse_json_non_dict(tmp_path: Path) -> None:
@@ -589,6 +608,25 @@ def test_collect_metrics_from_stages_parse_error(
 
     assert "my_stage" not in result
     assert "Failed to parse metrics" in caplog.text
+
+
+def test_collect_metrics_from_stages_skips_a_fifo_at_a_metric_output_at_once(
+    mock_discovery: PipelineLike,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A FIFO at a stage's metric output is never read (``regular_file.open_regular_file``): the
+    metric is skipped with the parse warning, which names the FIFO, at once, where a blocking
+    open of it would wait for a writer."""
+    metric_file = _register_metric_stage(mock_discovery, "my_stage")
+    helpers.occupy(metric_file, "fifo")
+
+    result = helpers.call_without_waiting(
+        metrics.collect_metrics_from_stages, lambda: helpers.free_fifo(metric_file), timeout=10
+    )
+
+    assert "my_stage" not in result
+    assert "Failed to parse metrics from metrics/my_stage.json" in caplog.text
+    assert f"Is a FIFO, not a regular file: {metric_file}" in caplog.text
 
 
 def test_collect_all_stage_metrics_flat(mock_discovery: PipelineLike) -> None:

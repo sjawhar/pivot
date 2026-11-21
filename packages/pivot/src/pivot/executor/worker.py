@@ -2811,6 +2811,13 @@ def hash_dependencies(
     Every dependency hash is ``store.hash_artifact``'s, so a directory input leaves out the
     files ``.pivotignore`` names wherever a stage's staleness is decided.
 
+    A dependency that does not exist is missing. One that cannot be read is unreadable, named
+    with why where that is known: a directory where a file is read (``key (a directory, not a
+    file)``), a FIFO, a socket or a device, which is never opened, by the rule
+    ``storage.regular_file.open_regular_file`` states (``exceptions.NotAFileError``: ``key (a
+    FIFO, not a file)``), a symlink in a directory input that cannot be classified
+    (``exceptions.UnreadableLinkError``), or any other ``OSError`` (a permission error: ``key``).
+
     With a read-only (or no) ``state_db``, the write-backs are the StateDB file-hash entries of
     every file read, a file of a directory dependency included, for the coordinator to save; a
     writable ``state_db`` saves them itself. ``hashed_dirs`` receives each directory
@@ -2833,6 +2840,8 @@ def hash_dependencies(
         except IsADirectoryError:
             # One file of a directory output names a directory the producer wrote there
             unreadable.append(f"{key} (a directory, not a file)")
+        except exceptions.NotAFileError as exc:
+            unreadable.append(f"{key} ({exc.kind}, not a file)")
         except exceptions.UnreadableLinkError as exc:
             unreadable.append(f"{key} ({exc})")
         except OSError:

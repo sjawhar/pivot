@@ -55,8 +55,28 @@ Without `t` or `format`, the extension picks the loader:
 | anything else | `pathlib.Path` (`PathOnly()`) |
 
 An input whose file does not exist fails before anything runs:
-`Stage 'demo/keep' depends on 'missing.csv' which is not produced by any stage
-and does not exist on disk`.
+`Stage 'demo/keep' depends on input 'missing.csv' (path data/raw/missing.csv),
+which does not exist`. `pivot repro --all --keep-going` is the exception. It
+logs a `Skipping:` warning for each missing input of a stage, excludes that
+stage and every stage downstream of it, and runs the other stages. A
+missing tracked file has its own rules (see
+[Files tracked outside the pipeline](#files-tracked-outside-the-pipeline)).
+
+Pivot reads an input only when it is a regular file or a directory, symlinks
+followed. A FIFO, a socket or a device, or a symlink to one, is never read.
+Such an input fails its stage as unreadable, in every mode, as a file you
+cannot read does: `unreadable deps: scores.csv (a FIFO, not a file)`.
+For a stage that ran before, `--explain` shows
+`Unreadable deps: scores.csv (a FIFO, not a file)`; a stage with no previous run
+is explained as `No previous run` before any input is read. A symlink to
+`/dev/null` is a device too (`a device, not a file`). For an empty input, use
+an empty file instead. At the path of a tracked file, such an entry counts as a
+missing tracked file when `pivot repro` runs, and in `--explain` and
+`--dry-run` under `--all --keep-going` too. Outside that mode, for a stage that
+ran before, `--explain`, `--dry-run` and `pivot status --stages-only` show it as
+unreadable. Plain `pivot status` stops with an error that names it
+(`Error: Is a device, not a regular file: <path>`), and `pivot track` refuses to
+track one.
 
 ### Directory inputs and `.pivotignore`
 
@@ -313,6 +333,25 @@ The sidecar sits beside its data, and its `path:` is the data's name
 (`values.csv` in `data/raw/values.csv.pvt`). `pivot checkout`, `pivot pull` and
 `pivot repro --checkout-missing` restore the file that `path:` names, under the
 directory holding the `.pvt`.
+
+**A missing tracked file stops the run.** Before any stage runs, `pivot repro`
+and `pivot run` check that each tracked file exists. With `--checkout-missing`,
+they first restore the files that the cache holds. A missing file stops the run
+with the error `The following tracked files are missing`.
+`pivot repro --all --keep-going` without `--watch` is the exception: it
+excludes each stage that reads the missing file, and every stage downstream of
+it, and runs the other stages.
+
+A stage reads the file when one of its dependencies is the file, lies inside
+it, or is an input directory that holds it, also when the path reaches the file
+through a symlink. A `Skipping:` line names the stage and each missing file
+that it reads. When the run excludes a named target, the command exits 1 after
+the other targets run.
+
+A missing tracked file that is, lies inside or holds a stage output still
+stops the run before any stage runs, also under `--all --keep-going`. The error
+names the output and its stage. Under `--all --keep-going`, a mapped stage
+whose instance output overlaps such a file fails instead and adds no instance.
 
 **A `.pvt` restores its file only inside the project.** A sidecar whose `path:`
 names no file (`.`, `./` or empty), holds `..`, is absolute, or names a file

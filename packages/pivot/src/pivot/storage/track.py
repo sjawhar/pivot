@@ -9,12 +9,12 @@ import shlex
 import stat
 import struct
 import time
-from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, TypeGuard, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, TypeGuard, cast
 
 import yaml
 
 from pivot import config, exceptions, project
-from pivot.storage import cache, listing, mounts
+from pivot.storage import cache, listing, mounts, regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +315,59 @@ def get_data_path(pvt_path: pathlib.Path) -> pathlib.Path:
         raise ValueError(f"Expected .pvt file, got: {pvt_path}")
     # Remove .pvt suffix
     return pvt_path.with_suffix("")
+
+
+def _followed_mode(path: pathlib.Path) -> int | None:
+    """The mode of what stands at ``path``, symlinks followed, from one ``stat``, which never
+    opens the path, so a FIFO never holds it up. None where nothing does: a ``stat`` error that
+    ``Path.is_file()`` reads as "no such file" on Python 3.13 (``cache.NO_FILE_ERRNO``: nothing,
+    or a dangling or looping symlink). Any other error is raised, as that method raises it."""
+    try:
+        return os.stat(path).st_mode
+    except OSError as e:
+        if e.errno not in cache.NO_FILE_ERRNO:
+            raise
+        return None
+
+
+def present_kind(path: pathlib.Path) -> Literal["file", "directory"] | None:
+    """What the tracked path ``path`` holds when it is present: a regular file or a directory,
+    symlinks followed. None when it is missing, whatever else stands there: nothing, a dangling
+    or looping symlink, a socket, a FIFO or a device.
+
+    The one rule for whether a tracked path is present. The run's pre-flight
+    (``executor.core.verify_tracked_files``) and the dry run's view of it
+    (``executor.core.find_missing_tracked_files``) both apply it, and the missing paths they find
+    are the ones whose readers the run leaves out (``engine.graph.get_runnable_stages``), whatever
+    else an existence test says of them. One ``stat`` decides, and an error of it other than "no
+    such file" is raised (``_followed_mode``).
+    """
+    mode = _followed_mode(path)
+    if mode is None:
+        return None
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    return None
+
+
+def occupant(path: pathlib.Path) -> str | None:
+    """What stands at the tracked path ``path``, making it missing (``present_kind``), that a
+    restore does not replace, named for a warning: "a socket", "a FIFO", "a device" or "an entry
+    that is neither a file nor a directory" (``regular_file.entry_kind``, the one naming of
+    them), each as "a symlink to ..." when ``path`` is a symlink to it. None for nothing, a
+    dangling or looping symlink, a regular file or a directory, symlinks followed.
+
+    One ``stat`` decides whether such an entry stands there, as for ``present_kind``, and an
+    error of it other than "no such file" is raised (``_followed_mode``). An ``lstat``
+    (``os.path.islink``, which reads any error of it as "not a symlink") only words the name.
+    """
+    mode = _followed_mode(path)
+    if mode is None or stat.S_ISREG(mode) or stat.S_ISDIR(mode):
+        return None
+    kind = regular_file.entry_kind(mode)
+    return f"a symlink to {kind}" if os.path.islink(path) else kind
 
 
 class RestoreTarget(NamedTuple):

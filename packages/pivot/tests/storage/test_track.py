@@ -1,4 +1,5 @@
 import logging
+import os
 import pathlib
 
 import pytest
@@ -7,6 +8,7 @@ import yaml
 
 from pivot import exceptions, types
 from pivot.storage import listing, track
+from tests import helpers
 
 _A = xxhash.xxh64(b"a").hexdigest()
 _RUN = xxhash.xxh64(b"#!/bin/sh\n").hexdigest()
@@ -318,6 +320,96 @@ def test_get_data_path_invalid_suffix_raises() -> None:
 
     with pytest.raises(ValueError, match=r"\.pvt"):
         track.get_data_path(not_pvt)
+
+
+# present_kind, occupant
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("regular_file", "file"),
+        ("directory", "directory"),
+        ("symlink_to_file", "file"),
+        ("symlink_to_directory", "directory"),
+        ("dangling_symlink", None),
+        ("symlink_loop", None),
+        ("socket", None),
+        ("fifo", None),
+        ("symlink_to_fifo", None),
+        ("nothing", None),
+    ],
+)
+def test_present_kind_counts_only_a_regular_file_or_a_directory_as_present(
+    tmp_path: pathlib.Path, kind: str, expected: str | None
+) -> None:
+    """The one rule for whether a tracked path is present: a regular file or a directory,
+    symlinks followed, and nothing else. A symlink to nothing or to itself, a socket, a FIFO, a
+    symlink to one or no entry at all is missing. It never opens the path: on a FIFO, whose
+    open for reading waits for a writer, it returns at once."""
+    path = tmp_path / "tracked"
+    helpers.occupy(path, kind)
+
+    found = helpers.call_without_waiting(
+        lambda: track.present_kind(path), lambda: helpers.free_fifo(path), timeout=10
+    )
+
+    assert found == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("regular_file", None),
+        ("directory", None),
+        ("symlink_to_file", None),
+        ("symlink_to_directory", None),
+        ("dangling_symlink", None),
+        ("symlink_loop", None),
+        ("nothing", None),
+        ("socket", "a socket"),
+        ("fifo", "a FIFO"),
+        ("symlink_to_fifo", "a symlink to a FIFO"),
+    ],
+)
+def test_occupant_names_an_entry_at_a_tracked_path_that_is_neither_file_nor_directory(
+    tmp_path: pathlib.Path, kind: str, expected: str | None
+) -> None:
+    """What stands at a tracked path that ``present_kind`` counts missing, and that a restore
+    does not replace, named for its warning: a socket, a FIFO, or a symlink to one. Nothing, a
+    symlink to nothing or to itself, a regular file and a directory, symlinks followed, are
+    None. It never opens the path: on a FIFO it returns at once."""
+    path = tmp_path / "tracked"
+    helpers.occupy(path, kind)
+
+    found = helpers.call_without_waiting(
+        lambda: track.occupant(path), lambda: helpers.free_fifo(path), timeout=10
+    )
+
+    assert found == expected
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches a directory whatever its mode")
+def test_present_kind_and_occupant_raise_a_stat_error_other_than_no_such_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A tracked path whose ``stat`` fails for another reason than "no such file" is neither
+    present nor missing: below a directory this user cannot search, ``PermissionError`` is
+    raised, as ``Path.is_file()`` raises it on Python 3.13, so the pre-flight stops there
+    rather than count the file missing and leave its readers out. ``occupant`` raises it too,
+    and the restore then warns that it fails (``tracked_restore._occupied``)."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "data.csv").write_text("data")
+
+    locked.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            track.present_kind(locked / "data.csv")
+        with pytest.raises(PermissionError):
+            track.occupant(locked / "data.csv")
+    finally:
+        locked.chmod(0o755)
 
 
 # discover_pvt_files

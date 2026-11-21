@@ -34,7 +34,7 @@ import lmdb
 from pivot import config, exceptions, project, types
 from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
-from pivot.storage import cache, listing, lock, naming, state, track
+from pivot.storage import cache, listing, lock, naming, path_forms, state, track
 
 logger = logging.getLogger(__name__)
 
@@ -976,14 +976,130 @@ def find_declared_overlap(
             relation = "is inside"
         else:
             relation = "contains"
-        text = (
-            f"it {relation} output '{display_path(pathlib.Path(output), project_root)}' "
-            + f"of stage '{declared['stage']}'"
-        )
+        resolves = None
         if resolved != normalized(path) or out_resolved != pathlib.Path(output):
-            text += f" (the path resolves to '{resolved}'; the output resolves to '{out_resolved}')"
-        return text
+            resolves = (resolved, out_resolved)
+        return _overlap_description(
+            relation, pathlib.Path(output), declared["stage"], project_root, resolves
+        )
     return None
+
+
+def _overlap_description(
+    relation: str,
+    output: pathlib.Path,
+    stage: str,
+    project_root: pathlib.Path,
+    resolves: tuple[pathlib.Path, pathlib.Path] | None,
+) -> str:
+    """How a path overlaps output ``output`` of ``stage``: "it ``relation`` output ...", the
+    relation being "is", "is inside" or "contains", and, with ``resolves``, what the path and
+    the output resolve to. ``find_declared_overlap`` and ``_tracked_output_overlaps`` both say
+    it here."""
+    text = f"it {relation} output '{display_path(output, project_root)}' of stage '{stage}'"
+    if resolves is not None:
+        text += f" (the path resolves to '{resolves[0]}'; the output resolves to '{resolves[1]}')"
+    return text
+
+
+def stage_output_paths(
+    project_root: pathlib.Path, stages: Mapping[str, RegistryStageInfo]
+) -> dict[pathlib.Path, str]:
+    """The ``normalized`` path of each output of ``stages``, with the stage that writes it: the
+    ``outputs`` that ``tracked_output_refusal`` takes. ``store.relative_output_path`` places each
+    output in the project, as ``member_skip.own_member_skip`` places it."""
+    # store imports this module
+    from pivot.storage import store as store_mod
+
+    return {
+        normalized(project_root / store_mod.relative_output_path(out)): stage_name
+        for stage_name, info in stages.items()
+        for out in info["outs"]
+    }
+
+
+class MissingTracked(NamedTuple):
+    """The tracked files a run start leaves missing, which only leave-out mode does (any other
+    run stops on one), with what its restore did: what a refusal of a stage whose output
+    overlaps one of them names (``tracked_output_refusal``). The run start
+    (``executor.core.verify_tracked_files``) gives it, the dry run predicts it
+    (``executor.core.find_missing_tracked_files``), and the checks of a mapped stage's instances
+    take it (``expansion.InstanceChecks``)."""
+
+    paths: list[str]
+    """Each missing tracked path, absolute and normalized as ``track.discover_pvt_files``
+    gives it, sorted."""
+    checkout_attempted: bool
+    """Whether a ``--checkout-missing`` restore tried ``paths`` first."""
+    failed: frozenset[str] = frozenset()
+    """Each path of ``paths`` whose ``--checkout-missing`` restore failed
+    (``executor.tracked_restore.Outcome.FAILED``), which a refusal names as such rather than as
+    one the local cache lacks; none by default."""
+
+
+def tracked_output_refusal(
+    missing: MissingTracked, outputs: Mapping[pathlib.Path, str], project_root: pathlib.Path
+) -> exceptions.TrackedFileMissingError | None:
+    """The refusal of the stages whose outputs ``outputs`` holds, or None: a path of
+    ``missing`` is, lies inside or contains one of those outputs, so that stage's write would
+    delete the path's sidecar. ``outputs`` maps the ``normalized`` path of each output to the
+    stage that writes it (``stage_output_paths``). The error names each such path and how it
+    overlaps (``_tracked_output_overlaps``), whether a restore tried it first, and whether that
+    restore failed. Every check of missing tracked files against stage outputs builds its
+    refusal here: the run start's check of the loaded stages
+    (``executor.core.verify_tracked_files``), the run's check of a mapped stage's planned
+    instances (``Engine._expand_template``) and the dry run's check of both
+    (``pivot repro --dry-run``), so all of them agree. With no missing path it reads nothing.
+    """
+    if not missing.paths:
+        return None
+    overlaps = _tracked_output_overlaps(missing.paths, outputs, project_root)
+    if not overlaps:
+        return None
+    return exceptions.TrackedFileMissingError(
+        list(overlaps),
+        checkout_attempted=missing.checkout_attempted,
+        overlaps=overlaps,
+        restore_failed=missing.failed,
+    )
+
+
+def _tracked_output_overlaps(
+    missing: Iterable[str], outputs: Mapping[pathlib.Path, str], project_root: pathlib.Path
+) -> dict[str, str]:
+    """Say how each missing tracked path overlaps an output, for each one that overlaps one.
+
+    A path overlaps an output when it is that output, lies inside it or contains it, by their
+    normalized paths or by their resolved ones (``storage.path_forms``): a path that reaches an
+    output through a symlink overlaps it, and its description then says what both resolve to,
+    as ``find_declared_overlap`` says. When a path overlaps more than one output, its
+    description names the first of them in sorted path order: the outermost output that is or
+    holds the path, else the first output inside the path (``path_forms.overlapping``). The
+    normalized paths are asked first, and the resolved ones only when they overlap no output,
+    each form against the outputs' same form: so a description says what both resolve to only
+    where the normalized paths overlap no output.
+    """
+    real_outputs = {output: path_forms.resolved(output) for output in outputs}
+    lexical = path_forms.parts_trie((output, output) for output in real_outputs)
+    resolved = path_forms.parts_trie((real, output) for output, real in real_outputs.items())
+    overlaps = dict[str, str]()
+    for missing_path in missing:
+        path = pathlib.Path(missing_path)
+        output = path_forms.overlapping(lexical, path)
+        if output is not None:
+            relation = _relation(path, output)
+            resolves = None
+        else:
+            real_path = path_forms.resolved(path)
+            output = path_forms.overlapping(resolved, real_path)
+            if output is None:
+                continue
+            relation = _relation(real_path, real_outputs[output])
+            resolves = (real_path, real_outputs[output])
+        overlaps[missing_path] = _overlap_description(
+            relation, output, outputs[output], project_root, resolves
+        )
+    return overlaps
 
 
 def _warning(overlap: OutputOverlap, project_root: pathlib.Path) -> str:

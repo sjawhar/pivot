@@ -1109,7 +1109,7 @@ def test_find_tracked_hash_exact_match() -> None:
     tracked_trie: pygtrie.Trie[str] = pygtrie.Trie()
     tracked_trie[("/", "project", "data.csv")] = "/project/data.csv"
 
-    result = explain._find_tracked_hash(
+    result = explain.find_tracked_hash(
         pathlib.Path("/project/data.csv"), tracked_files, tracked_trie, None
     )
 
@@ -1123,7 +1123,7 @@ def test_find_tracked_hash_reads_a_member_from_the_committed_listing(
     """With the directory gone and no cache, ``corpus.pvt.listing`` gives a member's hash."""
     tracked = _track_corpus(mock_discovery.root, runner)
 
-    result = explain._find_tracked_hash(
+    result = explain.find_tracked_hash(
         tracked["corpus"] / "sub" / "b.csv", tracked["tracked_files"], tracked["tracked_trie"], None
     )
 
@@ -1137,7 +1137,7 @@ def test_find_tracked_hash_reads_a_member_from_the_cache_without_a_committed_lis
     tracked = _track_corpus(mock_discovery.root, runner)
     (mock_discovery.root / "corpus.pvt.listing").unlink()
 
-    result = explain._find_tracked_hash(
+    result = explain.find_tracked_hash(
         tracked["corpus"] / "sub" / "b.csv",
         tracked["tracked_files"],
         tracked["tracked_trie"],
@@ -1157,7 +1157,7 @@ def test_find_tracked_hash_has_no_hash_for_a_member_when_no_listing_exists(
     shutil.rmtree(tracked["cache_dir"])
 
     assert (
-        explain._find_tracked_hash(
+        explain.find_tracked_hash(
             tracked["corpus"] / "sub" / "b.csv",
             tracked["tracked_files"],
             tracked["tracked_trie"],
@@ -1170,7 +1170,7 @@ def test_find_tracked_hash_has_no_hash_for_a_member_when_no_listing_exists(
 def test_find_tracked_hash_not_tracked() -> None:
     """Returns None for an untracked path."""
     assert (
-        explain._find_tracked_hash(
+        explain.find_tracked_hash(
             pathlib.Path("/project/untracked.csv"),
             {},
             pygtrie.Trie(),
@@ -1187,7 +1187,7 @@ def test_find_tracked_hash_not_in_listing(
     tracked = _track_corpus(mock_discovery.root, runner)
 
     assert (
-        explain._find_tracked_hash(
+        explain.find_tracked_hash(
             tracked["corpus"] / "sub" / "c.csv",
             tracked["tracked_files"],
             tracked["tracked_trie"],
@@ -1209,7 +1209,7 @@ def test_find_tracked_hash_refuses_an_edited_committed_listing_the_cache_cannot_
     cache.get_cache_path(tracked["cache_dir"], listing.digest(original)).unlink()
 
     with pytest.raises(exceptions.CorruptListingError, match=r"corpus\.pvt\.listing: its bytes"):
-        explain._find_tracked_hash(
+        explain.find_tracked_hash(
             tracked["corpus"] / "sub" / "b.csv",
             tracked["tracked_files"],
             tracked["tracked_trie"],
@@ -1227,7 +1227,7 @@ def test_find_tracked_hash_reads_a_member_from_an_old_directory_pvt_with_one_war
 
     with caplog.at_level(logging.WARNING, logger="pivot.storage.track"):
         tracked = _discover_corpus(mock_discovery.root)
-        result = explain._find_tracked_hash(
+        result = explain.find_tracked_hash(
             tracked["corpus"] / "sub" / "b.csv",
             tracked["tracked_files"],
             tracked["tracked_trie"],
@@ -1341,3 +1341,101 @@ def test_get_stage_explanation_allow_missing_uses_lock_file_hash(
 
     assert "missing" not in result["reason"].lower()
     assert result["will_run"] is False
+
+
+@pytest.mark.parametrize("tracked", [True, False], ids=["its-pvt", "no-pvt"])
+def test_get_stage_explanation_restorable_of_dry_run_keep_going_has_no_lock_fallback(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, tracked: bool
+) -> None:
+    """A dry run that counts restorable tracked files as present (`--all --keep-going
+    --checkout-missing`, no --allow-missing) takes a missing dependency's hash from the .pvt of
+    the restorable file that tracks it, which decides against the lock's; a missing dependency
+    that no restorable file tracks stays missing, though the lock records its hash."""
+    state_dir = tmp_path / ".pivot"
+    state_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(project, "_project_root_cache", None)
+    normalized_path = str(project.normalize_path(tmp_path / "data.csv"))
+    dep = _input_ref("data.csv")
+    _write_lock(
+        state_dir,
+        "restorable_stage",
+        {"self:restorable_stage": "abc"},
+        dep_hashes={dep.identity: {"hash": "4321432143214321"}},
+    )
+    tracked_files = dict[str, track.PvtData]()
+    if tracked:
+        tracked_files[normalized_path] = track.PvtData(
+            path="data.csv", hash="1234123412341234", size=100
+        )
+    tracked_trie = pygtrie.Trie((pathlib.Path(path).parts, path) for path in tracked_files)
+
+    result = explain.get_stage_explanation(
+        stage_name="restorable_stage",
+        fingerprint={"self:restorable_stage": "abc"},
+        deps={"data": dep},
+        outs=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=state_dir,
+        store=_store(tmp_path),
+        lock_data=_lock(state_dir, "restorable_stage"),
+        tracked_files=tracked_files,
+        tracked_trie=tracked_trie,
+    )
+
+    assert result["will_run"] is True
+    assert result["reason"] == (
+        "Input dependencies changed" if tracked else "Missing deps: data.csv"
+    ), result
+
+
+def _helper_explain_assume_restored(
+    tmp_path: pathlib.Path, recorded: dict[ArtifactIdentity, HashInfo]
+) -> StageExplanation:
+    """The explanation of a stage reading data.csv, whose lock records ``recorded``, with
+    data.csv in ``assume_restored`` (the dry run's notice, ``status.restore_limits``)."""
+    state_dir = tmp_path / ".pivot"
+    dep = _input_ref("data.csv")
+    _write_lock(state_dir, "restored_stage", {"self:restored_stage": "abc"}, dep_hashes=recorded)
+    return explain.get_stage_explanation(
+        stage_name="restored_stage",
+        fingerprint={"self:restored_stage": "abc"},
+        deps={"data": dep},
+        outs=[],
+        params_instance=None,
+        overrides=None,
+        state_dir=state_dir,
+        store=_store(tmp_path),
+        lock_data=_lock(state_dir, "restored_stage"),
+        assume_restored=[dep.identity],
+    )
+
+
+def test_get_stage_explanation_assume_restored_of_dry_run_keep_going_takes_the_lock_hash(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A dependency of ``assume_restored`` that the lock records takes the lock's hash and is not
+    read from the disk: missing from it, the dependency is neither missing nor changed."""
+    result = _helper_explain_assume_restored(
+        tmp_path, {_input_ref("data.csv").identity: {"hash": "4321432143214321"}}
+    )
+
+    assert not (tmp_path / "data.csv").exists()
+    assert (result["will_run"], result["reason"], result["dep_changes"]) == (False, "", []), result
+
+
+def test_get_stage_explanation_assume_restored_of_dry_run_keep_going_hashes_an_unrecorded_dep(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A dependency of ``assume_restored`` that the lock does not record is hashed from the disk
+    as always, and counts as a change."""
+    (tmp_path / "data.csv").write_bytes(b"beta")
+
+    result = _helper_explain_assume_restored(tmp_path, {})
+
+    assert result["will_run"] is True, result
+    assert result["reason"] == "Input dependencies changed", result
+    assert [(change["old_hash"], change["new_hash"]) for change in result["dep_changes"]] == [
+        (None, _BETA_HASH)
+    ], result

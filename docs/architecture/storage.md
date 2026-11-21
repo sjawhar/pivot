@@ -117,6 +117,15 @@ sidecar a stage no pipeline declares records as its member (`member_skip.orphane
 `remote/sync.py` applies the same rule to the one `.pvt` it reads by path
 (`_get_file_hash_from_pvt`).
 
+## Paths in both forms
+
+A missing tracked path meets a stage's dependencies and outputs in both its forms, its absolute
+normalized path and its resolved path (`os.path.realpath`), and `Path.parts` in a `pygtrie.Trie`
+decides containment. `storage/path_forms.py` keeps the forms, the tries and the questions
+(`enclosing`, `held`, `overlapping`). Its callers are `engine/graph.py` (`_tracked_file_errors`,
+`_restore_creates`, `tracked_overlap`) and `ownership.tracked_output_refusal`; each docstring
+says its order of forms and questions.
+
 ## Lock and listing files
 
 - A lock records a directory as `{listing, size, nfiles}` on disk, not under `hash`, which a
@@ -133,6 +142,10 @@ sidecar a stage no pipeline declares records as its member (`member_skip.orphane
 - Every listing read follows `listing._resolve`: a committed listing is taken only when it hashes
   to the recorded hash and equals the cache's copy, if there is one. `listing.OnStale` chooses
   what a stale one does: `REFUSE` for `pivot verify`, `QUIET` for a stage the command does not run.
+  Where a cache was read and could not give the listing, the refusal is
+  `ListingUnavailableError` (its docstring says where), which a restore under
+  `repro --all --keep-going` tolerates (`executor/tracked_restore.py`); every other refusal is a
+  plain `CorruptListingError`.
 
 ### Objects read by hash
 
@@ -189,6 +202,11 @@ user-facing rules and their limits are under [`pivot track`](../cli/index.md#piv
 - A whole-directory tree (`cache.tree_path`) is used unchecked only when its `.content-checked`
   marker holds the listing's bytes. Restores and `cache.missing_cache_objects` check it with
   `repair=False`; only the commit path repairs (`cache._ensure_tree_complete`).
+- A directory restore starts from that tree only where it links the tree whole
+  (`cache.restore_tree`: SYMLINK first, and links into the cache allowed or no COPY among the
+  modes); `cache.missing_cache_objects`, which `pivot get` and `checkout --force` ask, reads the
+  same rule, so where links are refused and COPY is among the modes it looks up each member's
+  object, as the restore that copies it does.
 - A listing is also a cache object, at the directory's hash (`listing.store_object`).
 
 ## The naming lock and the register
