@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.11.1 (2026-11-21)
+
+### Performance Improvements
+
+- **fingerprint**: Parse each function's source once per fingerprint pass
+  ([#566](https://github.com/sjawhar/pivot/pull/566),
+  [`acc0104`](https://github.com/sjawhar/pivot/commit/acc01044d79f66239a01eb79585956766fa69fd0))
+
+
 ## v0.11.0 (2026-11-20)
 
 ### Chores
