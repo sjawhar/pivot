@@ -377,8 +377,10 @@ _identity_active: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextV
 # Per-pass memo, keyed by kind and object id, for function identities (`function_identity`),
 # type-hint classes (`_hint_parts`), user-class members (`_user_methods`), mark decisions
 # (`_mark_decision`), class identities (`_class_identity`), the parts of classes with no source
-# (`_sourceless_parts`) and the library part of a loaded module (`_held_module`), and by file
-# name for source file digests (`_source_digest`).
+# (`_sourceless_parts`), the library part of a loaded module (`_held_module`), and the parsed
+# source of a function's code object, a wrapper's code or any other object (`_source_tree`) and
+# a function's definition (`_function_ast`), each in a kind of its own; and by file name for
+# source file digests (`_source_digest`).
 # Set only inside `fingerprint_pass()`; a reload, a mutated cell or an edit is seen by the next
 # pass.
 _pass_memo: contextvars.ContextVar[dict[tuple[str, int | str], Any] | None] = (
@@ -1760,14 +1762,35 @@ def _source_tree(func: Callable[..., Any]) -> ast.Module | None:
     """Parse `func`'s own source, without following a functools.wraps chain.
 
     None for a wrapper without code of its own (functools.cache): it has no source of its own.
+    Within one `fingerprint_pass()` each source is parsed once and every stage that reaches it
+    shares the tree. A function's or method's source is the lines its code object names
+    (`co_filename`, `co_firstlineno`), so the closures one factory makes for each stage share one
+    parse (`_function_code`); a wrapper's is its own code's; anything else, a class included, is
+    parsed as itself. Each has a kind of its own, so no two of them share a tree. Callers only read
+    it.
     """
-    code = getattr(func, "__code__", None)
     if hasattr(func, "__wrapped__"):
+        code = getattr(func, "__code__", None)
         if not isinstance(code, types.CodeType):
             return None
-        target: object = code
-    else:
-        target = func
+        return _memoized("source_tree:wrapper", code, lambda: _parse_source(code))
+    function_code = _function_code(func)
+    if function_code is None:
+        return _memoized("source_tree:object", func, lambda: _parse_source(func))
+    return _memoized("source_tree:function", function_code, lambda: _parse_source(func))
+
+
+def _function_code(obj: object) -> types.CodeType | None:
+    """The code object `inspect` reads the source of function or method `obj` from; None for
+    anything else, a class that sets `__code__` or a callable instance included. The checks are by
+    exact type (neither type can be subclassed), so no user `__class__` runs."""
+    if type(obj) is types.MethodType:
+        obj = obj.__func__
+    return obj.__code__ if type(obj) is types.FunctionType else None
+
+
+def _parse_source(target: Callable[..., Any] | types.CodeType) -> ast.Module | None:
+    """The parse of `target`'s source; None when it has none or it does not parse."""
     try:
         return ast.parse(textwrap.dedent(loaded_source.getsource(target)))
     except (OSError, TypeError, SyntaxError):
@@ -1781,10 +1804,7 @@ def _wrapped_source_tree(func: Callable[..., Any]) -> ast.Module | None:
     target = _source_object(func)
     if target is None:
         return None
-    try:
-        return ast.parse(textwrap.dedent(loaded_source.getsource(target)))
-    except (OSError, TypeError, SyntaxError):
-        return None
+    return _parse_source(target)
 
 
 def _check_dynamic_name_access(
@@ -4026,11 +4046,8 @@ def _default_expressions(func: Callable[..., Any]) -> dict[str, ast.expr]:
     """
     if hasattr(func, "__wrapped__"):
         return {}
-    try:
-        node = ast_utils.get_function_ast(func)
-    except (ValueError, SyntaxError):
-        return {}
-    if node.name != getattr(func, "__name__", None):
+    node = _function_ast(func)
+    if node is None or node.name != getattr(func, "__name__", None):
         return {}
     args = node.args
     positional = [*args.posonlyargs, *args.args]
@@ -4040,6 +4057,25 @@ def _default_expressions(func: Callable[..., Any]) -> dict[str, ast.expr]:
         if default is not None:
             expressions[arg.arg] = default
     return expressions
+
+
+def _function_ast(func: Callable[..., Any]) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """The definition `ast_utils.get_function_ast` parses from `func`'s source; None when it has
+    none. Within one `fingerprint_pass()` each is parsed once: a function's or method's by its code
+    object (`_function_code`), so the closures one factory makes for each stage share it, and
+    anything else as itself, in a kind of its own."""
+    function_code = _function_code(func)
+    if function_code is None:
+        return _memoized("function_ast:object", func, lambda: _parse_function(func))
+    return _memoized("function_ast:function", function_code, lambda: _parse_function(func))
+
+
+def _parse_function(func: Callable[..., Any]) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """`ast_utils.get_function_ast(func)`, or None when `func` has no source or it does not parse."""
+    try:
+        return ast_utils.get_function_ast(func)
+    except (ValueError, SyntaxError):
+        return None
 
 
 def _is_literal(expression: ast.expr) -> bool:
