@@ -62,6 +62,15 @@ stage and every stage downstream of it, and runs the other stages. A
 missing tracked file has its own rules (see
 [Files tracked outside the pipeline](#files-tracked-outside-the-pipeline)).
 
+Pivot reads an input only when it is a regular file or a directory, symlinks
+followed. A FIFO, a socket or a device, or a symlink to one, is never read.
+Such an input fails its stage as unreadable, in every mode, as a file you
+cannot read does: `unreadable deps: scores.csv (a FIFO, not a file)`.
+`--explain` shows `Unreadable deps: scores.csv (a FIFO, not a file)`. A
+symlink to `/dev/null` is a device too (`a device, not a file`). For an empty
+input, use an empty file instead. At the path of a tracked file, such an entry
+counts as a missing tracked file.
+
 ### Directory inputs and `.pivotignore`
 
 A directory input (`t=pathlib.Path` on a directory) is hashed file by file, and

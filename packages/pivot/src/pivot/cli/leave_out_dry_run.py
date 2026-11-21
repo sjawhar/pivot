@@ -1,9 +1,9 @@
 """The dry run and ``--explain`` of ``pivot repro`` in leave-out mode
 (``engine.graph.is_leave_out_mode``: ``--all --keep-going``, outside a watch session): the
 decisions that run makes before it expands a mapped stage (``plan_run``), reading only, and what
-it would then run (``explanations``), as ``Engine._orchestrate_execution`` decides both. The rows
-of the mapped stages that do not expand (``explain_rows``) and what the dry run shows
-(``Explained``) serve every mode (``cli/repro.py`` ``_get_explanations``).
+it would then run (``explanations``), as ``Engine._orchestrate_execution`` decides both, with a
+row for each mapped stage that does not expand, of the kind the run's decision about it gives
+(``_explain_rows``). Any other mode is shown by ``cli/repro.py`` ``_get_explanations``.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     import networkx as nx
 
     from pivot.cli import console as tui_console
+    from pivot.cli.status import Explained
     from pivot.executor.core import MissingTrackedFiles
     from pivot.registry import PipelineLike, RegistryStageInfo
     from pivot.types import ArtifactRef, StageExplanation
@@ -117,7 +118,7 @@ def plan_run(stages_list: list[str] | None, *, checkout_missing: bool) -> Plan:
         stages=runnable,
         left_out=left_out,
         targets=None if stages_list is None else kept.targets,
-        left_out_targets=kept.left_out,
+        left_out_targets=kept.left_out_targets,
         wanted=kept.wanted,
     )
 
@@ -212,23 +213,20 @@ def _log_restore_limits(
         )
 
 
-def explain_rows(
-    kept: expansion.Expansion,
-    shown: list[str] | None,
-    refused: Collection[str],
-    pipeline: PipelineLike,
+def _explain_rows(
+    kept: expansion.Expansion, shown: list[str] | None, pipeline: PipelineLike
 ) -> list[tui_console.ExplainRow]:
     """A row for each mapped stage of ``shown`` (None: every one) that ``kept`` leaves
-    unexpanded, of the kind the run's decision about it gives: one of ``refused``
-    (``expansion.Expansion``'s), which the run fails, with the reason ``kept`` gives; one the
-    run blocks behind one of ``refused`` (``_refused_upstream``), naming that one; any other
-    one, which the run expands once its producer is current, with what it waits for. In the
-    order of the kinds of ``status_cli.DRY_RUN_SHOWN``, each kind's rows in the order the
-    pipeline holds them."""
+    unexpanded, of the kind the run's decision about it gives: one of ``kept``'s ``refused``,
+    which the run fails, with the reason ``kept`` gives; one the run blocks behind one of those
+    (``_refused_upstream``), naming that one; any other one, which the run expands once its
+    producer is current, with what it waits for. In the order of the kinds of
+    ``status_cli.DRY_RUN_SHOWN``, each kind's rows in the order the pipeline holds them."""
     from pivot import status as status_mod
     from pivot.cli import console as tui_console_mod
     from pivot.cli import status as status_cli
 
+    refused = kept["refused"]
     rows = list[tui_console_mod.ExplainRow]()
     for row in status_mod.not_expanded_status(kept, shown):
         name = row["name"]
@@ -243,24 +241,6 @@ def explain_rows(
     return sorted(rows, key=lambda row: kinds.index(row.kind))
 
 
-class Explained(NamedTuple):
-    """What ``--explain`` and ``--dry-run`` show (``cli/repro.py`` ``_get_explanations``; in
-    leave-out mode, ``explanations``)."""
-
-    explanations: list[StageExplanation]
-    rows: list[tui_console.ExplainRow]
-    """A row for each mapped stage that does not expand (``explain_rows``). In leave-out mode:
-    one the run would expand once its producer is current (``status_cli.NOT_EXPANDED_ROW``);
-    one it refuses to expand (``expansion.Expansion``'s ``refused``, ``REFUSED_ROW``), with the
-    reason it fails that stage with, which runs none of its instances; and one it blocks behind
-    a refused one (``BLOCKED_ROW``), naming that one. In any other mode every row is not yet
-    expanded, refused and blocked mapped stages included, as 0.10.4 shows them."""
-    orphans: dict[str, str]
-    """Each orphaned instance the run would remove, mapped to its mapped stage."""
-    left_out_targets: dict[str, exceptions.DependencyNotFoundError]
-    """Each target the run leaves out (leave-out mode), as given, with its cause."""
-
-
 def explanations(
     stages_list: list[str] | None,
     *,
@@ -271,7 +251,7 @@ def explanations(
 ) -> Explained:
     """What ``pivot repro --all --keep-going`` of ``stages_list`` would do, for ``--dry-run``
     and ``--explain``: the stage explanations, a row for each mapped stage that does not expand
-    (``explain_rows``), each orphaned instance the run would remove, mapped to its mapped stage
+    (``_explain_rows``), each orphaned instance the run would remove, mapped to its mapped stage
     (``status.orphaned_instances``: of each mapped stage the run expands without refusing,
     ``cli_helpers.eligible_templates``, unless it commits nothing), and each target it leaves
     out. The command refuses ``--allow-missing`` in this mode, so no missing input is allowed.
@@ -299,7 +279,7 @@ def explanations(
     plan = plan_run(stages_list, checkout_missing=checkout_missing)
     if plan.left_out_targets and not plan.targets:
         # Every target is left out; no target would explain every stage
-        return Explained(
+        return status_cli.Explained(
             explanations=[], rows=[], orphans={}, left_out_targets=plan.left_out_targets
         )
     pipeline = cli_helpers.get_pipeline()
@@ -354,7 +334,7 @@ def explanations(
         known=known,
         restorable=plan.found.restorable,
     )
-    rows = explain_rows(kept, shown_templates, kept["refused"], pipeline)
+    rows = _explain_rows(kept, shown_templates, pipeline)
     _log_restore_limits(
         [row.name for row in rows if row.kind == status_cli.NOT_EXPANDED_ROW],
         plan,
@@ -363,7 +343,7 @@ def explanations(
         not_current,
         force=force,
     )
-    return Explained(
+    return status_cli.Explained(
         explanations=stage_explanations,
         rows=rows,
         orphans=orphans,

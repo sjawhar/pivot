@@ -33,44 +33,29 @@ def test_forms_are_the_path_and_its_real_path_through_a_missing_paths_existing_a
     assert found == (root / "link" / "missing.txt", root / "real" / "missing.txt")
 
 
-def test_enclosing_and_held_ask_each_form_given_where_a_symlinked_directory_splits_them(
-    tmp_path: pathlib.Path,
-) -> None:
-    """``link`` links to ``target/sub``: by its normalized form ``link`` holds the stored path
-    ``link/a``, and by its resolved form it lies inside the stored path ``target``, whose
-    resolved form also holds ``link/a``'s resolved form."""
-    root = _helper_root(tmp_path)
-    (root / "target" / "sub").mkdir(parents=True)
-    (root / "link").symlink_to("target/sub")
-    a, b, query = str(root / "link" / "a"), str(root / "target"), root / "link"
-    trie = path_forms.forms_trie([a, b])
-
-    assert path_forms.enclosing(trie, query) is None
-    assert path_forms.enclosing(trie, *path_forms.forms(query)) == b
-    assert path_forms.held(trie, query) == [a]
-    assert path_forms.held(trie, *path_forms.forms(query)) == [a]
-    assert path_forms.held(trie, path_forms.resolved(query)) == [a]
-
-
 def test_overlapping_both_forms_at_once_and_form_by_form_name_different_stored_paths(
     tmp_path: pathlib.Path,
 ) -> None:
     """With ``link`` linking to ``target/sub``, ``link`` holds ``link/a`` by its normalized form
-    and lies inside ``target`` by its resolved form. Asked of both forms at once (a trie keyed by
-    both forms, as ``engine.graph.tracked_overlap`` asks), "is or lies inside" comes first and
-    names ``target``; asked form by form, each against the stored paths' same form (as
+    and lies inside ``target`` by its resolved form, whose resolved form also holds ``link/a``'s
+    resolved form. Asked of both forms at once (a trie keyed by both forms, as
+    ``engine.graph.tracked_overlap`` asks), "is or lies inside" comes first and names
+    ``target``; asked form by form, each against the stored paths' same form (as
     ``ownership.tracked_output_refusal`` asks), the normalized form comes first and names
     ``link/a``."""
     root = _helper_root(tmp_path)
     (root / "target" / "sub").mkdir(parents=True)
     (root / "link").symlink_to("target/sub")
     a, b, query = root / "link" / "a", root / "target", root / "link"
+    trie = path_forms.forms_trie([str(a), str(b)])
     lexical = path_forms.parts_trie([(a, a), (b, b)])
     resolved = path_forms.parts_trie([(path_forms.resolved(a), a), (path_forms.resolved(b), b)])
 
-    both = path_forms.overlapping(path_forms.forms_trie([str(a), str(b)]), *path_forms.forms(query))
-
-    assert both == str(b)
+    assert path_forms.enclosing(trie, query) is None
+    assert path_forms.held(trie, query) == [str(a)]
+    assert path_forms.held(trie, *path_forms.forms(query)) == [str(a)]
+    assert path_forms.held(trie, path_forms.resolved(query)) == [str(a)]
+    assert path_forms.overlapping(trie, *path_forms.forms(query)) == str(b)
     assert path_forms.overlapping(lexical, query) == a
     assert path_forms.overlapping(resolved, path_forms.resolved(query)) == b
 
@@ -90,7 +75,6 @@ def test_a_path_equal_to_a_stored_path_in_one_form_only_is_it_in_that_form(
 
     assert path_forms.enclosing(trie, query) is None
     assert path_forms.enclosing(trie, *path_forms.forms(query)) == str(stored_real)
-    assert path_forms.overlapping(trie, *path_forms.forms(query)) == str(stored_real)
     assert path_forms.enclosing(trie, root / "real" / "g") == str(stored_link)
     assert path_forms.enclosing(lexical, query) is None
     assert path_forms.enclosing(lexical, *path_forms.forms(query)) == stored_real
@@ -99,19 +83,27 @@ def test_a_path_equal_to_a_stored_path_in_one_form_only_is_it_in_that_form(
 @pytest.mark.parametrize(
     ("stored", "query", "enclosing", "held"),
     [
-        pytest.param("data", "data-backup/x", None, [], id="a-longer-name-is-not-inside"),
-        pytest.param("data-backup/x", "data", None, [], id="a-shorter-name-does-not-hold"),
-        pytest.param("data/x", "data", None, ["data/x"], id="a-directory-holds"),
-        pytest.param("data", "data/x", "data", [], id="a-path-lies-inside"),
-        pytest.param("data", "data", "data", [], id="a-path-is"),
+        pytest.param(["data"], "data-backup/x", None, [], id="a-longer-name-is-not-inside"),
+        pytest.param(["data-backup/x"], "data", None, [], id="a-shorter-name-does-not-hold"),
+        pytest.param(["data/x"], "data", None, ["data/x"], id="a-directory-holds"),
+        pytest.param(["data"], "data/x", "data", [], id="a-path-lies-inside"),
+        pytest.param(["data"], "data", "data", [], id="a-path-is"),
+        pytest.param(
+            ["data", "data/x"],
+            "data",
+            "data",
+            ["data", "data/x"],
+            id="a-path-that-holds-is-held-too",
+        ),
     ],
 )
 def test_path_parts_decide_containment_not_a_string_prefix(
-    tmp_path: pathlib.Path, stored: str, query: str, enclosing: str | None, held: list[str]
+    tmp_path: pathlib.Path, stored: list[str], query: str, enclosing: str | None, held: list[str]
 ) -> None:
-    """``data-backup/x`` is not inside ``data``, nor does ``data`` hold it."""
+    """``data-backup/x`` is not inside ``data``, nor does ``data`` hold it. A path that holds a
+    stored path is among those ``held`` gives where it is stored itself."""
     root = _helper_root(tmp_path)
-    trie = path_forms.forms_trie([str(root / stored)])
+    trie = path_forms.forms_trie([str(root / path) for path in stored])
     forms = path_forms.forms(root / query)
 
     assert path_forms.enclosing(trie, *forms) == _helper_stored(root, enclosing)

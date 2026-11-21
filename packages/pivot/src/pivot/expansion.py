@@ -281,12 +281,13 @@ def mapped_targets(
 class KeptTargets(NamedTuple):
     """What a run in leave-out mode keeps of its targets (``keep_targets``)."""
 
-    left_out: dict[str, exceptions.DependencyNotFoundError]
+    left_out_targets: dict[str, exceptions.DependencyNotFoundError]
     """Each target, as given, whose stage the run leaves out, with that stage's cause."""
     targets: list[str]
     """The other targets, as given, in their order."""
     stages: list[str]
-    """``targets`` with each instance name replaced by its template (``mapped_targets``)."""
+    """``targets`` with each instance name replaced by its template, each once
+    (``mapped_targets``)."""
     wanted: dict[str, dict[str, set[str]]]
     """The keys each template expands for ``targets`` (``mapped_targets``)."""
 
@@ -310,7 +311,7 @@ def keep_targets(
             found[target] = left_out[stage]
     kept = [target for target in targets if target not in found]
     stages, wanted = mapped_targets(kept, templates)
-    return KeptTargets(left_out=found, targets=kept, stages=stages, wanted=wanted)
+    return KeptTargets(left_out_targets=found, targets=kept, stages=stages, wanted=wanted)
 
 
 def stage_lock(

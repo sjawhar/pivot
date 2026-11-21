@@ -1717,7 +1717,7 @@ class Engine:
             # unknown stage: the run runs the other targets, and the command then fails naming
             # it (``left_out_targets``)
             kept = expansion.keep_targets(targets, templates, left_out)
-            self._left_out_targets = kept.left_out
+            self._left_out_targets = kept.left_out_targets
             if not kept.targets:
                 # No target is left; get_execution_order would take no target as every stage
                 return {}

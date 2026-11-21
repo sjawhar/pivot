@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     import networkx as nx
 
     from pivot.cli import console as tui_console
+    from pivot.cli.status import Explained
     from pivot.executor import ExecutionSummary
 
 
@@ -132,9 +133,9 @@ def _get_explanations(
     *,
     leave_out: bool = False,
     checkout_missing: bool = False,
-) -> leave_out_dry_run.Explained:
+) -> Explained:
     """Resolve dependencies, build graph, and return stage explanations, with a row for each
-    mapped stage not yet expanded (``leave_out_dry_run.explain_rows``: the run would expand it
+    mapped stage not yet expanded (``status.not_expanded_status``: the run would expand it
     once its producer is current; a mapped stage the run refuses to expand, or blocks behind
     one, is shown so too, as 0.10.4 shows it), and each orphaned instance the run would remove,
     mapped to its mapped stage (``status.orphaned_instances``): of each mapped stage the run
@@ -158,6 +159,8 @@ def _get_explanations(
             checkout_missing=checkout_missing,
         )
     from pivot import status as status_mod
+    from pivot.cli import console as tui_console_mod
+    from pivot.cli import status as status_cli
 
     result, known = cli_helpers.expand_mapped_stages(force=force, allow_missing=allow_missing)
     order = cli_helpers.run_order(stages_list)
@@ -196,9 +199,12 @@ def _get_explanations(
         graph=graph,
         known=known,
     )
-    return leave_out_dry_run.Explained(
+    return status_cli.Explained(
         explanations=explanations,
-        rows=leave_out_dry_run.explain_rows(result, shown_templates, set[str](), pipeline),
+        rows=[
+            tui_console_mod.ExplainRow(status_cli.NOT_EXPANDED_ROW, row["name"], row["reason"])
+            for row in status_mod.not_expanded_status(result, shown_templates)
+        ],
         orphans=orphans,
         left_out_targets={},
     )

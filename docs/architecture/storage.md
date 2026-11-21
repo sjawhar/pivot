@@ -117,6 +117,15 @@ sidecar a stage no pipeline declares records as its member (`member_skip.orphane
 `remote/sync.py` applies the same rule to the one `.pvt` it reads by path
 (`_get_file_hash_from_pvt`).
 
+## Paths in both forms
+
+A missing tracked path meets a stage's dependencies and outputs in both its forms, its absolute
+normalized path and its resolved path (`os.path.realpath`), and `Path.parts` in a `pygtrie.Trie`
+decides containment. `storage/path_forms.py` keeps the forms, the tries and the questions
+(`enclosing`, `held`, `overlapping`). Its callers are `engine/graph.py` (`_tracked_file_errors`,
+`_restore_creates`, `tracked_overlap`) and `ownership.tracked_output_refusal`; each docstring
+says its order of forms and questions.
+
 ## Lock and listing files
 
 - A lock records a directory as `{listing, size, nfiles}` on disk, not under `hash`, which a

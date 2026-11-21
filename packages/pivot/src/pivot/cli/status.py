@@ -63,11 +63,31 @@ DRY_RUN_SHOWN = {
     BLOCKED_ROW: DryRunShown(would_run=False, words="would be blocked"),
 }
 """Each kind of row that ``pivot repro --dry-run`` lists among its stages, in the order it lists
-them, which is the order ``--explain`` shows the same rows in too
-(``cli/leave_out_dry_run.py`` ``explain_rows``), with how the dry run lists that kind: the run
-expands a mapped stage not yet expanded once its producer is current and runs its instances
-(``NOT_EXPANDED_ROW``), fails one it refuses to expand and runs none of its instances
-(``REFUSED_ROW``), and blocks one behind a refused one (``BLOCKED_ROW``)."""
+them, which is the order ``--explain`` shows the same rows in too (``Explained.rows``), with how
+the dry run lists that kind: the run expands a mapped stage not yet expanded once its producer is
+current and runs its instances (``NOT_EXPANDED_ROW``), fails one it refuses to expand and runs
+none of its instances (``REFUSED_ROW``), and blocks one behind a refused one (``BLOCKED_ROW``)."""
+
+
+class Explained(NamedTuple):
+    """What ``pivot repro --explain`` and ``--dry-run`` show (``cli/repro.py``
+    ``_get_explanations``; in leave-out mode, ``cli/leave_out_dry_run.py`` ``explanations``)."""
+
+    explanations: list[StageExplanation]
+    rows: list[console.ExplainRow]
+    """A row for each mapped stage shown that does not expand. In leave-out mode
+    (``cli/leave_out_dry_run.py`` ``explanations``), of the kind the run's decision gives: one
+    the run would expand once its producer is current (``NOT_EXPANDED_ROW``); one it refuses to
+    expand (``expansion.Expansion``'s ``refused``, ``REFUSED_ROW``), with the reason it fails
+    that stage with, which runs none of its instances; and one it blocks behind a refused one
+    (``BLOCKED_ROW``), naming that one; in the order of the kinds of ``DRY_RUN_SHOWN``. In any
+    other mode (``cli/repro.py`` ``_get_explanations``), every row is not yet expanded
+    (``NOT_EXPANDED_ROW``), refused and blocked mapped stages included, as 0.10.4 shows them
+    (``status.not_expanded_status``)."""
+    orphans: dict[str, str]
+    """Each orphaned instance the run would remove, mapped to its mapped stage."""
+    left_out_targets: dict[str, exceptions.DependencyNotFoundError]
+    """Each target the run leaves out (leave-out mode), as given, with its cause."""
 
 
 @cli_decorators.pivot_command(allow_all=True)

@@ -3,12 +3,18 @@
 A path's forms are its absolute normalized path and its resolved path (``os.path.realpath``,
 which resolves a missing path's existing ancestors), so a path that reaches another through a
 symlink meets it in its resolved form. A ``pygtrie.Trie`` keyed by ``Path.parts`` decides
-containment, never a string prefix: ``data-backup/x`` is not inside ``data``. These checks of
-a path against stored paths by both forms ask here: the missing tracked files a stage reads and
-the paths a ``--checkout-missing`` restore creates (``engine.graph.get_runnable_stages``), the
-restorable paths a dependency's restore changes (``engine.graph.tracked_overlap``), and the
-stage outputs a missing tracked path overlaps (``ownership.tracked_output_refusal``). Each
-caller composes its own order of forms and questions from these primitives, and says which.
+containment, never a string prefix: ``data-backup/x`` is not inside ``data``.
+
+The callers below are this module's; they are not every lookup of a path by both forms, as
+older code asks its own (``engine/engine.py``'s ``_MissingDependencyRun.awaits``,
+``ownership.control_path_refusal``, ``cli/forget_cache.py``). Three compose their own order of
+forms and questions from these primitives, and say which: the missing tracked files a stage
+reads (``engine.graph.get_runnable_stages``, ``_tracked_file_errors``), the restorable paths a
+dependency's restore changes (``engine.graph.tracked_overlap``), and the stage outputs a
+missing tracked path overlaps (``ownership.tracked_output_refusal``). The paths a
+``--checkout-missing`` restore creates (``engine.graph``'s ``_restore_creates``) take only the
+forms and the trie from here (``forms``, ``forms_trie``) and ask their own question there:
+whether a path is or holds a restored path, or lies inside one whose restore creates it.
 """
 
 from __future__ import annotations
@@ -62,7 +68,14 @@ def held[V: (str, pathlib.Path)](trie: pygtrie.Trie[V], *paths: pathlib.Path) ->
     """For each path of ``paths`` that holds a stored path of ``trie``, the values of the stored
     paths it is or holds; each value once, sorted in its type's order: a ``str`` by character, a
     ``pathlib.Path`` by its parts (``a/x`` before ``a-1`` as paths, after it as strings)."""
-    return sorted(_held(trie, paths))
+    return sorted(
+        {
+            value
+            for path in paths
+            if trie.has_subtrie(path.parts)
+            for value in trie.values(prefix=path.parts)
+        }
+    )
 
 
 def overlapping[V: (str, pathlib.Path)](trie: pygtrie.Trie[V], *paths: pathlib.Path) -> V | None:
@@ -71,16 +84,5 @@ def overlapping[V: (str, pathlib.Path)](trie: pygtrie.Trie[V], *paths: pathlib.P
     found = enclosing(trie, *paths)
     if found is not None:
         return found
-    inside = _held(trie, paths)
-    return min(inside) if inside else None
-
-
-def _held[V](trie: pygtrie.Trie[V], paths: Iterable[pathlib.Path]) -> set[V]:
-    """For each path of ``paths`` that holds a stored path of ``trie``, the values of the stored
-    paths it is or holds."""
-    return {
-        value
-        for path in paths
-        if trie.has_subtrie(path.parts)
-        for value in trie.values(prefix=path.parts)
-    }
+    inside = held(trie, *paths)
+    return inside[0] if inside else None

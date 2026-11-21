@@ -2,19 +2,16 @@ from __future__ import annotations
 
 import errno
 import os
+import pathlib
 import shutil
 import stat
 import sys
-from typing import TYPE_CHECKING
 
 import pytest
 
 from pivot import exceptions
 from pivot.storage import regular_file
 from tests import helpers
-
-if TYPE_CHECKING:
-    import pathlib
 
 _needs_o_path_and_proc = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="O_PATH and /proc are Linux-only"
@@ -30,15 +27,27 @@ _COPY_BUFSIZE: int = shutil.COPY_BUFSIZE  # pyright: ignore[reportAttributeAcces
 
 
 def _helper_record_opens(
-    monkeypatch: pytest.MonkeyPatch, *, leased: bool = False, proc_error: int | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    leased: bool = False,
+    proc_error: int | None = None,
+    swap_in: str | None = None,
+    descriptors: list[int] | None = None,
 ) -> list[tuple[str, int]]:
-    """Record each ``os.open`` as (path, flags). With ``leased``, an open that takes
-    ``O_NONBLOCK`` fails with ``EWOULDBLOCK``, as on a file under a conflicting lease (a Samba
-    oplock, an nfsd write delegation); with ``proc_error``, an open under ``/proc`` fails with
-    that errno, naming its ``/proc`` path: ``ENOENT`` where ``/proc`` is not mounted, ``EMFILE``
-    where the process has no descriptor left."""
+    """Record each ``os.open`` as (path, flags), and append each descriptor one returns to
+    ``descriptors``. With ``leased``, an open that takes ``O_NONBLOCK`` fails with
+    ``EWOULDBLOCK``, as on a file under a conflicting lease (a Samba oplock, an nfsd write
+    delegation); with ``proc_error``, an open under ``/proc`` fails with that errno, naming its
+    ``/proc`` path: ``ENOENT`` where ``/proc`` is not mounted, ``EMFILE`` where the process has
+    no descriptor left. With ``swap_in``, just before the first open outside ``/proc`` that
+    takes neither ``O_NONBLOCK`` nor ``O_PATH`` (the blocking open after an ``EWOULDBLOCK``),
+    the entry at its path is replaced by one of that kind (``helpers.occupy``); a writer holds
+    a FIFO open during that open, so it returns at once, as it does once a writer comes."""
     real_open = os.open
+    # Read now: a test may remove O_PATH from os after this call
+    o_path = getattr(os, "O_PATH", 0)
     opened = list[tuple[str, int]]()
+    swapping = [swap_in] if swap_in is not None else []
 
     def _open(
         path: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
@@ -49,10 +58,75 @@ def _helper_record_opens(
             raise OSError(errno.EWOULDBLOCK, os.strerror(errno.EWOULDBLOCK), name)
         if proc_error is not None and name.startswith("/proc/"):
             raise OSError(proc_error, os.strerror(proc_error), name)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
+        writer: int | None = None
+        if swapping and not flags & (os.O_NONBLOCK | o_path) and not name.startswith("/proc/"):
+            kind = swapping.pop()
+            os.unlink(name)
+            helpers.occupy(pathlib.Path(name), kind)
+            if kind == "fifo":
+                # A writer opens without waiting only while a reader is there
+                reader = real_open(name, os.O_RDONLY | os.O_NONBLOCK)
+                writer = real_open(name, os.O_WRONLY | os.O_NONBLOCK)
+                os.close(reader)
+        try:
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        finally:
+            if writer is not None:
+                os.close(writer)
+        if descriptors is not None:
+            descriptors.append(descriptor)
+        return descriptor
 
     monkeypatch.setattr(os, "open", _open)
     return opened
+
+
+def _helper_lease_without(
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+    *,
+    descriptors: list[int],
+    swap_in: str | None = None,
+) -> list[tuple[str, int]]:
+    """``_helper_record_opens`` with ``leased``, where ``missing`` is missing: "O_PATH",
+    removed from ``os``, or "/proc", under which an open fails with ``ENOENT``."""
+    opened = _helper_record_opens(
+        monkeypatch,
+        leased=True,
+        proc_error=errno.ENOENT if missing == "/proc" else None,
+        swap_in=swap_in,
+        descriptors=descriptors,
+    )
+    if missing == "O_PATH":
+        monkeypatch.delattr(os, "O_PATH", raising=False)
+    return opened
+
+
+def _helper_blocking_fallback_opens(
+    path: pathlib.Path, missing: str, located: list[int]
+) -> list[tuple[str, int]]:
+    """The opens ``open_regular_file`` makes of the leased file at ``path`` where ``missing``
+    is missing (``_helper_lease_without``): its ``O_NONBLOCK`` open; where "/proc" is the one
+    missing, the ``O_PATH`` open and the open through ``/proc/self/fd`` of that descriptor, the
+    one of ``located``; then the open of ``path`` without ``O_NONBLOCK``."""
+    read_flags = os.O_RDONLY | os.O_NOCTTY
+    checked = (
+        []
+        if missing == "O_PATH"
+        else [(str(path), os.O_PATH), (f"/proc/self/fd/{located[0]}", read_flags)]
+    )
+    return [(str(path), read_flags | os.O_NONBLOCK), *checked, (str(path), read_flags)]
+
+
+def _helper_is_open(descriptor: int) -> bool:
+    """Whether ``descriptor`` is open in this process: ``fstat`` fails with ``EBADF`` on a
+    closed one."""
+    try:
+        os.fstat(descriptor)
+    except OSError as error:
+        assert error.errno == errno.EBADF, error
+        return False
+    return True
 
 
 @pytest.mark.parametrize(
@@ -185,24 +259,61 @@ def test_open_regular_file_refuses_a_fifo_or_a_device_where_the_open_is_leased(
 
 
 @pytest.mark.parametrize("missing", ["O_PATH", pytest.param("/proc", marks=_needs_o_path_and_proc)])
-def test_open_regular_file_raises_the_lease_error_without_o_path_or_proc(
+def test_open_regular_file_opens_a_leased_file_blocking_without_o_path_or_proc(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, missing: str
 ) -> None:
-    """Where ``O_PATH`` (Linux-only) or ``/proc`` is missing, the ``O_NONBLOCK`` open's
-    ``EWOULDBLOCK`` is raised, naming the path: never "no such file" for a file that is
-    there."""
+    """Where ``O_PATH`` (Linux-only) or ``/proc`` is missing, a file whose ``O_NONBLOCK`` open
+    fails with ``EWOULDBLOCK`` is opened again by its path without ``O_NONBLOCK``, waiting as
+    0.10.4's ``open`` did, after the ``O_PATH`` check where there is ``O_PATH``: the file is
+    read as before, through the descriptor of that open, blocking, and the ``O_PATH``
+    descriptor is closed."""
     path = tmp_path / "input"
     helpers.occupy(path, "regular_file")
-    _helper_record_opens(
-        monkeypatch, leased=True, proc_error=errno.ENOENT if missing == "/proc" else None
-    )
-    if missing == "O_PATH":
-        monkeypatch.delattr(os, "O_PATH", raising=False)
+    descriptors = list[int]()
+    opened = _helper_lease_without(monkeypatch, missing, descriptors=descriptors)
 
-    with pytest.raises(BlockingIOError) as raised:
-        regular_file.open_regular_file(path)
+    with open(regular_file.open_regular_file(path), "rb") as f:
+        returned, blocking, data = f.fileno(), os.get_blocking(f.fileno()), f.read()
+        *located, reopened = descriptors
+        still_open = [descriptor for descriptor in located if _helper_is_open(descriptor)]
 
-    assert (raised.value.errno, raised.value.filename) == (errno.EWOULDBLOCK, str(path))
+    assert (returned, blocking, data, still_open) == (reopened, True, b"data", [])
+    assert opened == _helper_blocking_fallback_opens(path, missing, located)
+
+
+@pytest.mark.parametrize("missing", ["O_PATH", pytest.param("/proc", marks=_needs_o_path_and_proc)])
+@pytest.mark.parametrize(
+    ("kind", "named"),
+    [
+        pytest.param("fifo", "a FIFO", id="fifo"),
+        pytest.param("symlink_to_device", "a device", id="symlink_to_device"),
+    ],
+)
+def test_open_regular_file_refuses_a_fifo_or_a_device_swapped_in_before_its_blocking_open(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, missing: str, kind: str, named: str
+) -> None:
+    """Where ``O_PATH`` or ``/proc`` is missing, the descriptor of the open without
+    ``O_NONBLOCK`` after an ``EWOULDBLOCK`` is checked too: a FIFO or a device swapped in for
+    the regular file just before that open, after the ``O_PATH`` check where there is
+    ``O_PATH``, is refused, naming its kind, and every descriptor opened is closed. A writer
+    holds the FIFO open, so that open returns at once; without one it would wait for a writer
+    before the check refused it, the race ``open_regular_file`` states. Each call must return
+    within the hard timeout of ``helpers.call_without_waiting``."""
+    path = tmp_path / "input"
+    helpers.occupy(path, "regular_file")
+    descriptors = list[int]()
+    opened = _helper_lease_without(monkeypatch, missing, descriptors=descriptors, swap_in=kind)
+
+    with pytest.raises(exceptions.NotAFileError) as raised:
+        helpers.call_without_waiting(
+            lambda: regular_file.open_regular_file(path),
+            lambda: helpers.free_fifo(path),
+            timeout=10,
+        )
+
+    assert (raised.value.kind, raised.value.filename) == (named, str(path))
+    assert opened == _helper_blocking_fallback_opens(path, missing, descriptors[:-1])
+    assert [descriptor for descriptor in descriptors if _helper_is_open(descriptor)] == []
 
 
 @_needs_o_path_and_proc

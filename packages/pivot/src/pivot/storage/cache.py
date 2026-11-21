@@ -1986,9 +1986,13 @@ def missing_linked_objects(
     or, for a directory, the object of each file of its listing ``members``. Each is looked up
     as that restore looks it up (``resolve_cache_object_path``). With ``readable``, each one
     found is also opened for reading, as every checkout of it opens it (a copy reads it, and a
-    link's staged entry is opened through it, ``_fstat_staged``): the restore would fail on an
-    ``OSError`` that open gives, as on one the lookup gives (``_is_cache_object_path``). An
-    ``OSError`` of the lookup or the open is raised."""
+    link's staged entry is opened through it, ``_fstat_staged``), by
+    ``regular_file.open_regular_file``: the lookup found a regular file, on which that open
+    fails where a plain open fails, with the same ``OSError``, and waits where it waits (a
+    leased file). The restore would fail on that ``OSError``, as on one the lookup gives
+    (``_is_cache_object_path``). An ``OSError`` of the lookup or the open is raised, and so is
+    ``exceptions.NotAFileError`` (an ``OSError`` too) for an entry swapped in since the
+    lookup that is no regular file."""
     if is_dir_hash(output_hash):
         assert members is not None, "a directory is restored from its listing"
         hashes = [entry["hash"] for entry in members["files"]]
@@ -2000,7 +2004,7 @@ def missing_linked_objects(
         if found is None:
             missing.append(file_hash)
         elif readable:
-            os.close(os.open(found, os.O_RDONLY))
+            os.close(regular_file.open_regular_file(found))
     return missing
 
 

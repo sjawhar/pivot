@@ -54,21 +54,34 @@ def open_regular_file(path: str | os.PathLike[str]) -> int:
     descriptor for the caller to close (``open(descriptor, ...)`` takes it over).
 
     Pivot never reads a FIFO, a socket or a device: an open of a FIFO waits for a writer, and a
-    device such as ``/dev/zero`` never ends. This open keeps that rule, and waits only where
-    ``open`` waits on a regular file. It takes ``O_NONBLOCK``, so on a FIFO it returns at once
-    instead of waiting for a writer, and ``require_regular_file`` checks the descriptor itself
-    (``fstat``), so an entry swapped in after any earlier ``stat`` of the path is refused too,
-    the descriptor closed (a socket's open fails first, with ``ENXIO``). It takes ``O_NOCTTY``,
-    so a terminal swapped in never becomes the controlling terminal of a session leader that
-    has none before the check refuses it. A regular file's descriptor is made blocking again
-    before it is returned, so every read of it waits for its bytes, as a read of a file
-    ``open`` opened does. Where the ``O_NONBLOCK`` open fails with ``EAGAIN``, the file is
-    opened again as ``_open_leased`` says.
+    device such as ``/dev/zero`` never ends. This open keeps that rule. It takes ``O_NONBLOCK``,
+    so on a FIFO it returns at once instead of waiting for a writer, and
+    ``require_regular_file`` checks the descriptor itself (``fstat``), so an entry swapped in
+    after any earlier ``stat`` of the path is refused too, the descriptor closed (a socket's
+    open fails first, with ``ENXIO``). It takes ``O_NOCTTY``, so a terminal swapped in never
+    becomes the controlling terminal of a session leader that has none before the check refuses
+    it. A regular file's descriptor is made blocking again before it is returned, so every read
+    of it waits for its bytes, as a read of a file ``open`` opened does.
+
+    Where the ``O_NONBLOCK`` open fails with ``EAGAIN``, the file is opened again without
+    ``O_NONBLOCK``, waiting as ``open`` waits, as ``_open_leased`` says. So the open waits only
+    where ``open`` waits on a regular file, but for one race: where ``O_PATH`` or ``/proc`` is
+    missing, and only there, an entry swapped in between the failed ``O_NONBLOCK`` open and
+    that blocking open can make the open wait (a FIFO, for a writer) before the check refuses
+    it.
     """
     try:
         descriptor = os.open(path, _READ_FLAGS | os.O_NONBLOCK)
-    except BlockingIOError as leased:
-        return _open_leased(path, leased)
+    except BlockingIOError:
+        return _open_leased(path)
+    return _checked(path, descriptor)
+
+
+def _checked(path: str | os.PathLike[str], descriptor: int) -> int:
+    """``descriptor``, open for reading at ``path``, once ``require_regular_file`` passes on
+    what it holds (``fstat``), made blocking (one opened without ``O_NONBLOCK`` already is).
+    Where the check refuses, or making it blocking fails, the descriptor is closed and the
+    error raised."""
     try:
         require_regular_file(path, os.fstat(descriptor).st_mode)
         os.set_blocking(descriptor, True)
@@ -78,29 +91,38 @@ def open_regular_file(path: str | os.PathLike[str]) -> int:
     return descriptor
 
 
-def _open_leased(path: str | os.PathLike[str], leased: BlockingIOError) -> int:
-    """Open for reading the file at ``path`` whose ``O_NONBLOCK`` open failed with ``leased``
-    (``EAGAIN``): a regular file under a conflicting lease, such as a Samba oplock or an nfsd
-    write delegation on this host, which a blocking open waits to see broken. The path is opened
-    with ``O_PATH``, which reads nothing and never waits, and ``require_regular_file`` checks
-    that descriptor as in ``open_regular_file``; a regular file is then opened through
+def _open_leased(path: str | os.PathLike[str]) -> int:
+    """Open for reading the file at ``path`` whose ``O_NONBLOCK`` open failed with ``EAGAIN``:
+    a regular file under a conflicting lease, such as a Samba oplock or an nfsd write delegation
+    on this host, which a blocking open waits to see broken. The path is opened with
+    ``O_PATH``, which reads nothing and never waits, and ``require_regular_file`` checks that
+    descriptor as in ``open_regular_file``; a regular file is then opened through
     ``/proc/self/fd`` without ``O_NONBLOCK``, so the open waits as ``open`` waits, on the same
-    inode, so nothing swapped in since is read. Where ``O_PATH`` or ``/proc`` is missing,
-    ``leased`` is raised; any other error of that open names ``path``, as ``open``'s would."""
+    inode, so nothing swapped in since is read. Any other error of that open names ``path``, as
+    ``open``'s would.
+
+    Where ``O_PATH`` (Linux-only) is missing, or ``/proc`` (the open through it fails with
+    ``ENOENT``), the path itself is opened without ``O_NONBLOCK``, waiting for the lease to
+    break as 0.10.4's ``open`` did, and that descriptor is checked as ``open_regular_file``
+    checks its own (``_checked``), closed where the check refuses. So in those two cases only,
+    an entry swapped in between the failed ``O_NONBLOCK`` open and that blocking open (after
+    the ``O_PATH`` check, where there is one) is opened before the check refuses it: a FIFO
+    makes the open wait for a writer."""
     if not hasattr(os, "O_PATH"):
-        raise leased
+        return _checked(path, os.open(path, _READ_FLAGS))
     located = os.open(path, os.O_PATH)
     try:
         require_regular_file(path, os.fstat(located).st_mode)
         try:
             return os.open(f"/proc/self/fd/{located}", _READ_FLAGS)
         except FileNotFoundError:
-            # No /proc: the path's own error, never "no such file" for a file that is there
-            raise leased from None
+            # No /proc: the path itself is opened below, never "no such file" for a file there
+            pass
         except OSError as error:
             # EMFILE or ESTALE names the file, as open's would, never its /proc/self/fd link
             error.filename = os.fspath(path)
             raise
+        return _checked(path, os.open(path, _READ_FLAGS))
     finally:
         os.close(located)
 
@@ -123,10 +145,10 @@ def _send_file(
 ) -> bool:
     """Copy every byte of the regular file open at ``source`` to ``target``, open at its start,
     in the kernel (``os.sendfile``), and return True, as ``shutil.copyfile`` copies on Linux.
-    Return False, having written nothing, where ``shutil.copyfile`` copies through userspace
-    instead: where it calls no sendfile (``shutil._USE_CP_SENDFILE`` false), and where the
-    first call fails with any error but ENOSPC. ENOSPC, or an error once a byte was written, is
-    raised, naming ``src`` and ``dst``."""
+    Return False, having written nothing, where ``shutil.copyfile`` calls no sendfile
+    (``shutil._USE_CP_SENDFILE`` false), and where the first call fails with any error but
+    ENOSPC, after which ``shutil.copyfile`` copies through userspace. ENOSPC, or an error once a
+    byte was written, is raised, naming ``src`` and ``dst``."""
     # shutil.copyfile calls sendfile only while this flag is true: it is false off Linux, and a
     # program sets it false where a filesystem's sendfile is broken (cpython#87909). Typeshed
     # leaves the private flag out.
@@ -155,9 +177,11 @@ def copy_regular_file(src: str | os.PathLike[str], dst: str | os.PathLike[str]) 
     """``shutil.copy2(src, dst)`` for the regular file at ``src``, whose bytes are read through
     ``open_regular_file``. ``shutil.copy2`` refuses a FIFO only when its ``stat`` finds one, so
     it waits on a FIFO swapped in after that ``stat``, and it reads a device (``/dev/zero`` for
-    ever); this copy refuses both, naming the kind. The bytes are copied in the kernel
-    (``_send_file``), or, where ``_send_file`` declines, through userspace by
-    ``shutil.copyfileobj``, as ``shutil.copyfile`` copies them; then the metadata, as
+    ever); this copy refuses both, naming the kind. On Linux the bytes are copied in the kernel
+    (``_send_file``), as ``shutil.copyfile`` copies them, or, where ``_send_file`` declines,
+    through userspace by ``shutil.copyfileobj``, as ``shutil.copyfile`` then copies them. Off
+    Linux (where ``shutil.copyfile`` copies with ``fcopyfile`` on macOS) this copy always goes
+    through userspace, which gives the same bytes. Then the metadata is copied as
     ``shutil.copy2`` copies it (``shutil.copystat``)."""
     with open(open_regular_file(src), "rb", buffering=0) as source, open(dst, "wb") as target:
         if not _send_file(source.fileno(), target.fileno(), src, dst):
