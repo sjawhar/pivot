@@ -76,6 +76,13 @@ identity. The pass owns their model references; nothing in a process-lifetime sc
 keeps a model or its validator alive. The next pass reads a rebuilt model and its live defaults
 again.
 
+Each stage's walk is its own, and the stages of one pipeline reach the same helpers, often through
+closures one factory makes for each stage. So within one `fingerprint_pass()` a function's or
+method's source is parsed once for each code object, and anything else's (a class's, even one that
+sets `__code__`) once for the object. A reloaded module's functions have new code objects, so they
+are parsed again. A source file's resolved path is still worked out on each use, so a symlink
+retargeted during the pass is followed.
+
 ## Normalization
 
 AST normalization ensures stable hashing:
