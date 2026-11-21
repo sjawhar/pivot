@@ -57,12 +57,12 @@ def _helper_lease_without(
 ) -> tuple[list[tuple[str, int]], list[int]]:
     """``_helper_record_opens`` with ``leased``, where ``missing`` is missing: "O_PATH",
     removed from ``os``, or "/proc", under which an open fails with ``ENOENT``. Return the opens
-    it records and each descriptor an open returns. At the first open outside ``/proc`` that
-    takes neither ``O_NONBLOCK`` nor ``O_PATH`` (the blocking open after an ``EWOULDBLOCK``),
-    every ``O_PATH`` descriptor it returned must be closed already, so the open that may wait
-    holds none. With ``swap_in``, just before that open, the entry at its path is replaced by
-    one of that kind (``helpers.occupy``); a writer holds a FIFO open during that open, so it
-    returns at once, as it does once a writer comes."""
+    it records and each descriptor an open returns. At each open outside ``/proc`` that takes
+    neither ``O_NONBLOCK`` nor ``O_PATH`` (the blocking open after an ``EWOULDBLOCK``), every
+    ``O_PATH`` descriptor returned since the blocking open before it must be closed already, so
+    the open that may wait holds none. With ``swap_in``, just before the first such open, the
+    entry at its path is replaced by one of that kind (``helpers.occupy``); a writer holds a FIFO
+    open during that open, so it returns at once, as it does once a writer comes."""
     real_open = os.open
     opened = _helper_record_opens(
         monkeypatch, leased=True, proc_error=errno.ENOENT if missing == "/proc" else None
@@ -84,6 +84,8 @@ def _helper_lease_without(
             # Checked before the swap's own opens, which may take a closed descriptor's number
             still_open = [d for d in o_path_descriptors if _helper_is_open(d)]
             assert not still_open, f"O_PATH descriptors open at the blocking open: {still_open}"
+            # A later open may take one of these closed numbers: it belongs to that open alone
+            o_path_descriptors.clear()
         if blocking and swap_in is not None:
             kind, swap_in = swap_in, None
             os.unlink(name)
@@ -281,14 +283,8 @@ def test_open_regular_file_opens_a_leased_file_blocking_without_o_path_or_proc(
     with open(regular_file.open_regular_file(path), "rb") as f:
         returned, blocking, data = f.fileno(), os.get_blocking(f.fileno()), f.read()
         *located, reopened = descriptors
-        # The reopen may take the closed O_PATH descriptor's number, which a leaked one cannot
-        still_open = [
-            descriptor
-            for descriptor in located
-            if descriptor != reopened and _helper_is_open(descriptor)
-        ]
 
-    assert (returned, blocking, data, still_open) == (reopened, True, b"data", [])
+    assert (returned, blocking, data) == (reopened, True, b"data")
     assert opened == _helper_blocking_fallback_opens(path, missing, located)
 
 

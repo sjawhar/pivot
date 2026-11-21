@@ -3,8 +3,8 @@ pipeline.py text, tracked files with no data or removed once tracked, a cache's 
 trees and a cache register on a read-only mount, git projects that the installed `pivot` runs in,
 the output of `pivot repro --jsonl` and its restore warnings, the dry run and the run of `pivot
 repro --all --keep-going`, sockets, a call that must not wait on a FIFO or a lock, an entry of
-each kind where a path belongs, a copy that must not go through userspace, and venvs that CI-only
-tests install with uv."""
+each kind where a path belongs, a cache object swapped once its lookup found it, a copy that must
+not go through userspace, and venvs that CI-only tests install with uv."""
 
 # pyright: reportMissingImports=false, reportImplicitRelativeImport=false
 
