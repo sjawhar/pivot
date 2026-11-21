@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import collections
-import os
 import pathlib
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 import networkx as nx
-import pygtrie
 
 from pivot import project
 from pivot import types as pivot_types
 from pivot.engine.types import NodeType
+from pivot.storage import path_forms
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
     from collections.abc import Set as AbstractSet
+
+    import pygtrie
 
     from pivot.exceptions import DependencyNotFoundError
     from pivot.registry import RegistryStageInfo
@@ -443,21 +444,22 @@ def _tracked_file_errors(
     the file missing: a socket, a FIFO) gets the message ``validate_dependency_sources`` gives a
     missing one, without an output suggestion (the tracked file's data is the fix), unless the
     stage has one for that file; and one that is a directory holding missing tracked files gets
-    one error per such file the stage has no error for yet. Each path counts in both its forms,
-    normalized and resolved (``os.path.realpath``, which resolves a missing path's existing
-    ancestors), as a watch run waits for a missing input (``Engine``'s
+    one error per such file the stage has no error for yet. Each path counts in both its forms
+    (``storage.path_forms``), as a watch run waits for a missing input (``Engine``'s
     ``_MissingDependencyRun.awaits``): a dependency that reaches a missing tracked file through a
-    symlink reads it. Path parts decide containment, never a string prefix: ``data-backup/x`` is
-    not inside ``data``."""
+    symlink reads it. A dependency is or lies inside the outermost missing tracked file that is
+    or holds its normalized form, else its resolved form (``path_forms.enclosing``), and holds
+    each one that lies inside either form (``path_forms.held``)."""
     from pivot import exceptions
 
-    missing = _forms_trie(missing_tracked)
+    missing = path_forms.forms_trie(missing_tracked)
     # The stage and missing tracked file of each error kept
     reported = set[tuple[str, str]]()
     kept = list[exceptions.DependencyNotFoundError]()
     for error in errors:
         if error.input_path is not None:
-            tracked = _enclosing_path(missing, _forms(project.normalize_path(error.input_path)))
+            input_forms = path_forms.forms(project.normalize_path(error.input_path))
+            tracked = path_forms.enclosing(missing, *input_forms)
             if tracked is not None:
                 if (error.stage, tracked) in reported:
                     continue
@@ -471,8 +473,11 @@ def _tracked_file_errors(
         input_path = store.checkout(dep)
         path = project.normalize_path(input_path)
         if path not in found_by_path:
-            forms = _forms(path)
-            found_by_path[path] = (_enclosing_path(missing, forms), _held_paths(missing, forms))
+            forms = path_forms.forms(path)
+            found_by_path[path] = (
+                path_forms.enclosing(missing, *forms),
+                path_forms.held(missing, *forms),
+            )
         enclosing, held = found_by_path[path]
         if enclosing is not None and (stage_name, enclosing) not in reported:
             reported.add((stage_name, enclosing))
@@ -512,19 +517,19 @@ def _restore_creates(
     path inside it. ``restored`` maps each such path to every path its restore creates inside
     it, as its parts relative to that path (``executor.core.MissingTrackedFiles.restored``).
 
-    A path counts in both its forms (``_forms``), and so does each restored path: nothing under
-    a missing path exists, so a path inside it resolves to the same parts inside its resolved
-    form. The trie of the restored paths is built, resolving each of them once, when the first
-    path is asked about: a dry run with no missing dependency resolves none. Path parts decide
-    containment, never a string prefix.
+    A path counts in both its forms (``storage.path_forms.forms``), and so does each restored
+    path (``path_forms.forms_trie``): nothing under a missing path exists, so a path inside it
+    resolves to the same parts inside its resolved form. The trie of the restored paths is built,
+    resolving each of them once, when the first path is asked about: a dry run with no missing
+    dependency resolves none. Path parts decide containment, never a string prefix.
     """
     roots: pygtrie.Trie[str] | None = None
 
     def creates(path: pathlib.Path) -> bool:
         nonlocal roots
         if roots is None:
-            roots = _forms_trie(restored)
-        for form in _forms(project.normalize_path(path)):
+            roots = path_forms.forms_trie(restored)
+        for form in path_forms.forms(project.normalize_path(path)):
             parts = form.parts
             # A restored path, or a directory holding one
             if parts in roots or roots.has_subtrie(parts):
@@ -542,57 +547,17 @@ def _restore_creates(
 def tracked_overlap(tracked: Collection[str]) -> Callable[[pathlib.Path], str | None]:
     """For the absolute normalized tracked paths ``tracked``, the function that gives the one an
     absolute normalized path is or lies inside, else the first, sorted, of those it holds, else
-    None. Each path counts in both its forms (``_forms``), as ``get_runnable_stages`` counts a
-    missing tracked file (``_tracked_file_errors``). Path parts decide containment, never a
-    string prefix. The trie of ``tracked`` is built here, once."""
-    trie = _forms_trie(tracked)
+    None: ``storage.path_forms.overlapping`` of both forms of the path, each tracked path keyed
+    by both of its own (``path_forms.forms_trie``), as ``get_runnable_stages`` counts a missing
+    tracked file (``_tracked_file_errors``). So "is or lies inside" by either form comes before
+    "holds" by either: the tracked path that is or holds the path, by either form, is the one
+    whose restore brings that path back. The trie of ``tracked`` is built here, once."""
+    trie = path_forms.forms_trie(tracked)
 
     def overlap(path: pathlib.Path) -> str | None:
-        forms = _forms(path)
-        enclosing = _enclosing_path(trie, forms)
-        if enclosing is not None:
-            return enclosing
-        held = _held_paths(trie, forms)
-        return held[0] if held else None
+        return path_forms.overlapping(trie, *path_forms.forms(path))
 
     return overlap
-
-
-def _forms(path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    """Absolute normalized ``path`` and its resolved form (``os.path.realpath``)."""
-    return path, pathlib.Path(os.path.realpath(path))
-
-
-def _forms_trie(paths: Collection[str]) -> pygtrie.Trie[str]:
-    """A trie of the absolute normalized ``paths``, each keyed by the parts of both its forms
-    (``_forms``) to the path itself."""
-    trie: pygtrie.Trie[str] = pygtrie.Trie()
-    for path in paths:
-        for form in _forms(pathlib.Path(path)):
-            trie[form.parts] = path
-    return trie
-
-
-def _enclosing_path(trie: pygtrie.Trie[str], forms: tuple[pathlib.Path, ...]) -> str | None:
-    """The outermost path of ``trie`` that is, or holds, a form of ``forms`` (in their order),
-    or None."""
-    for form in forms:
-        step = trie.shortest_prefix(form.parts)
-        if step is not None and step.is_set:
-            return trie[step.key]
-    return None
-
-
-def _held_paths(trie: pygtrie.Trie[str], forms: tuple[pathlib.Path, ...]) -> list[str]:
-    """The paths of ``trie`` (``_forms_trie``) that lie inside a form of ``forms``, sorted."""
-    return sorted(
-        {
-            path
-            for form in forms
-            if trie.has_subtrie(form.parts)
-            for path in trie.values(prefix=form.parts)
-        }
-    )
 
 
 def update_stage(g: nx.DiGraph[str], stage_name: str, new_info: RegistryStageInfo) -> None:

@@ -538,7 +538,7 @@ def _restore_reads(
     present: Iterable[tuple[str, ArtifactRef]],
     restorable: Mapping[str, PvtData],
 ) -> dict[str, dict[ArtifactIdentity, RestoreLimit]]:
-    """Each stage of ``present`` (``engine.graph.get_runnable_stages``') with each dependency, by
+    """Each stage of ``present`` (``engine.graph.RunnableStages.present``) with each dependency, by
     identity, that the restore of ``restorable`` changes and its explanation reads from the disk:
     one that is, holds or lies inside a restorable path, by its path or resolved path
     (``engine.graph.tracked_overlap``, which names that path), and takes no hash from a ``.pvt``

@@ -30,12 +30,11 @@ import stat
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
 
 import lmdb
-import pygtrie
 
 from pivot import config, exceptions, project, types
 from pivot import state_dir as state_dir_mod
 from pivot.config import io as config_io
-from pivot.storage import cache, listing, lock, naming, state, track
+from pivot.storage import cache, listing, lock, naming, path_forms, state, track
 
 logger = logging.getLogger(__name__)
 
@@ -1071,30 +1070,28 @@ def _tracked_output_overlaps(
     """Say how each missing tracked path overlaps an output, for each one that overlaps one.
 
     A path overlaps an output when it is that output, lies inside it or contains it, by their
-    normalized paths or by their resolved ones (``os.path.realpath``, which resolves a missing
-    path's existing ancestors): a path that reaches an output through a symlink overlaps it, and
-    its description then says what both resolve to, as ``find_declared_overlap`` says. Path
-    parts decide this (a ``pygtrie.Trie`` keyed by ``Path.parts``), never a string prefix:
-    ``data-backup/x`` is not inside ``data``. When a path overlaps more than one output, its
+    normalized paths or by their resolved ones (``storage.path_forms``): a path that reaches an
+    output through a symlink overlaps it, and its description then says what both resolve to,
+    as ``find_declared_overlap`` says. When a path overlaps more than one output, its
     description names the first of them in sorted path order: the outermost output that is or
-    holds the path, else the first output inside the path.
+    holds the path, else the first output inside the path (``path_forms.overlapping``). The
+    normalized paths are asked first, and the resolved ones only when they overlap no output,
+    each form against the outputs' same form: so a description says what both resolve to only
+    where the normalized paths overlap no output.
     """
-    real_outputs = {output: pathlib.Path(os.path.realpath(output)) for output in outputs}
-    lexical: pygtrie.Trie[pathlib.Path] = pygtrie.Trie()
-    resolved: pygtrie.Trie[pathlib.Path] = pygtrie.Trie()
-    for output, real_output in real_outputs.items():
-        lexical[output.parts] = output
-        resolved[real_output.parts] = output
+    real_outputs = {output: path_forms.resolved(output) for output in outputs}
+    lexical = path_forms.parts_trie((output, output) for output in real_outputs)
+    resolved = path_forms.parts_trie((real, output) for output, real in real_outputs.items())
     overlaps = dict[str, str]()
     for missing_path in missing:
         path = pathlib.Path(missing_path)
-        output = _overlapping_output(lexical, path)
+        output = path_forms.overlapping(lexical, path)
         if output is not None:
             relation = _relation(path, output)
             resolves = None
         else:
-            real_path = pathlib.Path(os.path.realpath(path))
-            output = _overlapping_output(resolved, real_path)
+            real_path = path_forms.resolved(path)
+            output = path_forms.overlapping(resolved, real_path)
             if output is None:
                 continue
             relation = _relation(real_path, real_outputs[output])
@@ -1103,20 +1100,6 @@ def _tracked_output_overlaps(
             relation, output, outputs[output], project_root, resolves
         )
     return overlaps
-
-
-def _overlapping_output(
-    trie: pygtrie.Trie[pathlib.Path], path: pathlib.Path
-) -> pathlib.Path | None:
-    """The output that ``path`` overlaps, ``trie`` and ``path`` keyed by the same form of their
-    paths: the outermost one that is or holds it, else the first in sorted path order that it
-    holds; None for none."""
-    enclosing = trie.shortest_prefix(path.parts)
-    if enclosing is not None and enclosing.is_set:
-        return trie[enclosing.key]
-    if trie.has_subtrie(path.parts):
-        return min(trie.values(prefix=path.parts))
-    return None
 
 
 def _warning(overlap: OutputOverlap, project_root: pathlib.Path) -> str:
