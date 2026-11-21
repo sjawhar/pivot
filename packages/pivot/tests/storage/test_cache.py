@@ -3614,18 +3614,7 @@ def test_missing_linked_objects_refuses_an_object_swapped_for_a_fifo_or_a_device
     source.write_text("data")
     output_hash = cache.save_to_cache(source, cache_dir, checkout_mode=cache.CheckoutMode.COPY)
     cache_object = cache.get_cache_path(cache_dir, output_hash["hash"])
-    lookup = cache.resolve_cache_object_path
-
-    def _swap_after_lookup(
-        objects: pathlib.Path, file_hash: str, *, directory: bool = False, notice: bool = True
-    ) -> pathlib.Path | None:
-        found = lookup(objects, file_hash, directory=directory, notice=notice)
-        assert found == cache_object, found
-        cache_object.unlink()
-        helpers.occupy(cache_object, kind)
-        return cache_object
-
-    monkeypatch.setattr(cache, "resolve_cache_object_path", _swap_after_lookup)
+    helpers.swap_cache_object_after_lookup(monkeypatch, cache_object, kind)
 
     with pytest.raises(exceptions.NotAFileError) as raised:
         helpers.call_without_waiting(

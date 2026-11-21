@@ -57,11 +57,12 @@ def _helper_lease_without(
 ) -> tuple[list[tuple[str, int]], list[int]]:
     """``_helper_record_opens`` with ``leased``, where ``missing`` is missing: "O_PATH",
     removed from ``os``, or "/proc", under which an open fails with ``ENOENT``. Return the opens
-    it records and each descriptor an open returns. With ``swap_in``, just before the first open
-    outside ``/proc`` that takes neither ``O_NONBLOCK`` nor ``O_PATH`` (the blocking open after
-    an ``EWOULDBLOCK``), the entry at its path is replaced by one of that kind
-    (``helpers.occupy``); a writer holds a FIFO open during that open, so it returns at once,
-    as it does once a writer comes."""
+    it records and each descriptor an open returns. At the first open outside ``/proc`` that
+    takes neither ``O_NONBLOCK`` nor ``O_PATH`` (the blocking open after an ``EWOULDBLOCK``),
+    every ``O_PATH`` descriptor it returned must be closed already, so the open that may wait
+    holds none. With ``swap_in``, just before that open, the entry at its path is replaced by
+    one of that kind (``helpers.occupy``); a writer holds a FIFO open during that open, so it
+    returns at once, as it does once a writer comes."""
     real_open = os.open
     opened = _helper_record_opens(
         monkeypatch, leased=True, proc_error=errno.ENOENT if missing == "/proc" else None
@@ -70,6 +71,7 @@ def _helper_lease_without(
     # Read now: O_PATH is removed from os below where it is the one missing
     o_path = getattr(os, "O_PATH", 0)
     descriptors = list[int]()
+    o_path_descriptors = list[int]()
 
     def _open(
         path: str | os.PathLike[str], flags: int, mode: int = 0o777, *, dir_fd: int | None = None
@@ -77,11 +79,12 @@ def _helper_lease_without(
         nonlocal swap_in
         name = os.fspath(path)
         writer: int | None = None
-        if (
-            swap_in is not None
-            and not flags & (os.O_NONBLOCK | o_path)
-            and not name.startswith("/proc/")
-        ):
+        blocking = not flags & (os.O_NONBLOCK | o_path) and not name.startswith("/proc/")
+        if blocking:
+            # Checked before the swap's own opens, which may take a closed descriptor's number
+            still_open = [d for d in o_path_descriptors if _helper_is_open(d)]
+            assert not still_open, f"O_PATH descriptors open at the blocking open: {still_open}"
+        if blocking and swap_in is not None:
             kind, swap_in = swap_in, None
             os.unlink(name)
             helpers.occupy(pathlib.Path(name), kind)
@@ -96,6 +99,8 @@ def _helper_lease_without(
             if writer is not None:
                 os.close(writer)
         descriptors.append(descriptor)
+        if flags & o_path:
+            o_path_descriptors.append(descriptor)
         return descriptor
 
     monkeypatch.setattr(os, "open", _open)

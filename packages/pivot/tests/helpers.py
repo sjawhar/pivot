@@ -413,6 +413,27 @@ def occupy(path: pathlib.Path, kind: str) -> None:
     assert stat.S_IFMT(os.lstat(path).st_mode) == made, f"{path} is no {kind}"
 
 
+def swap_cache_object_after_lookup(
+    monkeypatch: pytest.MonkeyPatch, cache_object: pathlib.Path, kind: str
+) -> None:
+    """Make ``cache.resolve_cache_object_path`` find ``cache_object`` as it does, then put an
+    entry of ``kind`` (``occupy``) in its place before returning it: an object swapped once the
+    lookup found it, which only the open of the object itself can meet. The lookup must find
+    ``cache_object`` and no other path."""
+    lookup = cache.resolve_cache_object_path
+
+    def _swap_after_lookup(
+        objects: pathlib.Path, file_hash: str, *, directory: bool = False, notice: bool = True
+    ) -> pathlib.Path | None:
+        found = lookup(objects, file_hash, directory=directory, notice=notice)
+        assert found == cache_object, found
+        cache_object.unlink()
+        occupy(cache_object, kind)
+        return cache_object
+
+    monkeypatch.setattr(cache, "resolve_cache_object_path", _swap_after_lookup)
+
+
 def no_userspace_copy(*args: object, **kwargs: object) -> None:
     """Stands for ``shutil.copyfileobj`` where a copy must go through the kernel
     (``storage.regular_file.copy_regular_file``): a call fails the test."""

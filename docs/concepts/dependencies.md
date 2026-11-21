@@ -70,9 +70,11 @@ For a stage that ran before, `--explain` shows
 `Unreadable deps: scores.csv (a FIFO, not a file)`. A symlink to `/dev/null`
 is a device too (`a device, not a file`). For an empty
 input, use an empty file instead. At the path of a tracked file, such an entry
-counts as a missing tracked file when `pivot repro` reads it. `pivot status`
-stops with an error that names it (`Error: Is a device, not a regular file:
-<path>`), and `pivot track` refuses to track one.
+counts as a missing tracked file when `pivot repro` runs, and so under
+`--all --keep-going` in `--explain` and `--dry-run` too. Outside that mode,
+`--explain` and `--dry-run` show it as unreadable. `pivot status` stops with an
+error that names it (`Error: Is a device, not a regular file: <path>`), but
+`--stages-only` shows it as unreadable; `pivot track` refuses to track one.
 
 ### Directory inputs and `.pivotignore`
 

@@ -5,14 +5,14 @@ which resolves a missing path's existing ancestors), so a path that reaches anot
 symlink meets it in its resolved form. A ``pygtrie.Trie`` keyed by ``Path.parts`` decides
 containment, never a string prefix: ``data-backup/x`` is not inside ``data``.
 
-The callers below are this module's. Three compose their own order of
-forms and questions from these primitives, and say which: the missing tracked files a stage
-reads (``engine.graph.get_runnable_stages``, ``_tracked_file_errors``), the restorable paths a
-dependency's restore changes (``engine.graph.tracked_overlap``), and the stage outputs a
-missing tracked path overlaps (``ownership.tracked_output_refusal``). The paths a
-``--checkout-missing`` restore creates (``engine.graph``'s ``_restore_creates``) take only the
-forms and the trie from here (``forms``, ``forms_trie``) and ask their own question there:
-whether a path is or holds a restored path, or lies inside one whose restore creates it.
+Three of its callers compose their own order of forms and questions from these primitives,
+and say which: the missing tracked files a stage reads (``engine.graph.get_runnable_stages``,
+``_tracked_file_errors``), the restorable paths a dependency's restore changes
+(``engine.graph.tracked_overlap``), and the stage outputs a missing tracked path overlaps
+(``ownership.tracked_output_refusal``). The paths a ``--checkout-missing`` restore creates
+(``engine.graph``'s ``_restore_creates``) take only the forms and the trie from here
+(``forms``, ``forms_trie``) and ask their own question there: whether a path is or holds a
+restored path, or lies inside one whose restore creates it.
 """
 
 from __future__ import annotations

@@ -460,18 +460,7 @@ def test_a_cache_object_swapped_for_a_fifo_or_a_device_fails_the_predicted_resto
     assert record is not None
     cache_root = pipeline_dir / ".pivot" / "cache"
     cache_object = cache.get_cache_path(cache_root / "files", record["hash"])
-    lookup = cache.resolve_cache_object_path
-
-    def _swap_after_lookup(
-        objects: pathlib.Path, file_hash: str, *, directory: bool = False, notice: bool = True
-    ) -> pathlib.Path | None:
-        found = lookup(objects, file_hash, directory=directory, notice=notice)
-        assert found == cache_object, found
-        cache_object.unlink()
-        helpers.occupy(cache_object, swapped_in)
-        return cache_object
-
-    monkeypatch.setattr(cache, "resolve_cache_object_path", _swap_after_lookup)
+    helpers.swap_cache_object_after_lookup(monkeypatch, cache_object, swapped_in)
     with _caught_warnings(caplog) as warnings:
         check = helpers.call_without_waiting(
             lambda: tracked_restore.check_tracked(
